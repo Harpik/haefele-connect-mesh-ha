@@ -3,9 +3,10 @@
     "step": {
       "user": {
         "title": "Häfele Connect Mesh",
-        "description": "Paste the full contents of your Häfele Connect Mesh export file (.connect). Export it from the Häfele Connect app: Menu → Settings → Export Configuration.",
+        "description": "Upload your Häfele `.connect` export file (exported from the Häfele Connect app → Menu → Settings → Export Configuration).\n\nIf file upload is not available on your client, paste the file contents into the text box instead.",
         "data": {
-          "connect_file": "Configuration file contents (.connect)"
+          "connect_file_upload": "Upload .connect file",
+          "connect_file_text": "…or paste file contents"
         }
       },
       "confirm": {
@@ -16,6 +17,8 @@
     },
     "error": {
       "invalid_config": "Invalid or unrecognized .connect file. Make sure you exported a valid Häfele Connect Mesh configuration.",
+      "file_read_error": "Could not read the uploaded file. Try again or paste the contents manually.",
+      "no_input": "Please either upload a .connect file or paste its contents.",
       "unknown": "Unexpected error. Check the logs for details."
     },
     "abort": {
