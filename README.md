@@ -1,67 +1,141 @@
-# Häfele Connect Mesh - Home Assistant Integration
+# Häfele Connect Mesh — Home Assistant Integration
 
-[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
+[![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
+[![Tests](https://github.com/Harpik/haefele-connect-mesh-ha/actions/workflows/tests.yml/badge.svg)](https://github.com/Harpik/haefele-connect-mesh-ha/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Control your **Häfele Connect Mesh** Bluetooth lights directly from Home Assistant via BLE GATT Proxy — no cloud, no gateway hardware required.
+Control your **Häfele Connect Mesh** Bluetooth Mesh lights directly from Home Assistant over BLE — **no cloud, no Häfele gateway hardware, no MQTT broker required**.
+
+Home Assistant itself plays the role of a BT Mesh **GATT Proxy client**. It connects to a nearby mesh proxy node, encrypts messages with the keys from your `.connect` export, and drives the lights over the mesh.
 
 ## Features
 
-- 🔵 Direct BLE GATT connection (no hub needed)
-- 💡 On/Off, Brightness, Color Temperature (Tunable White)
-- 📡 Automatic availability monitoring (heartbeat)
-- 🔧 Setup via UI — just upload your `.connect` export file
-- 🔌 Supports multiple Bluetooth adapters (USB dongles)
+- 🔵 Native BLE via Home Assistant's `bluetooth` integration
+- 📡 **ESPHome Bluetooth Proxy compatible** — extend range without extra software
+- 💡 On/Off, brightness, color temperature (Tunable White)
+- 🔁 Automatic reconnection with `bleak-retry-connector`
+- 💾 Persistent BT Mesh sequence numbers (survives HA restarts — no replay risk)
+- 🧩 HACS compatible, setup 100% via UI
+- 🔐 No cloud. No phone. Keys stay on your HA install.
+
+## Architecture
+
+```
+┌──────────────────────┐        BLE GATT         ┌──────────────────┐
+│ Home Assistant       │ ──────(service 0x1828)──▶│  Mesh Proxy Node │
+│ (bluetooth adapter   │                          │  (Häfele light)  │
+│  or ESPHome proxy)   │                          └─────────┬────────┘
+└──────────────────────┘                                    │ BT Mesh
+                                                            ▼
+                                              ┌───────────────────────────┐
+                                              │ Other Häfele Mesh lights  │
+                                              └───────────────────────────┘
+```
+
+HA opens one GATT connection to the closest Häfele node (the "proxy"), then every command flows through the mesh to the target node or group.
 
 ## Requirements
 
-- Home Assistant 2024.1.0 or newer
-- Bluetooth adapter accessible from HAOS (built-in or USB dongle)
-- Häfele Connect Mesh lights provisioned with the Häfele Connect app
-- Export file from the Häfele Connect app (`.connect` format)
+- Home Assistant **2024.1** or newer
+- A Bluetooth adapter reachable by Home Assistant — either:
+  - Local HCI adapter on the HA host (Pi built-in, USB dongle, …), **or**
+  - An [ESPHome Bluetooth Proxy](https://esphome.io/components/bluetooth_proxy.html) on the same network
+- Häfele Connect Mesh lights provisioned via the Häfele Connect app
+- A `.connect` export file from that app
 
-## Installation via HACS
+## Installation
 
-1. In HACS, click **Custom repositories**
-2. Add `https://github.com/YOUR_USERNAME/haefele-connect-mesh-ha` as **Integration**
+### HACS (recommended)
+
+1. HACS → **Integrations** → ⋮ → **Custom repositories**
+2. Repository URL: `https://github.com/Harpik/haefele-connect-mesh-ha`
+   Category: **Integration**
 3. Install **Häfele Connect Mesh**
 4. Restart Home Assistant
 
-## Manual Installation
+### Manual
 
-1. Copy the `custom_components/haefele_mesh` folder to your HA `config/custom_components/` directory
-2. Restart Home Assistant
+```bash
+# From your HA config directory
+cd config/custom_components
+git clone https://github.com/Harpik/haefele-connect-mesh-ha.git haefele_tmp
+mv haefele_tmp/custom_components/haefele_mesh .
+rm -rf haefele_tmp
+```
+
+Restart Home Assistant.
 
 ## Setup
 
-1. Go to **Settings → Integrations → Add Integration**
-2. Search for **Häfele Connect Mesh**
-3. Paste the contents of your `.connect` export file
-   - Export from the Häfele Connect app: **Menu → Settings → Export Configuration**
-4. Select your Bluetooth adapter
-5. Confirm the discovered devices
+1. **Settings → Devices & Services → + Add Integration** → search **Häfele Connect Mesh**
+2. Paste the full contents of your `.connect` export file
+3. Confirm discovered devices — one HA device per light is created
 
-## How to export your .connect file
+HA picks the Bluetooth adapter automatically via the core `bluetooth` integration (configure the preferred adapter there if you have more than one).
 
-1. Open the **Häfele Connect** app on your phone
-2. Go to **Settings** (gear icon)
-3. Tap **Export Configuration**
-4. Save or share the `.connect` file
-5. Open it with a text editor and copy the entire contents
+### Exporting the `.connect` file
+
+1. Open the **Häfele Connect** app
+2. **Menu → Settings → Export Configuration**
+3. Share the file to yourself (email, Files app, …) and open it in a text editor
+4. Copy the entire contents and paste into the HA setup form
 
 ## Supported Devices
 
-- Häfele Connect Mesh Tunable White spots (Meshbox TW)
-- Other Häfele Connect Mesh light nodes
+Tested with Häfele Meshbox Tunable White spots. Other Häfele Connect Mesh light nodes (RGB, dimmable drivers, LED strips) are recognised by the parser and should work, but have not been verified end-to-end — reports welcome.
 
-## Technical Notes
+Remotes, sensors and switches are parsed but **skipped** (they don't expose writable light models).
 
-This integration communicates directly with Häfele Mesh nodes via **BLE GATT Proxy** (Bluetooth Mesh Profile, service UUID `0x1828`). It uses the cryptographic keys from your exported configuration to build and encrypt BT Mesh PDUs, bypassing the need for the Häfele gateway hardware or cloud service.
+## How it works
 
-The integration was developed and tested with:
-- Häfele Meshbox TW 1C spots
-- Raspberry Pi 5 running HAOS
-- Raspberry Pi 3 for development/testing
+- `.connect` is parsed as Bluetooth Mesh CDB JSON with Häfele extensions (`tos_node`, `tos_devices`).
+- Each light becomes a `light` entity inside an HA device keyed on MAC.
+- The coordinator keeps one GATT connection open to the mesh proxy and maintains a per-source BT Mesh sequence counter persisted in `.storage/haefele_mesh_seq`.
+- Commands are built as BT Mesh Network PDUs (encrypted with AES-CCM, obfuscated with AES-ECB) and segmented over the Mesh Proxy PDU bearer (spec § 6.6.2).
+- A 60-second heartbeat verifies connectivity and reconnects dropped links.
+
+See [`custom_components/haefele_mesh/gatt.py`](custom_components/haefele_mesh/gatt.py) and [`mesh_crypto.py`](custom_components/haefele_mesh/mesh_crypto.py) for the mesh implementation, and [`connect_parser.py`](custom_components/haefele_mesh/connect_parser.py) for the import format.
+
+## Troubleshooting
+
+**The integration setup says "No light nodes found"**
+Your `.connect` file only contains remotes/sensors, or the export is from a non-Häfele mesh. Re-export from the Häfele Connect app after provisioning at least one light.
+
+**Lights stay "unavailable"**
+HA can't reach any mesh proxy over BLE. Check:
+1. `Settings → System → Hardware → Bluetooth` shows an active adapter or ESPHome proxy.
+2. Move the HA host / proxy closer to one light (≤ 10 m line of sight is a good test).
+3. Look for `haefele_mesh` entries in `Settings → System → Logs`.
+
+**Commands fail after a while**
+BT Mesh requires monotonically increasing sequence numbers. The integration persists them on every emission, but if you restore an HA snapshot you may need to wait a few minutes for the network to accept new SEQ values (or re-provision).
+
+## Development
+
+```bash
+# Run tests
+pip install -r requirements_test.txt
+pytest -v tests/
+```
+
+CI runs `pytest` on Python 3.11 / 3.12, plus [HACS action](https://github.com/hacs/action) and [hassfest](https://developers.home-assistant.io/docs/creating_integration_manifest/#hassfest) on every push.
+
+## Roadmap
+
+- [ ] Brand logo/icon in Home Assistant (PR to [`home-assistant/brands`](https://github.com/home-assistant/brands))
+- [ ] RGB light support
+- [ ] Status feedback (parse incoming OnOff/CTL status messages)
+- [ ] Scene/group pass-through for Häfele scenes defined in the `.connect` file
+- [ ] Config options flow (tweak heartbeat interval, TTL, etc.)
+
+## Acknowledgements
+
+- [Bluetooth Mesh Profile 1.0](https://www.bluetooth.com/specifications/specs/mesh-profile-1-0-1/) — the spec that made this possible
+- [`bleak`](https://github.com/hbldh/bleak) + [`bleak-retry-connector`](https://github.com/Bluetooth-Devices/bleak-retry-connector) — the BLE stack HA uses under the hood
+- The Häfele firmware team for keeping the BT Mesh implementation standards-compliant
 
 ## License
 
-MIT License
+MIT — see [LICENSE](LICENSE).
+
+> Not affiliated with, endorsed by, or supported by Häfele. Use at your own risk.

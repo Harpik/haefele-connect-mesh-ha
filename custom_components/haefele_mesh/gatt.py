@@ -29,63 +29,9 @@ from .const import (
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
 )
+from .mesh_crypto import aes_ccm_encrypt, aes_ecb, k2, k4
 
 _LOGGER = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Crypto helpers (BT Mesh Spec 3.8)
-# ---------------------------------------------------------------------------
-
-def _aes_ccm_encrypt(key: bytes, nonce: bytes, plaintext: bytes, tag_length: int = 4) -> bytes:
-    from cryptography.hazmat.primitives.ciphers.aead import AESCCM
-    cipher = AESCCM(key, tag_length=tag_length)
-    return cipher.encrypt(nonce, plaintext, None)
-
-
-def _aes_ecb(key: bytes, data: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
-    cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
-    e = cipher.encryptor()
-    return e.update(data[:16]) + e.finalize()
-
-
-def _aes_cmac(key: bytes, data: bytes) -> bytes:
-    from cryptography.hazmat.primitives.cmac import CMAC
-    from cryptography.hazmat.primitives.ciphers import algorithms
-    from cryptography.hazmat.backends import default_backend
-    c = CMAC(algorithms.AES(key), backend=default_backend())
-    c.update(data)
-    return c.finalize()
-
-
-def _s1(m: bytes) -> bytes:
-    return _aes_cmac(b'\x00' * 16, m)
-
-
-def _k2(n: bytes, p: bytes):
-    """Derive NID, EncryptionKey, PrivacyKey from NetworkKey."""
-    import bitstring
-    salt = _s1(b"smk2")
-    t = _aes_cmac(salt, n)
-    t0 = b""
-    t1 = _aes_cmac(t, t0 + p + b"\x01")
-    t2 = _aes_cmac(t, t1 + p + b"\x02")
-    t3 = _aes_cmac(t, t2 + p + b"\x03")
-    k = (t1 + t2 + t3)[-33:]
-    nid, enc, priv = bitstring.BitString(k).unpack("pad:1, uint:7, bits:128, bits:128")
-    return nid, enc.bytes, priv.bytes
-
-
-def _k4(n: bytes) -> int:
-    """Derive AID from ApplicationKey."""
-    import bitstring
-    salt = _s1(b"smk4")
-    t = _aes_cmac(salt, n)
-    k = _aes_cmac(t, b"id6\x01")[-1:]
-    (aid,) = bitstring.BitString(k).unpack("pad:2, uint:6")
-    return aid
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +74,8 @@ class MeshGattNode:
         # Crypto — derived once from network/app keys
         self._net_key = bytes.fromhex(net_key_hex)
         self._app_key = bytes.fromhex(app_key_hex)
-        self._nid, self._enc_key, self._priv_key = _k2(self._net_key, b"\x00")
-        self._aid = _k4(self._app_key)
+        self._nid, self._enc_key, self._priv_key = k2(self._net_key, b"\x00")
+        self._aid = k4(self._app_key)
 
         # BLE state
         self._client: Optional[BleakClientWithServiceCache] = None
@@ -272,7 +218,7 @@ class MeshGattNode:
             + struct.pack(">HH", self._src, dst)
             + struct.pack(">I", self._iv_index)
         )
-        upper_transport = _aes_ccm_encrypt(self._app_key, app_nonce, access_pdu, tag_length=4)
+        upper_transport = aes_ccm_encrypt(self._app_key, app_nonce, access_pdu, tag_length=4)
         trans_pdu = bytes([(1 << 6) | (self._aid & 0x3F)]) + upper_transport
 
         net_nonce = (
@@ -283,10 +229,10 @@ class MeshGattNode:
             + struct.pack(">I", self._iv_index)
         )
         plaintext = struct.pack(">H", dst) + trans_pdu
-        encrypted = _aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=4)
+        encrypted = aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=4)
 
         privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self._iv_index) + encrypted[:7]
-        pecb = _aes_ecb(self._priv_key, privacy_plaintext)
+        pecb = aes_ecb(self._priv_key, privacy_plaintext)
         cleartext_header = (
             bytes([(ctl << 7) | (ttl & 0x7F)])
             + seq.to_bytes(3, "big")
