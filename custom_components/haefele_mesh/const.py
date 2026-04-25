@@ -2,7 +2,6 @@
 
 DOMAIN = "haefele_mesh"
 
-CONF_ADAPTER = "adapter"
 CONF_NETWORK_KEY = "network_key"
 CONF_APP_KEY = "app_key"
 CONF_IV_INDEX = "iv_index"

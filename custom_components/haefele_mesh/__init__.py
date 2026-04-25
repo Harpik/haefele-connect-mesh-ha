@@ -39,11 +39,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if unload_ok:
         coordinator: HaefeleCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        # Disconnect all nodes
-        for node in coordinator.nodes.values():
-            try:
-                await node.disconnect()
-            except Exception:
-                pass
+        await coordinator.async_shutdown()
 
     return unload_ok

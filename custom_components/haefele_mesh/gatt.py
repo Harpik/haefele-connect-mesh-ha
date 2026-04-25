@@ -3,16 +3,27 @@ Bluetooth Mesh GATT Proxy Bearer for Häfele Connect Mesh.
 
 Handles BLE connection, PDU segmentation, encryption and
 sequence number management per BT Mesh spec.
+
+Uses Home Assistant's bluetooth subsystem (supports local HCI
+adapters and ESPHome Bluetooth Proxies transparently) and
+bleak-retry-connector for robust connections.
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import struct
-import time
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
-from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    establish_connection,
+)
+
+from homeassistant.components import bluetooth
+from homeassistant.core import HomeAssistant
 
 from .const import (
     MESH_PROXY_DATA_IN_UUID,
@@ -21,8 +32,10 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-SEQ_FILE = "/tmp/haefele_mesh_seq"
 
+# ---------------------------------------------------------------------------
+# Crypto helpers (BT Mesh Spec 3.8)
+# ---------------------------------------------------------------------------
 
 def _aes_ccm_encrypt(key: bytes, nonce: bytes, plaintext: bytes, tag_length: int = 4) -> bytes:
     from cryptography.hazmat.primitives.ciphers.aead import AESCCM
@@ -75,112 +88,124 @@ def _k4(n: bytes) -> int:
     return aid
 
 
+# ---------------------------------------------------------------------------
+# GATT Proxy node
+# ---------------------------------------------------------------------------
+
+SeqProvider = Callable[[int], Awaitable[int]]
+"""Callback `(src_address) -> next_seq` owned by the coordinator."""
+
+
 class MeshGattNode:
     """
     Controls a single Häfele Mesh node via GATT Proxy bearer.
 
-    Handles BLE connection, PDU encryption/segmentation,
-    and monotonic sequence numbers for anti-replay protection.
+    Uses Home Assistant's bluetooth subsystem for device lookup
+    (so ESPHome Bluetooth Proxies work out of the box) and
+    bleak-retry-connector for the actual connection.
     """
 
     def __init__(
         self,
+        hass: HomeAssistant,
         mac: str,
         unicast: int,
         net_key_hex: str,
         app_key_hex: str,
+        src_address: int,
+        seq_provider: SeqProvider,
         iv_index: int = 1,
-        src_address: int = 0x0060,
-        adapter: Optional[str] = None,
         name: str = "",
     ):
-        self.mac = mac
+        self._hass = hass
+        self.mac = mac.upper()
         self.unicast = unicast
-        self.name = name
+        self.name = name or self.mac
         self._iv_index = iv_index
         self._src = src_address
-        self._adapter = adapter  # e.g. "hci0", "hci1"
+        self._seq_provider = seq_provider
 
-        # Crypto
+        # Crypto — derived once from network/app keys
         self._net_key = bytes.fromhex(net_key_hex)
         self._app_key = bytes.fromhex(app_key_hex)
         self._nid, self._enc_key, self._priv_key = _k2(self._net_key, b"\x00")
         self._aid = _k4(self._app_key)
 
-        # SEQ number — load from file or use timestamp
-        self._seq = self._load_seq()
-
         # BLE state
-        self._client: Optional[BleakClient] = None
+        self._client: Optional[BleakClientWithServiceCache] = None
         self._data_in = None
         self._incoming: asyncio.Queue = asyncio.Queue()
         self._reassembly_buf = bytearray()
-
-    # ------------------------------------------------------------------
-    # Sequence number
-    # ------------------------------------------------------------------
-
-    def _load_seq(self) -> int:
-        try:
-            with open(SEQ_FILE) as f:
-                return (int(f.read().strip()) + 200) & 0xFFFFFF
-        except Exception:
-            return int(time.time()) & 0xFFFFFF
-
-    def _save_seq(self):
-        try:
-            with open(SEQ_FILE, 'w') as f:
-                f.write(str(self._seq))
-        except Exception:
-            pass
-
-    def _next_seq(self) -> int:
-        self._seq = (self._seq + 1) & 0xFFFFFF
-        self._save_seq()
-        return self._seq
+        self._connect_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Connection
     # ------------------------------------------------------------------
 
-    async def connect(self, timeout: float = 20.0) -> bool:
-        try:
-            kwargs = {}
-            if self._adapter:
-                kwargs['adapter'] = self._adapter
+    def _resolve_device(self) -> Optional[BLEDevice]:
+        """Ask HA's bluetooth manager for the current BLEDevice."""
+        return bluetooth.async_ble_device_from_address(
+            self._hass, self.mac, connectable=True
+        )
 
-            _LOGGER.debug("Scanning for %s (%s)...", self.name, self.mac)
-            device = await BleakScanner.find_device_by_address(
-                self.mac, timeout=timeout, **kwargs
-            )
+    async def connect(self, timeout: float = 20.0) -> bool:
+        """Establish a GATT connection and subscribe to notifications."""
+        async with self._connect_lock:
+            if self.is_connected:
+                return True
+
+            device = self._resolve_device()
             if device is None:
-                _LOGGER.warning("Device %s (%s) not found", self.name, self.mac)
+                _LOGGER.warning(
+                    "Device %s (%s) not seen by HA bluetooth; is the node in range "
+                    "of the HA adapter or an ESPHome BT proxy?",
+                    self.name, self.mac,
+                )
                 return False
 
-            self._client = BleakClient(device, timeout=timeout)
-            await self._client.connect()
+            try:
+                self._client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    device,
+                    self.name,
+                    disconnected_callback=self._on_disconnected,
+                    max_attempts=3,
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("Failed to connect to %s: %s", self.name, err)
+                return False
 
             self._data_in = self._client.services.get_characteristic(MESH_PROXY_DATA_IN_UUID)
             data_out = self._client.services.get_characteristic(MESH_PROXY_DATA_OUT_UUID)
-
             if not self._data_in or not data_out:
                 _LOGGER.error("Mesh Proxy characteristics not found on %s", self.mac)
+                await self._safe_disconnect()
                 return False
 
-            await self._client.start_notify(data_out, self._on_notification)
+            try:
+                await self._client.start_notify(data_out, self._on_notification)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("start_notify failed on %s: %s", self.name, err)
+                await self._safe_disconnect()
+                return False
+
             _LOGGER.info("Connected to %s (%s)", self.name, self.mac)
             return True
 
-        except Exception as err:
-            _LOGGER.error("Failed to connect to %s: %s", self.name, err)
-            return False
+    def _on_disconnected(self, _client) -> None:
+        _LOGGER.debug("BLE disconnected from %s", self.name)
 
-    async def disconnect(self):
-        if self._client and self._client.is_connected:
+    async def _safe_disconnect(self) -> None:
+        if self._client is not None:
             try:
                 await self._client.disconnect()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
+            self._client = None
+            self._data_in = None
+
+    async def disconnect(self) -> None:
+        await self._safe_disconnect()
         _LOGGER.debug("Disconnected from %s", self.name)
 
     @property
@@ -188,15 +213,17 @@ class MeshGattNode:
         return self._client is not None and self._client.is_connected
 
     async def ensure_connected(self, timeout: float = 20.0) -> bool:
-        if not self.is_connected:
-            return await self.connect(timeout=timeout)
-        return True
+        if self.is_connected:
+            return True
+        return await self.connect(timeout=timeout)
 
     # ------------------------------------------------------------------
     # PDU segmentation / reassembly (BT Mesh 6.6.2)
     # ------------------------------------------------------------------
 
-    def _on_notification(self, _, data: bytearray):
+    def _on_notification(self, _char, data: bytearray) -> None:
+        if not data:
+            return
         header = data[0]
         sar = (header >> 6) & 0x03
         pdu_type = header & 0x3F
@@ -210,14 +237,18 @@ class MeshGattNode:
         if sar in (0x00, 0x03):
             self._incoming.put_nowait((pdu_type, bytes(self._reassembly_buf)))
 
-    async def _send_proxy_pdu(self, pdu: bytes, pdu_type: int = 0x00):
+    async def _send_proxy_pdu(self, pdu: bytes, pdu_type: int = 0x00) -> None:
         max_chunk = 19
-        chunks = [pdu[i:i+max_chunk] for i in range(0, len(pdu), max_chunk)]
+        chunks = [pdu[i:i + max_chunk] for i in range(0, len(pdu), max_chunk)]
         for i, chunk in enumerate(chunks):
-            if len(chunks) == 1:       sar = 0x00
-            elif i == 0:               sar = 0x40
-            elif i == len(chunks)-1:   sar = 0xC0
-            else:                      sar = 0x80
+            if len(chunks) == 1:
+                sar = 0x00
+            elif i == 0:
+                sar = 0x40
+            elif i == len(chunks) - 1:
+                sar = 0xC0
+            else:
+                sar = 0x80
             packet = bytes([sar | (pdu_type & 0x3F)]) + chunk
             await self._client.write_gatt_char(self._data_in, packet, response=False)
             await asyncio.sleep(0.05)
@@ -226,8 +257,8 @@ class MeshGattNode:
     # Network PDU construction (BT Mesh 3.4 + 3.6 + 3.8)
     # ------------------------------------------------------------------
 
-    def _build_network_pdu(self, dst: int, opcode: int, params: bytes) -> bytes:
-        seq = self._next_seq()
+    async def _build_network_pdu(self, dst: int, opcode: int, params: bytes) -> bytes:
+        seq = await self._seq_provider(self._src)
         ctl, ttl = 0, 5
 
         if opcode <= 0x7E:
@@ -256,35 +287,43 @@ class MeshGattNode:
 
         privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self._iv_index) + encrypted[:7]
         pecb = _aes_ecb(self._priv_key, privacy_plaintext)
-        cleartext_header = bytes([(ctl << 7) | (ttl & 0x7F)]) + seq.to_bytes(3, "big") + struct.pack(">H", self._src)
+        cleartext_header = (
+            bytes([(ctl << 7) | (ttl & 0x7F)])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">H", self._src)
+        )
         obfuscated = bytes(a ^ b for a, b in zip(cleartext_header, pecb[:6]))
 
         ivi_nid = ((self._iv_index & 1) << 7) | (self._nid & 0x7F)
         return bytes([ivi_nid]) + obfuscated + encrypted
 
-    async def _send(self, dst: int, opcode: int, params: bytes):
+    async def _send(self, dst: int, opcode: int, params: bytes) -> None:
         if not await self.ensure_connected():
             raise ConnectionError(f"Cannot connect to {self.name}")
-        pdu = self._build_network_pdu(dst, opcode, params)
+        pdu = await self._build_network_pdu(dst, opcode, params)
         await self._send_proxy_pdu(pdu)
 
     # ------------------------------------------------------------------
     # Mesh commands
     # ------------------------------------------------------------------
 
-    async def set_onoff(self, dst: int, onoff: bool):
-        tid = self._next_seq() & 0xFF
+    async def set_onoff(self, dst: int, onoff: bool) -> None:
+        tid = (await self._seq_provider(self._src)) & 0xFF
         await self._send(dst, 0x8203, struct.pack("BB", int(onoff), tid))
         _LOGGER.debug("%s OnOff -> %s", self.name, "ON" if onoff else "OFF")
 
-    async def set_level(self, dst: int, level: int):
+    async def set_level(self, dst: int, level: int) -> None:
         """Generic Level Set Unack. level: -32768 to 32767"""
-        tid = self._next_seq() & 0xFF
-        await self._send(dst, 0x8207, struct.pack("<hB", max(-32768, min(32767, level)), tid))
+        tid = (await self._seq_provider(self._src)) & 0xFF
+        level = max(-32768, min(32767, level))
+        await self._send(dst, 0x8207, struct.pack("<hB", level, tid))
         _LOGGER.debug("%s Level -> %d", self.name, level)
 
-    async def set_ctl(self, dst: int, lightness: int, temperature: int):
+    async def set_ctl(self, dst: int, lightness: int, temperature: int) -> None:
         """Light CTL Set Unack. lightness: 0-65535, temperature: 800-20000K"""
-        tid = self._next_seq() & 0xFF
-        await self._send(dst, 0x8260, struct.pack("<HHHB", lightness & 0xFFFF, temperature & 0xFFFF, 0, tid))
+        tid = (await self._seq_provider(self._src)) & 0xFF
+        await self._send(
+            dst, 0x8260,
+            struct.pack("<HHHB", lightness & 0xFFFF, temperature & 0xFFFF, 0, tid),
+        )
         _LOGGER.debug("%s CTL -> lightness=%d temp=%dK", self.name, lightness, temperature)

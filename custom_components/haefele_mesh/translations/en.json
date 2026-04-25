@@ -8,16 +8,9 @@
           "connect_file": "Configuration file contents (.connect)"
         }
       },
-      "adapter": {
-        "title": "Select Bluetooth Adapter",
-        "description": "Found {node_count} light(s) in your configuration. Select the Bluetooth adapter to use for mesh communication. Use a USB Bluetooth dongle (hci1) if available for better reliability.",
-        "data": {
-          "adapter": "Bluetooth adapter"
-        }
-      },
       "confirm": {
         "title": "Confirm Configuration",
-        "description": "Ready to set up **{node_count}** light(s):\n\n{node_names}\n\nUsing adapter: **{adapter}**\nIV Index: **{iv_index}**\n\nClick Submit to connect.",
+        "description": "Ready to set up **{node_count}** light(s):\n\n{node_names}\n\nIV Index: **{iv_index}**\n\nHome Assistant will use its configured Bluetooth adapter (including ESPHome Bluetooth Proxies) to reach the mesh. Click Submit to continue.",
         "data": {}
       }
     },

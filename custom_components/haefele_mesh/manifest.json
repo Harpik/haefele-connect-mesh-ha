@@ -1,12 +1,16 @@
 {
   "domain": "haefele_mesh",
   "name": "Häfele Connect Mesh",
-  "version": "1.0.0",
-  "documentation": "https://github.com/your-repo/haefele-mesh-ha",
-  "issue_tracker": "https://github.com/your-repo/haefele-mesh-ha/issues",
-  "requirements": ["bleak==0.22.3", "cryptography>=3.0"],
-  "dependencies": [],
-  "codeowners": [],
+  "version": "0.2.0",
+  "documentation": "https://github.com/Harpik/haefele-connect-mesh-ha",
+  "issue_tracker": "https://github.com/Harpik/haefele-connect-mesh-ha/issues",
+  "requirements": [
+    "bleak-retry-connector>=3.5.0",
+    "bitstring>=4.0",
+    "cryptography>=41.0"
+  ],
+  "dependencies": ["bluetooth"],
+  "codeowners": ["@Harpik"],
   "iot_class": "local_push",
   "config_flow": true,
   "integration_type": "hub"
