@@ -1,0 +1,27 @@
+"""Constants for Häfele Connect Mesh integration."""
+
+DOMAIN = "haefele_mesh"
+
+CONF_ADAPTER = "adapter"
+CONF_NETWORK_KEY = "network_key"
+CONF_APP_KEY = "app_key"
+CONF_IV_INDEX = "iv_index"
+CONF_NODES = "nodes"
+
+# BLE
+MESH_PROXY_SERVICE_UUID  = "00001828-0000-1000-8000-00805f9b34fb"
+MESH_PROXY_DATA_IN_UUID  = "00002add-0000-1000-8000-00805f9b34fb"
+MESH_PROXY_DATA_OUT_UUID = "00002ade-0000-1000-8000-00805f9b34fb"
+
+# Heartbeat
+HEARTBEAT_INTERVAL = 60  # seconds
+
+# Mesh crypto
+IV_INDEX_DEFAULT = 1
+SRC_ADDRESS_BASE = 0x0060
+
+# Light capabilities
+LIGHT_MIN_KELVIN = 2700
+LIGHT_MAX_KELVIN = 5000
+LIGHT_MIN_MIREDS = 200   # ~5000K
+LIGHT_MAX_MIREDS = 370   # ~2700K

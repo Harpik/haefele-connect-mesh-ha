@@ -1,0 +1,13 @@
+{
+  "domain": "haefele_mesh",
+  "name": "Häfele Connect Mesh",
+  "version": "1.0.0",
+  "documentation": "https://github.com/your-repo/haefele-mesh-ha",
+  "issue_tracker": "https://github.com/your-repo/haefele-mesh-ha/issues",
+  "requirements": ["bleak==0.22.3", "cryptography>=3.0"],
+  "dependencies": [],
+  "codeowners": [],
+  "iot_class": "local_push",
+  "config_flow": true,
+  "integration_type": "hub"
+}

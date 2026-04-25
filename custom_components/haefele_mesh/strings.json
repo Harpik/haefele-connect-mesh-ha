@@ -1,0 +1,32 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Häfele Connect Mesh",
+        "description": "Paste the full contents of your Häfele Connect Mesh export file (.connect). Export it from the Häfele Connect app: Menu → Settings → Export Configuration.",
+        "data": {
+          "connect_file": "Configuration file contents (.connect)"
+        }
+      },
+      "adapter": {
+        "title": "Select Bluetooth Adapter",
+        "description": "Found {node_count} light(s) in your configuration. Select the Bluetooth adapter to use for mesh communication. Use a USB Bluetooth dongle (hci1) if available for better reliability.",
+        "data": {
+          "adapter": "Bluetooth adapter"
+        }
+      },
+      "confirm": {
+        "title": "Confirm Configuration",
+        "description": "Ready to set up **{node_count}** light(s):\n\n{node_names}\n\nUsing adapter: **{adapter}**\nIV Index: **{iv_index}**\n\nClick Submit to connect.",
+        "data": {}
+      }
+    },
+    "error": {
+      "invalid_config": "Invalid or unrecognized .connect file. Make sure you exported a valid Häfele Connect Mesh configuration.",
+      "unknown": "Unexpected error. Check the logs for details."
+    },
+    "abort": {
+      "already_configured": "Häfele Connect Mesh is already configured."
+    }
+  }
+}
