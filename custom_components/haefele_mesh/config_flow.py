@@ -74,7 +74,7 @@ class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Optional(_FIELD_FILE): selector.FileSelector(
-                    selector.FileSelectorConfig(accept=".connect,.json,application/json,text/plain")
+                    selector.FileSelectorConfig(accept="*/*")
                 ),
                 vol.Optional(_FIELD_TEXT): selector.TextSelector(
                     selector.TextSelectorConfig(multiline=True)
