@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from custom_components.haefele_mesh.connect_parser import parse_connect_file
+from connect_parser import parse_connect_file
 
 
 FIXTURES = Path(__file__).parent / "fixtures"

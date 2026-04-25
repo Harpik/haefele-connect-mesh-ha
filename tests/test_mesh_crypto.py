@@ -11,7 +11,7 @@ For full spec-vector coverage, see Bluetooth Mesh Profile 1.0 § 8.1.
 
 from __future__ import annotations
 
-from custom_components.haefele_mesh.mesh_crypto import (
+from mesh_crypto import (
     aes_ccm_encrypt,
     aes_cmac,
     aes_ecb,
