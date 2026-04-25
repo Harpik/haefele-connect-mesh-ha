@@ -10,7 +10,6 @@
   "issue_tracker": "https://github.com/Harpik/haefele-connect-mesh-ha/issues",
   "requirements": [
     "bleak-retry-connector>=3.5.0",
-    "bitstring>=4.0",
     "cryptography>=41.0"
   ],
   "version": "0.2.0"

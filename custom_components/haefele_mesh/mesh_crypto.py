@@ -39,25 +39,23 @@ def s1(m: bytes) -> bytes:
 
 def k2(n: bytes, p: bytes) -> tuple[int, bytes, bytes]:
     """Mesh Profile spec 3.8.2.6: derive (NID, EncryptionKey, PrivacyKey) from a NetKey."""
-    import bitstring
-
     salt = s1(b"smk2")
     t = aes_cmac(salt, n)
-    t0 = b""
-    t1 = aes_cmac(t, t0 + p + b"\x01")
+    t1 = aes_cmac(t, p + b"\x01")
     t2 = aes_cmac(t, t1 + p + b"\x02")
     t3 = aes_cmac(t, t2 + p + b"\x03")
     k = (t1 + t2 + t3)[-33:]
-    nid, enc, priv = bitstring.BitString(k).unpack("pad:1, uint:7, bits:128, bits:128")
-    return nid, enc.bytes, priv.bytes
+    # k layout: 1 bit pad | 7 bits NID | 128 bits EncKey | 128 bits PrivKey
+    nid = k[0] & 0x7F
+    enc = k[1:17]
+    priv = k[17:33]
+    return nid, enc, priv
 
 
 def k4(n: bytes) -> int:
     """Mesh Profile spec 3.8.2.8: derive AID (6-bit) from an AppKey."""
-    import bitstring
-
     salt = s1(b"smk4")
     t = aes_cmac(salt, n)
-    k = aes_cmac(t, b"id6\x01")[-1:]
-    (aid,) = bitstring.BitString(k).unpack("pad:2, uint:6")
-    return aid
+    k = aes_cmac(t, b"id6\x01")
+    # AID is the low 6 bits of the last byte (2 bits pad | 6 bits AID)
+    return k[-1] & 0x3F
