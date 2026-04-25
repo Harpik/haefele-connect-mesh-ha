@@ -15,6 +15,13 @@ def aes_ccm_encrypt(key: bytes, nonce: bytes, plaintext: bytes, tag_length: int 
     return cipher.encrypt(nonce, plaintext, None)
 
 
+def aes_ccm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes, tag_length: int = 4) -> bytes:
+    """Decrypt AES-CCM. Raises cryptography.exceptions.InvalidTag on MIC failure."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESCCM
+    cipher = AESCCM(key, tag_length=tag_length)
+    return cipher.decrypt(nonce, ciphertext_with_tag, None)
+
+
 def aes_ecb(key: bytes, data: bytes) -> bytes:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.backends import default_backend

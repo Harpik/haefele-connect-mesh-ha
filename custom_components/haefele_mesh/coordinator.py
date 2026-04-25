@@ -29,6 +29,10 @@ SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
 # emitted but not persisted yet. The BT Mesh SEQ space is 24 bits (~16M).
 SEQ_STARTUP_JUMP = 200
 
+# Callback signature for entities registering for status updates
+# (opcode, params) -> None
+StatusCallback = "Callable[[int, bytes], None]"
+
 
 class HaefeleCoordinator(DataUpdateCoordinator):
     """Manages all Häfele Mesh nodes and their availability."""
@@ -44,11 +48,44 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.nodes: dict[str, MeshGattNode] = {}
         self.availability: dict[str, bool] = {}
 
+        # Routing: incoming mesh src_address -> list of entity callbacks.
+        # Entities register the unicast addresses they care about (usually
+        # just their own) at setup time.
+        self._status_handlers: dict[int, list] = {}
+
         # SEQ state: {src_address(int) -> seq(int)} persisted via HA Store
         self._seq_store: Store = Store(hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY)
         self._seq_state: dict[int, int] = {}
         self._seq_lock = asyncio.Lock()
         self._seq_dirty = False
+
+    # ------------------------------------------------------------------
+    # Status routing
+    # ------------------------------------------------------------------
+
+    def register_status_handler(self, src_address: int, callback) -> "Callable[[], None]":
+        """Subscribe to status messages coming from a given mesh unicast.
+
+        Returns an unsubscribe callable.
+        """
+        self._status_handlers.setdefault(src_address, []).append(callback)
+
+        def _unsub() -> None:
+            handlers = self._status_handlers.get(src_address, [])
+            if callback in handlers:
+                handlers.remove(callback)
+            if not handlers:
+                self._status_handlers.pop(src_address, None)
+
+        return _unsub
+
+    def _dispatch_status(self, src_address: int, opcode: int, params: bytes) -> None:
+        """Called by GATT nodes when a decoded access PDU arrives."""
+        for cb in self._status_handlers.get(src_address, ()):
+            try:
+                cb(opcode, params)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Status handler failed for %04X", src_address)
 
     # ------------------------------------------------------------------
     # SEQ management
@@ -121,6 +158,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 src_address=src_address,
                 seq_provider=self.next_seq,
                 name=node_cfg["name"],
+                message_handler=self._dispatch_status,
             )
             self.nodes[node_id] = node
             self.availability[node_id] = False

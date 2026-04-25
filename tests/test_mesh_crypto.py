@@ -12,6 +12,7 @@ For full spec-vector coverage, see Bluetooth Mesh Profile 1.0 § 8.1.
 from __future__ import annotations
 
 from mesh_crypto import (
+    aes_ccm_decrypt,
     aes_ccm_encrypt,
     aes_cmac,
     aes_ecb,
@@ -57,6 +58,27 @@ def test_aes_ccm_length_with_tag4():
     pt = b"hello mesh"
     ct = aes_ccm_encrypt(key, nonce, pt, tag_length=4)
     assert len(ct) == len(pt) + 4
+
+
+def test_aes_ccm_roundtrip_tag4():
+    key = b"\x22" * 16
+    nonce = b"\x01" * 13
+    pt = b"\xde\xad\xbe\xef payload"
+    ct = aes_ccm_encrypt(key, nonce, pt, tag_length=4)
+    assert aes_ccm_decrypt(key, nonce, ct, tag_length=4) == pt
+
+
+def test_aes_ccm_tag_mismatch_raises():
+    import pytest
+    from cryptography.exceptions import InvalidTag
+
+    key = b"\x22" * 16
+    nonce = b"\x01" * 13
+    pt = b"secret"
+    ct = bytearray(aes_ccm_encrypt(key, nonce, pt, tag_length=4))
+    ct[-1] ^= 0x01  # corrupt the tag
+    with pytest.raises(InvalidTag):
+        aes_ccm_decrypt(key, nonce, bytes(ct), tag_length=4)
 
 
 # ---------------------------------------------------------------------------
