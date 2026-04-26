@@ -1,15 +1,23 @@
 """
-Bluetooth Mesh GATT Proxy Bearer for Häfele Connect Mesh.
+Bluetooth Mesh GATT Proxy bearer for Häfele Connect Mesh.
 
-Handles BLE connection, PDU segmentation, encryption and
-sequence number management per BT Mesh spec. Also decodes
-inbound Network → Transport → Access PDUs so status messages
-emitted by mesh nodes (when they are turned on/off/changed by
-a physical switch or the Häfele app) can update HA state.
+Architecture (post-refactor):
 
-Uses Home Assistant's bluetooth subsystem (supports local HCI
-adapters and ESPHome Bluetooth Proxies transparently) and
-bleak-retry-connector for robust connections.
+* `MeshSession` — pure crypto + PDU construction/decoding. No BLE, no
+  Home Assistant. Holds NetKey/AppKey-derived material, our single SRC
+  address and the SEQ provider.
+
+* `MeshProxyConnection` — owns a SINGLE GATT connection to ONE reachable
+  Häfele node that implements the Mesh Proxy service (UUID 0x1828).
+  All commands and inbound traffic for the whole mesh flow through
+  this one link; the proxy node forwards to/from the mesh via its
+  radio (advertising bearer). This matches BT Mesh 6.6 and Haefele's
+  real deployment where typically only 1–2 nodes advertise the
+  Proxy service.
+
+Legacy `MeshGattNode` (one-connection-per-lamp) has been removed — it
+broke on nodes that accept GATT but aren't functional proxies (e.g.
+'Cocina fuegos' in Jose's install).
 """
 
 from __future__ import annotations
@@ -38,145 +46,381 @@ from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k4
 _LOGGER = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Callback types
-# ---------------------------------------------------------------------------
-
 SeqProvider = Callable[[int], Awaitable[int]]
-"""Callback `(src_address) -> next_seq` owned by the coordinator."""
-
 MessageHandler = Callable[[int, int, bytes], None]
-"""`(src_address, opcode, params) -> None` — fired for each decoded access PDU."""
+"""`(src_address, opcode, params) -> None`."""
 
 
 # ---------------------------------------------------------------------------
-# GATT Proxy node
+# Crypto + PDU construction/decoding (no BLE)
 # ---------------------------------------------------------------------------
 
-class MeshGattNode:
+class MeshSession:
+    """BT Mesh network-/transport-/access-layer codec with no BLE.
+
+    Holds the single (src_address, iv_index, NetKey-derived, AppKey-derived)
+    context used for every frame we emit or receive.
     """
-    Controls a single Häfele Mesh node via GATT Proxy bearer.
 
-    Uses Home Assistant's bluetooth subsystem for device lookup
-    (so ESPHome Bluetooth Proxies work out of the box) and
-    bleak-retry-connector for the actual connection.
+    def __init__(
+        self,
+        net_key_hex: str,
+        app_key_hex: str,
+        src_address: int,
+        iv_index: int,
+        seq_provider: SeqProvider,
+    ):
+        self._net_key = bytes.fromhex(net_key_hex)
+        self._app_key = bytes.fromhex(app_key_hex)
+        self.src = src_address & 0xFFFF
+        self.iv_index = iv_index
+        self._seq_provider = seq_provider
+
+        # Derived from NetKey: NID + Encryption Key + Privacy Key
+        self.nid, self._enc_key, self._priv_key = k2(self._net_key, b"\x00")
+        # Derived from AppKey: 6-bit AID
+        self.aid = k4(self._app_key)
+
+    # ------------------------------------------------------------------
+    # Outbound — application (access) messages
+    # ------------------------------------------------------------------
+
+    async def build_access_network_pdu(
+        self, dst: int, opcode: int, params: bytes
+    ) -> bytes:
+        """Encode an access-layer message as a BT Mesh Network PDU."""
+        seq = await self._seq_provider(self.src)
+        ctl, ttl = 0, 5
+
+        access_pdu = encode_opcode(opcode) + params
+
+        app_nonce = (
+            bytes([0x01, 0x00])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">HH", self.src, dst)
+            + struct.pack(">I", self.iv_index)
+        )
+        upper_transport = aes_ccm_encrypt(self._app_key, app_nonce, access_pdu, tag_length=4)
+        # Lower Transport: SEG=0, AKF=1, AID
+        trans_pdu = bytes([(1 << 6) | (self.aid & 0x3F)]) + upper_transport
+
+        return self._wrap_network_pdu(
+            plaintext=struct.pack(">H", dst) + trans_pdu,
+            ctl=ctl, ttl=ttl, seq=seq,
+        )
+
+    # ------------------------------------------------------------------
+    # Outbound — proxy-config messages (encrypted at net layer only)
+    # ------------------------------------------------------------------
+
+    async def build_proxy_config_pdu(self, message: bytes) -> bytes:
+        """Wrap a Proxy Configuration message as a Network PDU (CTL=1, TTL=0)."""
+        seq = await self._seq_provider(self.src)
+        ctl, ttl = 1, 0
+        plaintext = struct.pack(">H", 0x0000) + message  # DST = 0x0000
+        return self._wrap_network_pdu(plaintext, ctl=ctl, ttl=ttl, seq=seq)
+
+    def _wrap_network_pdu(
+        self, plaintext: bytes, ctl: int, ttl: int, seq: int
+    ) -> bytes:
+        """Encrypt + obfuscate a network-layer plaintext into a Network PDU."""
+        net_nonce = (
+            bytes([0x00, (ctl << 7) | (ttl & 0x7F)])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">H", self.src)
+            + bytes([0x00, 0x00])
+            + struct.pack(">I", self.iv_index)
+        )
+        tag_length = 8 if ctl else 4
+        encrypted = aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=tag_length)
+
+        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self.iv_index) + encrypted[:7]
+        pecb = aes_ecb(self._priv_key, privacy_plaintext)
+        cleartext_header = (
+            bytes([(ctl << 7) | (ttl & 0x7F)])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">H", self.src)
+        )
+        obfuscated = bytes(a ^ b for a, b in zip(cleartext_header, pecb[:6]))
+
+        ivi_nid = ((self.iv_index & 1) << 7) | (self.nid & 0x7F)
+        return bytes([ivi_nid]) + obfuscated + encrypted
+
+    # ------------------------------------------------------------------
+    # Inbound
+    # ------------------------------------------------------------------
+
+    def decode_access_pdu(self, pdu: bytes) -> Optional[tuple[int, int, int, bytes]]:
+        """Decrypt an inbound Network PDU carrying an access message.
+
+        Returns (src, dst, opcode, params) or None if the frame is not ours,
+        not an access message, malformed, segmented (unsupported), etc.
+        """
+        header = self._decode_network_header(pdu)
+        if header is None:
+            return None
+        ctl, seq, src, plaintext = header
+        if ctl:
+            # Control PDUs handled elsewhere if needed.
+            _LOGGER.debug("ctl PDU src=%04X seq=%d — not an access message", src, seq)
+            return None
+
+        if len(plaintext) < 3:
+            return None
+        dst = int.from_bytes(plaintext[:2], "big")
+        transport_pdu = plaintext[2:]
+
+        seg = (transport_pdu[0] >> 7) & 1
+        akf = (transport_pdu[0] >> 6) & 1
+        aid = transport_pdu[0] & 0x3F
+        if seg:
+            _LOGGER.debug("Ignoring segmented PDU from %04X (unsupported)", src)
+            return None
+        if not akf:
+            _LOGGER.debug("RX devkey-encrypted PDU src=%04X (ignored)", src)
+            return None
+        if aid != self.aid:
+            _LOGGER.debug(
+                "AID mismatch (got 0x%02X, expected 0x%02X) — different AppKey",
+                aid, self.aid,
+            )
+            return None
+
+        upper = transport_pdu[1:]
+        if len(upper) < 5:
+            return None
+        app_nonce = (
+            bytes([0x01, 0x00])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">HH", src, dst)
+            + struct.pack(">I", self.iv_index)
+        )
+        try:
+            access_pdu = aes_ccm_decrypt(self._app_key, app_nonce, upper, tag_length=4)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("App MIC failed src=%04X seq=%d", src, seq)
+            return None
+
+        decoded = decode_opcode(access_pdu)
+        if decoded is None:
+            _LOGGER.debug("Unable to decode opcode raw=%s", access_pdu.hex())
+            return None
+        opcode, params = decoded
+        return src, dst, opcode, params
+
+    def decode_proxy_config(self, pdu: bytes) -> Optional[tuple[int, bytes]]:
+        """Decrypt an inbound Proxy Configuration PDU, return (opcode, params)."""
+        header = self._decode_network_header(pdu, expected_ctl=1)
+        if header is None:
+            return None
+        _ctl, _seq, _src, plaintext = header
+        if len(plaintext) < 3:
+            return None
+        # plaintext = dst(2) + opcode(1) + params
+        opcode = plaintext[2]
+        return opcode, plaintext[3:]
+
+    def _decode_network_header(
+        self, pdu: bytes, expected_ctl: Optional[int] = None
+    ) -> Optional[tuple[int, int, int, bytes]]:
+        """Strip obfuscation + net encryption. Returns (ctl, seq, src, plaintext)."""
+        if len(pdu) < 10:
+            _LOGGER.debug("Network PDU too short: %d bytes", len(pdu))
+            return None
+
+        ivi_nid = pdu[0]
+        nid = ivi_nid & 0x7F
+        if nid != self.nid:
+            _LOGGER.debug("NID mismatch (got 0x%02X, expected 0x%02X)", nid, self.nid)
+            return None
+
+        obfuscated = pdu[1:7]
+        encrypted = pdu[7:]
+        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self.iv_index) + encrypted[:7]
+        pecb = aes_ecb(self._priv_key, privacy_plaintext)
+        clear_hdr = bytes(a ^ b for a, b in zip(obfuscated, pecb[:6]))
+        ctl_ttl = clear_hdr[0]
+        ctl = (ctl_ttl >> 7) & 1
+        seq = int.from_bytes(clear_hdr[1:4], "big")
+        src = int.from_bytes(clear_hdr[4:6], "big")
+
+        if expected_ctl is not None and ctl != expected_ctl:
+            return None
+
+        net_mic_len = 8 if ctl else 4
+        if len(encrypted) < net_mic_len + 2:
+            _LOGGER.debug("Net ciphertext too short (src=%04X)", src)
+            return None
+
+        net_nonce = (
+            bytes([0x00, ctl_ttl])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">H", src)
+            + bytes([0x00, 0x00])
+            + struct.pack(">I", self.iv_index)
+        )
+        try:
+            plaintext = aes_ccm_decrypt(
+                self._enc_key, net_nonce, encrypted, tag_length=net_mic_len
+            )
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug(
+                "Net MIC failed (src=%04X seq=%d ctl=%d) — not ours / replay / foreign",
+                src, seq, ctl,
+            )
+            return None
+
+        return ctl, seq, src, plaintext
+
+
+# ---------------------------------------------------------------------------
+# Shared GATT Proxy connection
+# ---------------------------------------------------------------------------
+
+class MeshProxyConnection:
+    """Single shared GATT Proxy connection for the whole Häfele network.
+
+    Accepts a list of candidate MACs (usually every provisioned node) and
+    connects to the first one that (a) advertises the Mesh Proxy service
+    and (b) behaves as a real proxy (forwards traffic). All commands to
+    any destination unicast / group are routed through this one link —
+    the connected proxy injects frames into the mesh via its radio, so
+    nodes that don't have the Proxy feature enabled (e.g. remote-only
+    lamps in the Häfele ecosystem) remain reachable via advertising
+    bearer.
     """
 
     def __init__(
         self,
         hass: HomeAssistant,
-        mac: str,
-        unicast: int,
-        net_key_hex: str,
-        app_key_hex: str,
-        src_address: int,
-        seq_provider: SeqProvider,
-        iv_index: int = 1,
-        name: str = "",
+        session: MeshSession,
         message_handler: MessageHandler | None = None,
     ):
         self._hass = hass
-        self.mac = mac.upper()
-        self.unicast = unicast
-        self.name = name or self.mac
-        self._iv_index = iv_index
-        self._src = src_address
-        self._seq_provider = seq_provider
+        self._session = session
         self._message_handler = message_handler
 
-        # Crypto — derived once from network/app keys
-        self._net_key = bytes.fromhex(net_key_hex)
-        self._app_key = bytes.fromhex(app_key_hex)
-        self._nid, self._enc_key, self._priv_key = k2(self._net_key, b"\x00")
-        self._aid = k4(self._app_key)
-
-        # BLE state
         self._client: Optional[BleakClientWithServiceCache] = None
         self._data_in = None
+        self._active_mac: Optional[str] = None
+        self._active_name: str = ""
         self._incoming: asyncio.Queue = asyncio.Queue()
         self._reassembly_buf = bytearray()
+        self._rx_task: Optional[asyncio.Task] = None
         self._connect_lock = asyncio.Lock()
-        self._rx_task: asyncio.Task | None = None
+        # Track candidates ordered by last success so we retry smart.
+        self._candidates: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------
-    # Connection
+    # Lifecycle
     # ------------------------------------------------------------------
 
-    def _resolve_device(self) -> Optional[BLEDevice]:
-        """Ask HA's bluetooth manager for the current BLEDevice."""
-        return bluetooth.async_ble_device_from_address(
-            self._hass, self.mac, connectable=True
-        )
+    def set_candidates(self, candidates: list[tuple[str, str]]) -> None:
+        """Set the (mac, name) list we're allowed to connect to."""
+        self._candidates = [(m.upper(), n) for m, n in candidates]
 
-    async def connect(self, timeout: float = 20.0) -> bool:
-        """Establish a GATT connection and subscribe to notifications."""
+    @property
+    def is_connected(self) -> bool:
+        return self._client is not None and self._client.is_connected
+
+    @property
+    def active_mac(self) -> Optional[str]:
+        return self._active_mac if self.is_connected else None
+
+    @property
+    def active_name(self) -> str:
+        return self._active_name if self.is_connected else ""
+
+    async def connect_any(self, timeout_per_candidate: float = 15.0) -> bool:
+        """Try each candidate in order; return True on first success."""
         async with self._connect_lock:
             if self.is_connected:
                 return True
+            for mac, name in self._candidates:
+                ok = await self._try_connect(mac, name, timeout=timeout_per_candidate)
+                if ok:
+                    # Move the winner to the front for next time.
+                    self._candidates = (
+                        [(mac, name)]
+                        + [c for c in self._candidates if c[0] != mac]
+                    )
+                    return True
+                _LOGGER.debug("Proxy candidate %s (%s) unusable, trying next", name, mac)
+            _LOGGER.warning(
+                "No Häfele node reachable as a mesh proxy (%d candidates tried)",
+                len(self._candidates),
+            )
+            return False
 
-            device = self._resolve_device()
-            if device is None:
-                _LOGGER.warning(
-                    "Device %s (%s) not seen by HA bluetooth; is the node in range "
-                    "of the HA adapter or an ESPHome BT proxy?",
-                    self.name, self.mac,
-                )
-                return False
+    async def _try_connect(self, mac: str, name: str, timeout: float) -> bool:
+        device = bluetooth.async_ble_device_from_address(
+            self._hass, mac, connectable=True
+        )
+        if device is None:
+            _LOGGER.debug(
+                "Proxy candidate %s (%s) not seen by HA bluetooth",
+                name, mac,
+            )
+            return False
 
+        try:
+            client = await establish_connection(
+                BleakClientWithServiceCache,
+                device,
+                name or mac,
+                disconnected_callback=self._on_disconnected,
+                max_attempts=2,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Connect to %s (%s) failed: %s", name, mac, err)
+            return False
+
+        data_in = client.services.get_characteristic(MESH_PROXY_DATA_IN_UUID)
+        data_out = client.services.get_characteristic(MESH_PROXY_DATA_OUT_UUID)
+        if not data_in or not data_out:
+            _LOGGER.debug("Mesh Proxy characteristics missing on %s", mac)
             try:
-                self._client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    device,
-                    self.name,
-                    disconnected_callback=self._on_disconnected,
-                    max_attempts=3,
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("Failed to connect to %s: %s", self.name, err)
-                return False
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
 
-            self._data_in = self._client.services.get_characteristic(MESH_PROXY_DATA_IN_UUID)
-            data_out = self._client.services.get_characteristic(MESH_PROXY_DATA_OUT_UUID)
-            if not self._data_in or not data_out:
-                _LOGGER.error("Mesh Proxy characteristics not found on %s", self.mac)
-                await self._safe_disconnect()
-                return False
-
+        try:
+            await client.start_notify(data_out, self._on_notification)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("start_notify on %s failed: %s", mac, err)
             try:
-                await self._client.start_notify(data_out, self._on_notification)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("start_notify failed on %s: %s", self.name, err)
-                await self._safe_disconnect()
-                return False
+                await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
 
-            # Start incoming pipeline consumer
-            if self._rx_task is None or self._rx_task.done():
-                self._rx_task = asyncio.create_task(
-                    self._incoming_pump(), name=f"haefele-rx-{self.mac}"
-                )
+        self._client = client
+        self._data_in = data_in
+        self._active_mac = mac
+        self._active_name = name or mac
 
-            # Configure the Proxy Filter so the node forwards inbound mesh
-            # traffic to us. Per BT Mesh 6.4, the default filter is an
-            # *accept list* with an empty list, i.e. nothing gets through.
-            # We switch it to a *reject list* (0x01) with empty list, which
-            # means "forward everything" — exactly what we need to see
-            # status messages from physical switches and the Häfele app.
-            try:
-                await self._configure_proxy_filter(reject_list=True)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning(
-                    "Proxy filter setup failed on %s: %s (status RX may be blocked)",
-                    self.name, err,
-                )
+        if self._rx_task is None or self._rx_task.done():
+            self._rx_task = asyncio.create_task(
+                self._incoming_pump(), name=f"haefele-rx-{mac}"
+            )
 
-            _LOGGER.info("Connected to %s (%s) [nid=0x%02X aid=0x%02X src=0x%04X]",
-                         self.name, self.mac, self._nid, self._aid, self._src)
-            return True
+        # Configure the proxy filter so it forwards everything from the mesh.
+        try:
+            await self._configure_proxy_filter(reject_list=True)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Proxy filter setup failed on %s: %s", mac, err)
+
+        _LOGGER.info(
+            "Mesh proxy connected via %s (%s) [nid=0x%02X aid=0x%02X src=0x%04X]",
+            name, mac, self._session.nid, self._session.aid, self._session.src,
+        )
+        return True
 
     def _on_disconnected(self, _client) -> None:
-        _LOGGER.debug("BLE disconnected from %s", self.name)
+        _LOGGER.debug("BLE disconnected from proxy %s", self._active_name)
 
-    async def _safe_disconnect(self) -> None:
+    async def disconnect(self) -> None:
         if self._rx_task is not None and not self._rx_task.done():
             self._rx_task.cancel()
             try:
@@ -184,30 +428,23 @@ class MeshGattNode:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._rx_task = None
-
         if self._client is not None:
             try:
                 await self._client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
-            self._client = None
-            self._data_in = None
+        self._client = None
+        self._data_in = None
+        self._active_mac = None
+        self._active_name = ""
 
-    async def disconnect(self) -> None:
-        await self._safe_disconnect()
-        _LOGGER.debug("Disconnected from %s", self.name)
-
-    @property
-    def is_connected(self) -> bool:
-        return self._client is not None and self._client.is_connected
-
-    async def ensure_connected(self, timeout: float = 20.0) -> bool:
+    async def ensure_connected(self) -> bool:
         if self.is_connected:
             return True
-        return await self.connect(timeout=timeout)
+        return await self.connect_any()
 
     # ------------------------------------------------------------------
-    # Inbound pipeline: SAR reassembly → Network → Transport → Access
+    # Inbound pipeline
     # ------------------------------------------------------------------
 
     def _on_notification(self, _char, data: bytearray) -> None:
@@ -219,7 +456,7 @@ class MeshGattNode:
         payload = bytes(data[1:])
         _LOGGER.debug(
             "RX raw %s: sar=%d type=0x%02X len=%d",
-            self.name, sar, pdu_type, len(payload),
+            self._active_name, sar, pdu_type, len(payload),
         )
 
         if sar in (0x00, 0x01):
@@ -231,156 +468,65 @@ class MeshGattNode:
             self._incoming.put_nowait((pdu_type, bytes(self._reassembly_buf)))
 
     async def _incoming_pump(self) -> None:
-        """Consume the reassembled-PDU queue and route decrypted access PDUs."""
         try:
             while True:
                 pdu_type, pdu = await self._incoming.get()
                 if pdu_type == 0x02:
-                    # Proxy Configuration message (e.g. Filter Status).
                     try:
                         self._handle_proxy_config(pdu)
                     except Exception as err:  # noqa: BLE001
-                        _LOGGER.debug("Malformed proxy-config PDU from %s: %s", self.name, err)
+                        _LOGGER.debug("Malformed proxy-config PDU: %s", err)
                     continue
                 if pdu_type != 0x00:
-                    # 0x01=mesh beacon, 0x03=provisioning. Ignore.
-                    _LOGGER.debug("Ignoring proxy PDU type 0x%02X on %s", pdu_type, self.name)
+                    _LOGGER.debug("Ignoring proxy PDU type 0x%02X", pdu_type)
                     continue
                 try:
                     self._handle_network_pdu(pdu)
                 except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("Dropped malformed inbound PDU from %s: %s", self.name, err)
+                    _LOGGER.debug("Dropped malformed inbound PDU: %s", err)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            _LOGGER.exception("Incoming PDU pump crashed for %s", self.name)
+            _LOGGER.exception("Incoming PDU pump crashed")
 
     def _handle_network_pdu(self, pdu: bytes) -> None:
-        """Decrypt Network PDU → Transport PDU → Access PDU, fire callback."""
-        if len(pdu) < 10:
-            _LOGGER.debug("Network PDU too short on %s: %d bytes", self.name, len(pdu))
-            return
-
-        # Byte 0 = IVI(1) | NID(7)
-        ivi_nid = pdu[0]
-        nid = ivi_nid & 0x7F
-        if nid != self._nid:
-            _LOGGER.debug(
-                "NID mismatch on %s (got 0x%02X, expected 0x%02X) — foreign mesh",
-                self.name, nid, self._nid,
-            )
-            return  # Not for our network
-
-        obfuscated = pdu[1:7]
-        encrypted = pdu[7:]  # encrypted [dst(2) + transport_pdu + net_mic]
-
-        # De-obfuscate header using Privacy Key
-        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self._iv_index) + encrypted[:7]
-        pecb = aes_ecb(self._priv_key, privacy_plaintext)
-        clear_hdr = bytes(a ^ b for a, b in zip(obfuscated, pecb[:6]))
-        ctl_ttl = clear_hdr[0]
-        ctl = (ctl_ttl >> 7) & 1
-        seq = int.from_bytes(clear_hdr[1:4], "big")
-        src = int.from_bytes(clear_hdr[4:6], "big")
-
-        # Network MIC length: 4 for access (ctl=0), 8 for control (ctl=1)
-        net_mic_len = 8 if ctl else 4
-        if len(encrypted) < net_mic_len + 2:
-            _LOGGER.debug("Encrypted section too short on %s", self.name)
-            return
-
-        net_nonce = (
-            bytes([0x00, ctl_ttl])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", src)
-            + bytes([0x00, 0x00])
-            + struct.pack(">I", self._iv_index)
-        )
-        try:
-            plaintext = aes_ccm_decrypt(
-                self._enc_key, net_nonce, encrypted, tag_length=net_mic_len
-            )
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug(
-                "Net MIC failed on %s (src=%04X seq=%d ctl=%d) — not ours / replay",
-                self.name, src, seq, ctl,
-            )
-            return  # MIC failure → not for us / foreign mesh / replay
-
-        if len(plaintext) < 3:
-            _LOGGER.debug("Decrypted payload too short on %s", self.name)
-            return
-        dst = int.from_bytes(plaintext[:2], "big")
-        transport_pdu = plaintext[2:]
-
-        if ctl:
-            # Control PDUs (heartbeat, ack, friendship…) — ignore for now.
-            _LOGGER.debug(
-                "RX ctl PDU on %s src=%04X dst=%04X (ignored)",
-                self.name, src, dst,
-            )
-            return
-
-        # Lower Transport PDU (access): [SEG(1)|AKF(1)|AID(6)] ...
-        seg = (transport_pdu[0] >> 7) & 1
-        akf = (transport_pdu[0] >> 6) & 1
-        aid = transport_pdu[0] & 0x3F
-
-        if seg:
-            # Segmented Access PDUs — for MVP we ignore. Status messages from
-            # Generic/Light servers fit in one segment so this is rarely needed.
-            _LOGGER.debug("Ignoring segmented PDU from %04X (not yet supported)", src)
-            return
-        if not akf:
-            # Device-key encrypted (configuration messages) — not for us.
-            _LOGGER.debug("RX devkey-encrypted PDU on %s src=%04X (ignored)", self.name, src)
-            return
-        if aid != self._aid:
-            _LOGGER.debug(
-                "AID mismatch on %s (got 0x%02X, expected 0x%02X) — different AppKey",
-                self.name, aid, self._aid,
-            )
-            return  # Different AppKey
-
-        # Upper Transport PDU = transport_pdu[1:], tag 4 bytes at the end
-        upper = transport_pdu[1:]
-        if len(upper) < 5:
-            return
-
-        app_nonce = (
-            bytes([0x01, 0x00])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">HH", src, dst)
-            + struct.pack(">I", self._iv_index)
-        )
-        try:
-            access_pdu = aes_ccm_decrypt(self._app_key, app_nonce, upper, tag_length=4)
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("App MIC failed on %s src=%04X seq=%d", self.name, src, seq)
-            return
-
-        decoded = decode_opcode(access_pdu)
+        decoded = self._session.decode_access_pdu(pdu)
         if decoded is None:
-            _LOGGER.debug("Unable to decode opcode on %s, raw=%s", self.name, access_pdu.hex())
             return
-        opcode, params = decoded
-
+        src, dst, opcode, params = decoded
         _LOGGER.debug(
-            "RX %s: src=%04X dst=%04X op=%#06x params=%s",
-            self.name, src, dst, opcode, params.hex(),
+            "RX src=%04X dst=%04X op=%#06x params=%s",
+            src, dst, opcode, params.hex(),
         )
-
         if self._message_handler is not None:
             try:
                 self._message_handler(src, opcode, params)
             except Exception:  # noqa: BLE001
-                _LOGGER.exception("Message handler raised for %s", self.name)
+                _LOGGER.exception("Message handler raised for src=%04X", src)
+
+    def _handle_proxy_config(self, pdu: bytes) -> None:
+        decoded = self._session.decode_proxy_config(pdu)
+        if decoded is None:
+            return
+        opcode, params = decoded
+        if opcode == 0x03 and len(params) >= 3:
+            filter_type = params[0]
+            list_size = int.from_bytes(params[1:3], "big")
+            _LOGGER.debug(
+                "Proxy Filter Status: type=0x%02X size=%d", filter_type, list_size,
+            )
+        else:
+            _LOGGER.debug(
+                "Proxy-config op=0x%02X params=%s", opcode, params.hex(),
+            )
 
     # ------------------------------------------------------------------
-    # PDU segmentation (outbound BT Mesh 6.6.2)
+    # Outbound
     # ------------------------------------------------------------------
 
     async def _send_proxy_pdu(self, pdu: bytes, pdu_type: int = 0x00) -> None:
+        if not self._client or not self._client.is_connected or self._data_in is None:
+            raise ConnectionError("No active mesh-proxy connection")
         max_chunk = 19
         chunks = [pdu[i:i + max_chunk] for i in range(0, len(pdu), max_chunk)]
         for i, chunk in enumerate(chunks):
@@ -396,201 +542,66 @@ class MeshGattNode:
             await self._client.write_gatt_char(self._data_in, packet, response=False)
             await asyncio.sleep(0.05)
 
-    # ------------------------------------------------------------------
-    # Network PDU construction (BT Mesh 3.4 + 3.6 + 3.8)
-    # ------------------------------------------------------------------
-
-    async def _build_network_pdu(self, dst: int, opcode: int, params: bytes) -> bytes:
-        seq = await self._seq_provider(self._src)
-        ctl, ttl = 0, 5
-
-        access_pdu = encode_opcode(opcode) + params
-
-        app_nonce = (
-            bytes([0x01, 0x00])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">HH", self._src, dst)
-            + struct.pack(">I", self._iv_index)
-        )
-        upper_transport = aes_ccm_encrypt(self._app_key, app_nonce, access_pdu, tag_length=4)
-        trans_pdu = bytes([(1 << 6) | (self._aid & 0x3F)]) + upper_transport
-
-        net_nonce = (
-            bytes([0x00, (ctl << 7) | (ttl & 0x7F)])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", self._src)
-            + bytes([0x00, 0x00])
-            + struct.pack(">I", self._iv_index)
-        )
-        plaintext = struct.pack(">H", dst) + trans_pdu
-        encrypted = aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=4)
-
-        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self._iv_index) + encrypted[:7]
-        pecb = aes_ecb(self._priv_key, privacy_plaintext)
-        cleartext_header = (
-            bytes([(ctl << 7) | (ttl & 0x7F)])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", self._src)
-        )
-        obfuscated = bytes(a ^ b for a, b in zip(cleartext_header, pecb[:6]))
-
-        ivi_nid = ((self._iv_index & 1) << 7) | (self._nid & 0x7F)
-        return bytes([ivi_nid]) + obfuscated + encrypted
-
-    async def _send(self, dst: int, opcode: int, params: bytes) -> None:
+    async def send_access(self, dst: int, opcode: int, params: bytes) -> None:
+        """Send an access-layer message (encrypted with AppKey) to dst."""
         if not await self.ensure_connected():
-            raise ConnectionError(f"Cannot connect to {self.name}")
-        pdu = await self._build_network_pdu(dst, opcode, params)
-        await self._send_proxy_pdu(pdu)
+            raise ConnectionError("No mesh proxy available")
+        pdu = await self._session.build_access_network_pdu(dst, opcode, params)
+        await self._send_proxy_pdu(pdu, pdu_type=0x00)
+
+    async def _configure_proxy_filter(self, reject_list: bool = True) -> None:
+        filter_type = 0x01 if reject_list else 0x00
+        message = bytes([0x00, filter_type])  # Opcode 0x00 = Set Filter Type
+        pdu = await self._session.build_proxy_config_pdu(message)
+        await self._send_proxy_pdu(pdu, pdu_type=0x02)
+        _LOGGER.debug(
+            "Proxy filter set to %s",
+            "reject-empty (forward all)" if reject_list else "accept-empty",
+        )
 
     # ------------------------------------------------------------------
-    # Mesh commands — Set (acknowledged-Unack variants are fire-and-forget
+    # High-level mesh commands (stateless — dst is provided by caller)
     # ------------------------------------------------------------------
 
     async def set_onoff(self, dst: int, onoff: bool) -> None:
-        tid = (await self._seq_provider(self._src)) & 0xFF
-        await self._send(dst, 0x8203, struct.pack("BB", int(onoff), tid))
-        _LOGGER.debug("%s OnOff -> %s", self.name, "ON" if onoff else "OFF")
+        tid = (await self._session._seq_provider(self._session.src)) & 0xFF
+        await self.send_access(
+            dst, 0x8203, struct.pack("BB", int(onoff), tid),
+        )
+        _LOGGER.debug("OnOff -> %s dst=%04X", "ON" if onoff else "OFF", dst)
 
     async def set_level(self, dst: int, level: int) -> None:
-        """Generic Level Set Unack. level: -32768 to 32767"""
-        tid = (await self._seq_provider(self._src)) & 0xFF
+        tid = (await self._session._seq_provider(self._session.src)) & 0xFF
         level = max(-32768, min(32767, level))
-        await self._send(dst, 0x8207, struct.pack("<hB", level, tid))
-        _LOGGER.debug("%s Level -> %d", self.name, level)
+        await self.send_access(
+            dst, 0x8207, struct.pack("<hB", level, tid),
+        )
+        _LOGGER.debug("Level -> %d dst=%04X", level, dst)
+
+    async def set_lightness(self, dst: int, lightness: int) -> None:
+        """Light Lightness Set Unacknowledged (0x824D)."""
+        tid = (await self._session._seq_provider(self._session.src)) & 0xFF
+        await self.send_access(
+            dst, 0x824D, struct.pack("<HB", lightness & 0xFFFF, tid),
+        )
+        _LOGGER.debug("Lightness -> %d dst=%04X", lightness, dst)
 
     async def set_ctl(self, dst: int, lightness: int, temperature: int) -> None:
-        """Light CTL Set Unacknowledged (0x825F).
-
-        lightness: 0-65535, temperature: 800-20000K, delta_uv signed defaults to 0.
-        Note: 0x8260 is Light CTL *Status*, not Set — using it as a command
-        makes the server drop the message silently.
-        """
-        tid = (await self._seq_provider(self._src)) & 0xFF
-        await self._send(
+        """Light CTL Set Unacknowledged (0x825F)."""
+        tid = (await self._session._seq_provider(self._session.src)) & 0xFF
+        await self.send_access(
             dst, 0x825F,
             struct.pack("<HHhB", lightness & 0xFFFF, temperature & 0xFFFF, 0, tid),
         )
-        _LOGGER.debug("%s CTL -> lightness=%d temp=%dK", self.name, lightness, temperature)
-
-    # ------------------------------------------------------------------
-    # Proxy Configuration (BT Mesh 6.5)
-    # ------------------------------------------------------------------
-
-    async def _configure_proxy_filter(self, reject_list: bool = True) -> None:
-        """Send a Proxy Configuration \"Set Filter Type\" message.
-
-        Default GATT Proxy filter is *accept list + empty* which silently drops
-        everything coming from the mesh. Switching to *reject list + empty*
-        means \"forward everything\".
-        """
-        if not self._client or not self._client.is_connected:
-            return
-        filter_type = 0x01 if reject_list else 0x00
-        # Proxy Config message = opcode(1) + params. Opcode 0x00 = Set Filter Type.
-        message = bytes([0x00, filter_type])
-        pdu = await self._build_proxy_config_pdu(message)
-        await self._send_proxy_pdu(pdu, pdu_type=0x02)
         _LOGGER.debug(
-            "%s proxy filter set to %s",
-            self.name, "reject-empty (forward all)" if reject_list else "accept-empty",
+            "CTL -> lightness=%d temp=%dK dst=%04X", lightness, temperature, dst,
         )
-
-    async def _build_proxy_config_pdu(self, message: bytes) -> bytes:
-        """Build a Network PDU carrying a Proxy Configuration message.
-
-        Proxy config messages: CTL=1, TTL=0, DST=0x0000, encrypted at network
-        layer only (no Upper/Lower Transport), using master security credentials.
-        """
-        seq = await self._seq_provider(self._src)
-        ctl, ttl = 1, 0
-
-        dst_bytes = struct.pack(">H", 0x0000)
-        plaintext = dst_bytes + message
-
-        net_nonce = (
-            bytes([0x00, (ctl << 7) | (ttl & 0x7F)])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", self._src)
-            + bytes([0x00, 0x00])
-            + struct.pack(">I", self._iv_index)
-        )
-        # CTL=1 → NetMIC is 8 bytes
-        encrypted = aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=8)
-
-        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self._iv_index) + encrypted[:7]
-        pecb = aes_ecb(self._priv_key, privacy_plaintext)
-        cleartext_header = (
-            bytes([(ctl << 7) | (ttl & 0x7F)])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", self._src)
-        )
-        obfuscated = bytes(a ^ b for a, b in zip(cleartext_header, pecb[:6]))
-
-        ivi_nid = ((self._iv_index & 1) << 7) | (self._nid & 0x7F)
-        return bytes([ivi_nid]) + obfuscated + encrypted
-
-    def _handle_proxy_config(self, pdu: bytes) -> None:
-        """Decrypt a Proxy Configuration response (mainly Filter Status)."""
-        if len(pdu) < 10:
-            return
-        ivi_nid = pdu[0]
-        nid = ivi_nid & 0x7F
-        if nid != self._nid:
-            return
-        obfuscated = pdu[1:7]
-        encrypted = pdu[7:]
-        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self._iv_index) + encrypted[:7]
-        pecb = aes_ecb(self._priv_key, privacy_plaintext)
-        clear_hdr = bytes(a ^ b for a, b in zip(obfuscated, pecb[:6]))
-        ctl_ttl = clear_hdr[0]
-        seq = int.from_bytes(clear_hdr[1:4], "big")
-        src = int.from_bytes(clear_hdr[4:6], "big")
-        net_nonce = (
-            bytes([0x00, ctl_ttl])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", src)
-            + bytes([0x00, 0x00])
-            + struct.pack(">I", self._iv_index)
-        )
-        try:
-            plaintext = aes_ccm_decrypt(self._enc_key, net_nonce, encrypted, tag_length=8)
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("Proxy-config MIC failed on %s", self.name)
-            return
-        if len(plaintext) < 3:
-            return
-        opcode = plaintext[2]
-        params = plaintext[3:]
-        if opcode == 0x03 and len(params) >= 3:
-            filter_type = params[0]
-            list_size = int.from_bytes(params[1:3], "big")
-            _LOGGER.debug(
-                "%s proxy Filter Status: type=0x%02X size=%d",
-                self.name, filter_type, list_size,
-            )
-        else:
-            _LOGGER.debug(
-                "%s proxy-config op=0x%02X params=%s",
-                self.name, opcode, params.hex(),
-            )
-
-    # ------------------------------------------------------------------
-    # Mesh commands — Get (used to sync initial state)
-    # ------------------------------------------------------------------
 
     async def get_onoff(self, dst: int) -> None:
-        """Generic OnOff Get (0x8201). Answered with OnOff Status (0x8204)."""
-        await self._send(dst, 0x8201, b"")
-
-    async def get_level(self, dst: int) -> None:
-        """Generic Level Get (0x8205). Answered with Level Status (0x8208)."""
-        await self._send(dst, 0x8205, b"")
+        await self.send_access(dst, 0x8201, b"")
 
     async def get_lightness(self, dst: int) -> None:
-        """Light Lightness Get (0x824B). Answered with Lightness Status (0x824E)."""
-        await self._send(dst, 0x824B, b"")
+        await self.send_access(dst, 0x824B, b"")
 
     async def get_ctl(self, dst: int) -> None:
-        """Light CTL Get (0x825D). Answered with CTL Status (0x8260)."""
-        await self._send(dst, 0x825D, b"")
+        await self.send_access(dst, 0x825D, b"")

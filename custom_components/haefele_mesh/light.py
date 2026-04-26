@@ -53,9 +53,7 @@ async def async_setup_entry(
 
     entities: list[HaefeleLight] = []
     for node_cfg in nodes_cfg:
-        nid = _node_id(node_cfg)
-        if nid in coordinator.nodes:
-            entities.append(HaefeleLight(coordinator, nid, node_cfg))
+        entities.append(HaefeleLight(coordinator, node_cfg))
 
     async_add_entities(entities)
 
@@ -73,47 +71,27 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
     def __init__(
         self,
         coordinator: HaefeleCoordinator,
-        node_id: str,
         node_cfg: dict,
     ) -> None:
         super().__init__(coordinator)
-        self._node_id = node_id
+        self._node_id = _node_id(node_cfg)
         self._node_cfg = node_cfg
-        self._node = coordinator.nodes[node_id]
         self._unicast = node_cfg["unicast"]
-
-        # Destination for outbound mesh messages.
-        #
-        # Important: Generic OnOff Server (0x1000) is typically NOT subscribed
-        # to any group on Häfele nodes — only Lightness / CTL servers are.
-        # So OnOff must go to UNICAST to be routed. Lightness/CTL can use a
-        # group (faster + groups multiple lights with one frame), but falling
-        # back to unicast is always safe, so that's what we do by default.
         self._unicast_addr = node_cfg["unicast"]
-        groups = node_cfg.get("groups", [])
-        # Prefer a per-node (unique) group — those are usually 0xC00B+,
-        # shared groups like 0xC002/0xC006/0xC017 trigger multiple lights.
-        self._group_dst = _pick_preferred_group(groups)
-        # Default dst kept for backwards-compat; actual send sites choose.
-        self._dst = self._unicast_addr
+        self._name_for_log = node_cfg["name"]
 
-        # Local state (seeded optimistically, corrected by status messages)
+        # Local state (seeded optimistically, corrected by status messages).
         self._is_on = False
-        self._brightness = 128
+        self._brightness = 255
         self._color_temp_kelvin = (LIGHT_MIN_KELVIN + LIGHT_MAX_KELVIN) // 2
 
         self._unsub_status = None
 
         mac = node_cfg["mac"]
         mac_clean = mac.replace(":", "").lower()
-
-        # Entity unique_id — stable per (device, capability).
         self._attr_unique_id = f"{mac_clean}_light"
-
-        # Device identifier — shared across any future entities on the same node.
-        device_identifier = (DOMAIN, mac_clean)
         self._attr_device_info = DeviceInfo(
-            identifiers={device_identifier},
+            identifiers={(DOMAIN, mac_clean)},
             connections={("mac", mac)},
             name=node_cfg["name"],
             manufacturer="Häfele",
@@ -138,16 +116,16 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
         # temperature + implicit on/off (presentLightness>0 means on).
         async def _initial_sync() -> None:
             try:
-                if not await self._node.ensure_connected(timeout=10.0):
+                proxy = self.coordinator.proxy
+                if proxy is None or not await proxy.ensure_connected():
                     return
-                await self._node.get_ctl(self._unicast)
-                # Also ask OnOff explicitly — some firmwares only answer the
-                # model you asked. Small delay to avoid flooding.
+                await proxy.get_ctl(self._unicast)
                 await asyncio.sleep(0.15)
-                await self._node.get_onoff(self._unicast)
+                await proxy.get_onoff(self._unicast)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug(
-                    "Initial status sync for %s skipped: %s", self._node.name, err
+                    "Initial status sync for %s skipped: %s",
+                    self._name_for_log, err,
                 )
 
         self.hass.async_create_task(_initial_sync())
@@ -192,7 +170,7 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
         try:
             changed = self._apply_status(opcode, params)
         except Exception:  # noqa: BLE001
-            _LOGGER.exception("Failed to apply status 0x%04X on %s", opcode, self._node.name)
+            _LOGGER.exception("Failed to apply status 0x%04X on %s", opcode, self._name_for_log)
             return
         if changed:
             # Coordinator ensures node is available if we're hearing from it.
@@ -243,10 +221,16 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
     # ------------------------------------------------------------------
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        node = self._node
+        proxy = self.coordinator.proxy
+        if proxy is None:
+            _LOGGER.warning("No mesh proxy available for %s", self._name_for_log)
+            return
 
         if ATTR_BRIGHTNESS in kwargs:
             self._brightness = kwargs[ATTR_BRIGHTNESS]
+        elif not self._is_on and (self._brightness or 0) <= 0:
+            self._brightness = 255
+
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             self._color_temp_kelvin = max(
                 LIGHT_MIN_KELVIN,
@@ -254,38 +238,35 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
             )
 
         try:
-            # OnOff Server isn't subscribed to groups on Häfele nodes —
-            # always send OnOff to unicast.
-            await node.set_onoff(self._unicast_addr, True)
-            await asyncio.sleep(0.2)
-
-            # Lightness/CTL can be delivered to a group (if we have a
-            # per-node one) for lower latency; fallback to unicast.
-            lightness_dst = self._group_dst or self._unicast_addr
-
-            if ATTR_COLOR_TEMP_KELVIN in kwargs or ATTR_BRIGHTNESS in kwargs:
-                lightness = self._brightness_to_lightness(self._brightness)
-                await node.set_ctl(lightness_dst, lightness, self._color_temp_kelvin)
+            lightness = self._brightness_to_lightness(self._brightness)
+            if ATTR_COLOR_TEMP_KELVIN in kwargs:
+                # Combined brightness + color-temp — one CTL frame.
+                await proxy.set_ctl(
+                    self._unicast_addr, lightness, self._color_temp_kelvin,
+                )
             else:
-                level = self._brightness_to_level(self._brightness)
-                await node.set_level(lightness_dst, level)
+                # Lightness>0 implies OnOff=1 on the Light Lightness Server;
+                # avoids the OnOff+Level two-step dance that could race.
+                await proxy.set_lightness(self._unicast_addr, lightness)
 
             self._is_on = True
             self.async_write_ha_state()
 
         except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to turn on %s: %s", self._node.name, err)
+            _LOGGER.error("Failed to turn on %s: %s", self._name_for_log, err)
             self.coordinator.availability[self._node_id] = False
             self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
+        proxy = self.coordinator.proxy
+        if proxy is None:
+            return
         try:
-            # OnOff must go to unicast (see async_turn_on).
-            await self._node.set_onoff(self._unicast_addr, False)
+            await proxy.set_lightness(self._unicast_addr, 0)
             self._is_on = False
             self.async_write_ha_state()
         except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to turn off %s: %s", self._node.name, err)
+            _LOGGER.error("Failed to turn off %s: %s", self._name_for_log, err)
             self.coordinator.availability[self._node_id] = False
             self.async_write_ha_state()
 
@@ -314,19 +295,7 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
         return max(0, min(255, round((level + 32768) / 65535 * 255)))
 
 
-# Shared groups present on every Häfele node that should NOT be used
-# as the per-entity preferred destination (they address multiple lights).
 _SHARED_GROUPS = {0xC002, 0xC003, 0xC006, 0xC007, 0xC017, 0xC018}
-
-
-def _pick_preferred_group(groups: list[int]) -> int | None:
-    """Choose a per-node group if present, else any group, else None."""
-    if not groups:
-        return None
-    unique = [g for g in groups if g not in _SHARED_GROUPS]
-    if unique:
-        return unique[0]
-    return groups[0]
 
 
 def _pretty_model(device_type: str) -> str:

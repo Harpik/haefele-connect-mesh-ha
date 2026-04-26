@@ -1,9 +1,10 @@
 """
 DataUpdateCoordinator for Häfele Connect Mesh.
 
-Manages BLE connections to all nodes, owns the shared BT Mesh
-sequence-number store (persisted via HA Store), and monitors
-availability via periodic heartbeat.
+Owns a single shared MeshProxyConnection (one GATT link into the mesh)
+and exposes typed send helpers for entities. Nodes with no Proxy
+feature are reached through whichever node currently holds the active
+proxy role, via advertising bearer.
 """
 
 from __future__ import annotations
@@ -12,30 +13,29 @@ import asyncio
 import logging
 import time
 from datetime import timedelta
-from typing import Any
+from typing import Any, Callable
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, HEARTBEAT_INTERVAL, SEQ_SEED_MIN, SRC_ADDRESS_BASE
-from .gatt import MeshGattNode
+from .const import (
+    DOMAIN,
+    HEARTBEAT_INTERVAL,
+    SEQ_SEED_MIN,
+    SRC_ADDRESS_BASE,
+)
+from .gatt import MeshProxyConnection, MeshSession
 
 _LOGGER = logging.getLogger(__name__)
 
 SEQ_STORAGE_VERSION = 1
 SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
-# Jump forward at startup so we never reuse a SEQ we might have
-# emitted but not persisted yet. The BT Mesh SEQ space is 24 bits (~16M).
 SEQ_STARTUP_JUMP = 200
-
-# Callback signature for entities registering for status updates
-# (opcode, params) -> None
-StatusCallback = "Callable[[int, bytes], None]"
 
 
 class HaefeleCoordinator(DataUpdateCoordinator):
-    """Manages all Häfele Mesh nodes and their availability."""
+    """Owns mesh session + single proxy connection for all nodes."""
 
     def __init__(self, hass: HomeAssistant, config: dict):
         super().__init__(
@@ -45,29 +45,31 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=HEARTBEAT_INTERVAL),
         )
         self._config = config
-        self.nodes: dict[str, MeshGattNode] = {}
-        self.availability: dict[str, bool] = {}
-
-        # Routing: incoming mesh src_address -> list of entity callbacks.
-        # Entities register the unicast addresses they care about (usually
-        # just their own) at setup time.
-        self._status_handlers: dict[int, list] = {}
-
-        # SEQ state: {src_address(int) -> seq(int)} persisted via HA Store
+        # {unicast_address -> list[callback(opcode, params)]}
+        self._status_handlers: dict[int, list[Callable[[int, bytes], None]]] = {}
+        # SEQ store (shared by our single SRC, but kept as a map for safety
+        # in case SRC_ADDRESS_BASE is bumped in future releases).
         self._seq_store: Store = Store(hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY)
         self._seq_state: dict[int, int] = {}
         self._seq_lock = asyncio.Lock()
-        self._seq_dirty = False
+
+        self.session: MeshSession | None = None
+        self.proxy: MeshProxyConnection | None = None
+        self._nodes_cfg: list[dict] = config.get("nodes", [])
+        # Per-node availability (True means the mesh is reachable *and* we
+        # have no reason to believe the node specifically is offline; we
+        # don't currently track per-node liveness beyond "mesh is up").
+        self.availability: dict[str, bool] = {
+            _node_id(n): False for n in self._nodes_cfg
+        }
 
     # ------------------------------------------------------------------
     # Status routing
     # ------------------------------------------------------------------
 
-    def register_status_handler(self, src_address: int, callback) -> "Callable[[], None]":
-        """Subscribe to status messages coming from a given mesh unicast.
-
-        Returns an unsubscribe callable.
-        """
+    def register_status_handler(
+        self, src_address: int, callback: Callable[[int, bytes], None]
+    ) -> Callable[[], None]:
         self._status_handlers.setdefault(src_address, []).append(callback)
 
         def _unsub() -> None:
@@ -80,7 +82,6 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         return _unsub
 
     def _dispatch_status(self, src_address: int, opcode: int, params: bytes) -> None:
-        """Called by GATT nodes when a decoded access PDU arrives."""
         for cb in self._status_handlers.get(src_address, ()):
             try:
                 cb(opcode, params)
@@ -103,29 +104,20 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._seq_state = state
 
     async def _save_seq(self) -> None:
-        # JSON keys must be strings
         await self._seq_store.async_save(
             {str(k): v for k, v in self._seq_state.items()}
         )
-        self._seq_dirty = False
 
     async def next_seq(self, src_address: int) -> int:
-        """Return and persist the next BT Mesh SEQ for a given source address."""
         async with self._seq_lock:
             current = self._seq_state.get(src_address)
             if current is None:
-                # First use ever for this src: seed with a value in the upper
-                # half of the SEQ space. This avoids anti-replay collisions
-                # with SEQ values that may have been emitted by previous
-                # provisioners/gateways on the same network, which the lights
-                # keep in their replay cache.
                 current = max(SEQ_SEED_MIN, int(time.time()) & 0xFFFFFF)
                 _LOGGER.info(
                     "Seeding fresh SEQ for SRC 0x%04X at %d", src_address, current,
                 )
             seq = (current + 1) & 0xFFFFFF
             self._seq_state[src_address] = seq
-            # Persist on every emission — cheap (Store debounces writes).
             await self._seq_store.async_save(
                 {str(k): v for k, v in self._seq_state.items()}
             )
@@ -136,80 +128,72 @@ class HaefeleCoordinator(DataUpdateCoordinator):
     # ------------------------------------------------------------------
 
     async def async_setup(self) -> None:
-        """Initialize all node connections."""
         await self._load_seq()
-
-        # Jump SEQ forward at startup to cover any un-persisted emissions.
+        # Jump SEQ forward on startup for every known SRC to swallow any
+        # un-persisted emissions around the last unclean shutdown.
         for src, seq in list(self._seq_state.items()):
             self._seq_state[src] = (seq + SEQ_STARTUP_JUMP) & 0xFFFFFF
         await self._save_seq()
 
-        nodes_cfg = self._config.get("nodes", [])
         net_key = self._config["network_key"]
         app_key = self._config["app_key"]
         iv_index = self._config.get("iv_index", 1)
-        src_base = self._config.get("src_address_base", SRC_ADDRESS_BASE)
 
-        for i, node_cfg in enumerate(nodes_cfg):
-            node_id = _node_id(node_cfg)
-            src_address = (src_base + i * 0x10) & 0xFFFF
+        # One SRC for the whole integration. SRC_ADDRESS_BASE is chosen to
+        # be fresh vs the Haefele app (provisioner address, usually 0x7FFD)
+        # and any earlier gateway implementation.
+        src_address = self._config.get("src_address", SRC_ADDRESS_BASE) & 0xFFFF
 
-            node = MeshGattNode(
-                hass=self.hass,
-                mac=node_cfg["mac"],
-                unicast=node_cfg["unicast"],
-                net_key_hex=net_key,
-                app_key_hex=app_key,
-                iv_index=iv_index,
-                src_address=src_address,
-                seq_provider=self.next_seq,
-                name=node_cfg["name"],
-                message_handler=self._dispatch_status,
-            )
-            self.nodes[node_id] = node
-            self.availability[node_id] = False
+        self.session = MeshSession(
+            net_key_hex=net_key,
+            app_key_hex=app_key,
+            src_address=src_address,
+            iv_index=iv_index,
+            seq_provider=self.next_seq,
+        )
+        self.proxy = MeshProxyConnection(
+            hass=self.hass,
+            session=self.session,
+            message_handler=self._dispatch_status,
+        )
+        self.proxy.set_candidates([
+            (n["mac"], n["name"]) for n in self._nodes_cfg if n.get("mac")
+        ])
 
-            # Initial connection (best-effort; heartbeat will retry)
-            available = await node.connect(timeout=20.0)
-            self.availability[node_id] = available
+        ok = await self.proxy.connect_any()
+        # Mark every node as available if *any* proxy is up — they're all
+        # reachable through the mesh from there.
+        for nid in self.availability:
+            self.availability[nid] = ok
 
     async def async_shutdown(self) -> None:
-        for node in self.nodes.values():
+        if self.proxy is not None:
             try:
-                await node.disconnect()
+                await self.proxy.disconnect()
             except Exception:  # noqa: BLE001
                 pass
 
     # ------------------------------------------------------------------
-    # Heartbeat
+    # Heartbeat — just keep the single connection alive
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Heartbeat — check connectivity of all nodes."""
-        result: dict[str, Any] = {}
-        for node_id, node in self.nodes.items():
-            try:
-                if not node.is_connected:
-                    _LOGGER.debug("Reconnecting %s...", node_id)
-                    available = await node.connect(timeout=15.0)
-                else:
-                    available = True
+        if self.proxy is None:
+            return {nid: {"available": False} for nid in self.availability}
 
-                self.availability[node_id] = available
-                result[node_id] = {"available": available}
+        ok = self.proxy.is_connected
+        if not ok:
+            _LOGGER.debug("Proxy disconnected, trying to reconnect...")
+            ok = await self.proxy.connect_any()
 
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Heartbeat failed for %s: %s", node_id, err)
-                self.availability[node_id] = False
-                result[node_id] = {"available": False}
-
-        return result
+        for nid in self.availability:
+            self.availability[nid] = ok
+        return {nid: {"available": ok} for nid in self.availability}
 
     def is_available(self, node_id: str) -> bool:
         return self.availability.get(node_id, False)
 
 
 def _node_id(node_cfg: dict) -> str:
-    """Generate a stable node ID from MAC address."""
     mac = node_cfg["mac"].replace(":", "").lower()
     return f"haefele_{mac}"
