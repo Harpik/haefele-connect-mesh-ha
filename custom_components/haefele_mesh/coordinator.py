@@ -60,6 +60,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._seq_store: Store = Store(hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY)
         self._seq_state: dict[int, int] = {}
         self._seq_lock = asyncio.Lock()
+        # Persisted IV Index from last session (auto-updated by Secure
+        # Network Beacons). None until _load_seq runs.
+        self._persisted_iv_index: int | None = None
 
         self.session: MeshSession | None = None
         self.proxy: MeshProxyConnection | None = None
@@ -104,18 +107,27 @@ class HaefeleCoordinator(DataUpdateCoordinator):
     async def _load_seq(self) -> None:
         raw = await self._seq_store.async_load()
         state: dict[int, int] = {}
+        iv: int | None = None
         if isinstance(raw, dict):
             for k, v in raw.items():
+                if k == "_iv_index":
+                    try:
+                        iv = int(v)
+                    except (TypeError, ValueError):
+                        pass
+                    continue
                 try:
                     state[int(k)] = int(v)
                 except (TypeError, ValueError):
                     continue
         self._seq_state = state
+        self._persisted_iv_index = iv
 
     async def _save_seq(self) -> None:
-        await self._seq_store.async_save(
-            {str(k): v for k, v in self._seq_state.items()}
-        )
+        payload: dict[str, int] = {str(k): v for k, v in self._seq_state.items()}
+        if self.session is not None:
+            payload["_iv_index"] = int(self.session.iv_index)
+        await self._seq_store.async_save(payload)
 
     async def next_seq(self, src_address: int) -> int:
         async with self._seq_lock:
@@ -127,9 +139,12 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 )
             seq = (current + 1) & 0xFFFFFF
             self._seq_state[src_address] = seq
-            await self._seq_store.async_save(
-                {str(k): v for k, v in self._seq_state.items()}
-            )
+            payload: dict[str, int] = {
+                str(k): v for k, v in self._seq_state.items()
+            }
+            if self.session is not None:
+                payload["_iv_index"] = int(self.session.iv_index)
+            await self._seq_store.async_save(payload)
             return seq
 
     # ------------------------------------------------------------------
@@ -146,7 +161,18 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
         net_key = self._config["network_key"]
         app_key = self._config["app_key"]
-        iv_index = self._config.get("iv_index", 1)
+        # Prefer the IV Index we last saw on a Secure Network Beacon; fall
+        # back to whatever the casa-2.connect import recorded. The beacon
+        # parser will correct us live on the first beacon regardless, but
+        # starting close to the truth keeps the first second of traffic
+        # decryptable (including the Proxy Filter Status, if any firmware
+        # ever starts honouring it).
+        iv_index = self._persisted_iv_index
+        if iv_index is None:
+            iv_index = self._config.get("iv_index", 1)
+        _LOGGER.info("Starting mesh session with IV Index = %d (source=%s)",
+                     iv_index,
+                     "persisted" if self._persisted_iv_index is not None else "config")
 
         # One SRC for the whole integration. SRC_ADDRESS_BASE is chosen to
         # be fresh vs the Haefele app (provisioner address, usually 0x7FFD)
