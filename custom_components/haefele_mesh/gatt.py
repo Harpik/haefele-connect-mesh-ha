@@ -316,6 +316,8 @@ class MeshProxyConnection:
         self._beacon_event: asyncio.Event = asyncio.Event()
         # Track candidates ordered by last success so we retry smart.
         self._candidates: list[tuple[str, str]] = []
+        # Addresses to explicitly accept-list on the proxy after connect.
+        self._filter_addresses: list[int] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -324,6 +326,10 @@ class MeshProxyConnection:
     def set_candidates(self, candidates: list[tuple[str, str]]) -> None:
         """Set the (mac, name) list we're allowed to connect to."""
         self._candidates = [(m.upper(), n) for m, n in candidates]
+
+    def set_filter_addresses(self, addresses: list[int]) -> None:
+        """Set the addresses to accept-list on every new proxy connection."""
+        self._filter_addresses = list(addresses)
 
     @property
     def is_connected(self) -> bool:
@@ -428,13 +434,17 @@ class MeshProxyConnection:
             await self._teardown_active()
             return False
 
-        # Got a beacon — real proxy. Now configure the filter (fire and
-        # forget; Häfele doesn't reliably ACK with Filter Status so we
-        # don't wait).
+        # Got a beacon — real proxy. Now configure the filter. Häfele
+        # firmware is flaky about Set Filter Type, so we send Set Filter
+        # Type = accept-list AND explicitly add all addresses we care
+        # about. No reliance on Filter Status ACK (we've confirmed this
+        # firmware never sends it).
         try:
-            await self._configure_proxy_filter(reject_list=True)
+            await self._configure_proxy_filter(reject_list=False)
+            if self._filter_addresses:
+                await self.add_filter_addresses(self._filter_addresses)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Proxy filter send failed on %s: %s", mac, err)
+            _LOGGER.warning("Proxy filter setup failed on %s: %s", mac, err)
 
         _LOGGER.info(
             "Mesh proxy connected via %s (%s) [nid=0x%02X aid=0x%02X src=0x%04X]",
@@ -603,6 +613,29 @@ class MeshProxyConnection:
             "reject-empty (forward all)" if reject_list else "accept-empty",
         )
 
+    async def add_filter_addresses(self, addresses: list[int]) -> None:
+        """Add addresses to the proxy filter (opcode 0x01).
+
+        Häfele firmware silently ignores 'Set Filter Type' (no Filter
+        Status reply), so we can't rely on reject-list mode. Instead we
+        switch the filter to accept-list and explicitly add the DSTs we
+        care about: our own SRC (for unicast replies), every lamp
+        unicast (for reply overhear), and every known group (for
+        publications from the physical remote / app).
+        """
+        if not addresses:
+            return
+        # Opcode 0x01 = Add Addresses To Filter, then N big-endian 16-bit addresses.
+        payload = bytes([0x01])
+        for addr in addresses:
+            payload += struct.pack(">H", addr & 0xFFFF)
+        pdu = await self._session.build_proxy_config_pdu(payload)
+        await self._send_proxy_pdu(pdu, pdu_type=0x02)
+        _LOGGER.debug(
+            "Proxy filter: added %d addresses: %s",
+            len(addresses), ", ".join(f"0x{a:04X}" for a in addresses),
+        )
+
     # ------------------------------------------------------------------
     # High-level mesh commands (stateless — dst is provided by caller)
     # ------------------------------------------------------------------
@@ -643,9 +676,12 @@ class MeshProxyConnection:
 
     async def get_onoff(self, dst: int) -> None:
         await self.send_access(dst, 0x8201, b"")
+        _LOGGER.debug("OnOff Get -> dst=%04X", dst)
 
     async def get_lightness(self, dst: int) -> None:
         await self.send_access(dst, 0x824B, b"")
+        _LOGGER.debug("Lightness Get -> dst=%04X", dst)
 
     async def get_ctl(self, dst: int) -> None:
         await self.send_access(dst, 0x825D, b"")
+        _LOGGER.debug("CTL Get -> dst=%04X", dst)

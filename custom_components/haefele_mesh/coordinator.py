@@ -168,6 +168,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.proxy.set_candidates([
             (n["mac"], n["name"]) for n in self._nodes_cfg if n.get("mac")
         ])
+        self.proxy.set_filter_addresses(self._filter_addresses())
 
         ok = await self.proxy.connect_any()
         # Mark every node as available if *any* proxy is up — they're all
@@ -211,6 +212,27 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         for nid in self.availability:
             self.availability[nid] = ok
         return {nid: {"available": ok} for nid in self.availability}
+
+    def _filter_addresses(self) -> list[int]:
+        """Compute the set of DST addresses the proxy should forward.
+
+        Includes:
+          * our own SRC (so unicast Status replies make it back)
+          * every lamp unicast (replies overheard via relay)
+          * every group configured on the lamps (so publications from
+            the physical remote or the Häfele app come through)
+        """
+        addrs: set[int] = set()
+        if self.session is not None:
+            addrs.add(self.session.src & 0xFFFF)
+        for n in self._nodes_cfg:
+            unicast = n.get("unicast")
+            if isinstance(unicast, int):
+                addrs.add(unicast & 0xFFFF)
+            for g in n.get("groups", []) or []:
+                if isinstance(g, int):
+                    addrs.add(g & 0xFFFF)
+        return sorted(addrs)
 
     def is_available(self, node_id: str) -> bool:
         return self.availability.get(node_id, False)
