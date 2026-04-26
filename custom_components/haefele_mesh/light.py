@@ -82,9 +82,20 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
         self._node = coordinator.nodes[node_id]
         self._unicast = node_cfg["unicast"]
 
-        # Destination for outbound mesh messages: first group address, else unicast.
+        # Destination for outbound mesh messages.
+        #
+        # Important: Generic OnOff Server (0x1000) is typically NOT subscribed
+        # to any group on Häfele nodes — only Lightness / CTL servers are.
+        # So OnOff must go to UNICAST to be routed. Lightness/CTL can use a
+        # group (faster + groups multiple lights with one frame), but falling
+        # back to unicast is always safe, so that's what we do by default.
+        self._unicast_addr = node_cfg["unicast"]
         groups = node_cfg.get("groups", [])
-        self._dst = groups[0] if groups else node_cfg["unicast"]
+        # Prefer a per-node (unique) group — those are usually 0xC00B+,
+        # shared groups like 0xC002/0xC006/0xC017 trigger multiple lights.
+        self._group_dst = _pick_preferred_group(groups)
+        # Default dst kept for backwards-compat; actual send sites choose.
+        self._dst = self._unicast_addr
 
         # Local state (seeded optimistically, corrected by status messages)
         self._is_on = False
@@ -233,7 +244,6 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         node = self._node
-        dst = self._dst
 
         if ATTR_BRIGHTNESS in kwargs:
             self._brightness = kwargs[ATTR_BRIGHTNESS]
@@ -244,17 +254,21 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
             )
 
         try:
-            # Always turn on first, then send the detailed command.
-            # The small gap lets the mesh propagate the OnOff before CTL/Level.
-            await node.set_onoff(dst, True)
+            # OnOff Server isn't subscribed to groups on Häfele nodes —
+            # always send OnOff to unicast.
+            await node.set_onoff(self._unicast_addr, True)
             await asyncio.sleep(0.2)
+
+            # Lightness/CTL can be delivered to a group (if we have a
+            # per-node one) for lower latency; fallback to unicast.
+            lightness_dst = self._group_dst or self._unicast_addr
 
             if ATTR_COLOR_TEMP_KELVIN in kwargs or ATTR_BRIGHTNESS in kwargs:
                 lightness = self._brightness_to_lightness(self._brightness)
-                await node.set_ctl(dst, lightness, self._color_temp_kelvin)
+                await node.set_ctl(lightness_dst, lightness, self._color_temp_kelvin)
             else:
                 level = self._brightness_to_level(self._brightness)
-                await node.set_level(dst, level)
+                await node.set_level(lightness_dst, level)
 
             self._is_on = True
             self.async_write_ha_state()
@@ -266,7 +280,8 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         try:
-            await self._node.set_onoff(self._dst, False)
+            # OnOff must go to unicast (see async_turn_on).
+            await self._node.set_onoff(self._unicast_addr, False)
             self._is_on = False
             self.async_write_ha_state()
         except Exception as err:  # noqa: BLE001
@@ -297,6 +312,21 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
     def _level_to_brightness(level: int) -> int:
         """Generic Level (-32768..32767) → HA brightness (0-255)."""
         return max(0, min(255, round((level + 32768) / 65535 * 255)))
+
+
+# Shared groups present on every Häfele node that should NOT be used
+# as the per-entity preferred destination (they address multiple lights).
+_SHARED_GROUPS = {0xC002, 0xC003, 0xC006, 0xC007, 0xC017, 0xC018}
+
+
+def _pick_preferred_group(groups: list[int]) -> int | None:
+    """Choose a per-node group if present, else any group, else None."""
+    if not groups:
+        return None
+    unique = [g for g in groups if g not in _SHARED_GROUPS]
+    if unique:
+        return unique[0]
+    return groups[0]
 
 
 def _pretty_model(device_type: str) -> str:
