@@ -41,7 +41,7 @@ from .const import (
     MESH_PROXY_DATA_OUT_UUID,
 )
 from .access_codec import decode_opcode, encode_opcode
-from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k4
+from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +78,9 @@ class MeshSession:
 
         # Derived from NetKey: NID + Encryption Key + Privacy Key
         self.nid, self._enc_key, self._priv_key = k2(self._net_key, b"\x00")
+        # Derived from NetKey: 8-byte Network ID (used to recognise Secure
+        # Network Beacons from our own mesh).
+        self.network_id = k3(self._net_key)
         # Derived from AppKey: 6-bit AID
         self.aid = k4(self._app_key)
 
@@ -522,7 +525,7 @@ class MeshProxyConnection:
                 if pdu_type == 0x01:
                     # Secure Network Beacon — proof of a functional proxy.
                     self._beacon_event.set()
-                    _LOGGER.debug("Secure Network Beacon from active proxy")
+                    self._parse_secure_network_beacon(pdu)
                     continue
                 if pdu_type == 0x02:
                     try:
@@ -556,6 +559,45 @@ class MeshProxyConnection:
                 self._message_handler(src, opcode, params)
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("Message handler raised for src=%04X", src)
+
+    def _parse_secure_network_beacon(self, pdu: bytes) -> None:
+        """Extract flags + IV Index from a Secure Network Beacon.
+
+        Format (Mesh Profile 1.0 §3.9.3):
+          [0]    beacon type (0x01)
+          [1]    flags (bit0=key refresh, bit1=IV update)
+          [2:10] network ID (8 bytes)
+          [10:14] IV Index (big-endian 32-bit)
+          [14:22] authentication value (8 bytes; skipped, we don't
+                  verify BeaconKey auth here)
+
+        If the beacon comes from our own network (matching network ID
+        derived from our NetKey via k3) AND its IV Index differs from
+        our current one, update the session IV Index. This is the
+        heuristic that lets inbound Status messages decrypt after an
+        IV Update procedure has advanced the network since the config
+        file was exported.
+        """
+        if len(pdu) < 14 or pdu[0] != 0x01:
+            _LOGGER.debug("Non-secure beacon or truncated: %s", pdu.hex())
+            return
+        flags = pdu[1]
+        net_id = pdu[2:10]
+        iv_index = int.from_bytes(pdu[10:14], "big")
+
+        ours_net_id = getattr(self._session, "network_id", None)
+        is_ours = ours_net_id is not None and bytes(ours_net_id) == net_id
+        _LOGGER.debug(
+            "Secure Network Beacon: flags=0x%02X net_id=%s iv=%d ours_net=%s ours_iv=%d",
+            flags, net_id.hex(), iv_index,
+            "yes" if is_ours else "no", self._session.iv_index,
+        )
+        if is_ours and iv_index != self._session.iv_index:
+            _LOGGER.warning(
+                "Updating IV Index %d -> %d based on Secure Network Beacon",
+                self._session.iv_index, iv_index,
+            )
+            self._session.iv_index = iv_index
 
     def _handle_proxy_config(self, pdu: bytes) -> None:
         decoded = self._session.decode_proxy_config(pdu)

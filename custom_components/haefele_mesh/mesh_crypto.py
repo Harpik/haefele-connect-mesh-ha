@@ -66,3 +66,11 @@ def k4(n: bytes) -> int:
     k = aes_cmac(t, b"id6\x01")
     # AID is the low 6 bits of the last byte (2 bits pad | 6 bits AID)
     return k[-1] & 0x3F
+
+
+def k3(n: bytes) -> bytes:
+    """Mesh Profile spec 3.8.2.7: derive the 8-byte Network ID from a NetKey."""
+    salt = s1(b"smk3")
+    t = aes_cmac(salt, n)
+    k = aes_cmac(t, b"id64\x01")
+    return k[-8:]
