@@ -310,6 +310,10 @@ class MeshProxyConnection:
         self._connect_lock = asyncio.Lock()
         # Signalled whenever a Proxy Filter Status is received.
         self._filter_status_event: asyncio.Event = asyncio.Event()
+        # Signalled on the first Secure Network Beacon (proxy PDU type=0x01).
+        # Used as the real 'is this a functional proxy?' test — the Filter
+        # Status ACK isn't reliable (Häfele firmware doesn't send it).
+        self._beacon_event: asyncio.Event = asyncio.Event()
         # Track candidates ordered by last success so we retry smart.
         self._candidates: list[tuple[str, str]] = []
 
@@ -407,31 +411,30 @@ class MeshProxyConnection:
                 self._incoming_pump(), name=f"haefele-rx-{mac}"
             )
 
-        # Configure the proxy filter AND verify the node is a functional
-        # proxy. A broken 'proxy' (GATT service present but no mesh routing)
-        # will never send us the Filter Status response, so we bail out and
-        # let the caller try the next candidate. This is the definitive
-        # live-fire test: no round-trip, no proxy.
+        # Real proxy-functionality test: wait for any Secure Network Beacon
+        # (PDU type=0x01). Working Häfele proxies emit one within ~2s of
+        # a fresh link. Nodes with the Proxy feature disabled (e.g. 'Cocina
+        # fuegos') never emit any — so silence = skip this candidate.
+        self._beacon_event.clear()
         self._filter_status_event.clear()
         try:
-            await self._configure_proxy_filter(reject_list=True)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Proxy filter send failed on %s: %s", mac, err)
-            await self._teardown_active()
-            return False
-
-        try:
-            await asyncio.wait_for(
-                self._filter_status_event.wait(), timeout=3.0,
-            )
+            await asyncio.wait_for(self._beacon_event.wait(), timeout=5.0)
         except asyncio.TimeoutError:
             _LOGGER.debug(
-                "%s (%s) accepted GATT but did not ACK Proxy Filter Status — "
-                "not a functional mesh proxy, trying next candidate",
+                "%s (%s) accepted GATT but never emitted a Secure Network "
+                "Beacon — not a functional mesh proxy, trying next candidate",
                 name, mac,
             )
             await self._teardown_active()
             return False
+
+        # Got a beacon — real proxy. Now configure the filter (fire and
+        # forget; Häfele doesn't reliably ACK with Filter Status so we
+        # don't wait).
+        try:
+            await self._configure_proxy_filter(reject_list=True)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Proxy filter send failed on %s: %s", mac, err)
 
         _LOGGER.info(
             "Mesh proxy connected via %s (%s) [nid=0x%02X aid=0x%02X src=0x%04X]",
@@ -506,6 +509,11 @@ class MeshProxyConnection:
         try:
             while True:
                 pdu_type, pdu = await self._incoming.get()
+                if pdu_type == 0x01:
+                    # Secure Network Beacon — proof of a functional proxy.
+                    self._beacon_event.set()
+                    _LOGGER.debug("Secure Network Beacon from active proxy")
+                    continue
                 if pdu_type == 0x02:
                     try:
                         self._handle_proxy_config(pdu)
