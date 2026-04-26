@@ -17,7 +17,22 @@ HEARTBEAT_INTERVAL = 60  # seconds
 
 # Mesh crypto
 IV_INDEX_DEFAULT = 1
-SRC_ADDRESS_BASE = 0x0060
+# Base address used for our BT Mesh SRC.
+#
+# Must NOT collide with SRCs used by any previous provisioner/gateway for the
+# same network, or the lights' anti-replay cache will silently drop our
+# frames until our SEQ exceeds whatever they last accepted. The Pi3 gateway
+# used 0x0060/0x0080, and the Haefele mobile app uses the provisioner
+# address from the .connect file (typically 0x7FFD). 0x00C0+ is fresh in all
+# known deployments, leaving 0x10 headroom between nodes.
+SRC_ADDRESS_BASE = 0x00C0
+
+# Lower bound used when seeding a brand-new SEQ counter. Starting at
+# 0x800000 (half the 24-bit SEQ space) guarantees we're above anything any
+# previous emitter could plausibly have left in the lights' replay cache
+# for this SRC, while still leaving ~8M emissions before we need an IV
+# Index update — well beyond the lifetime of any install.
+SEQ_SEED_MIN = 0x800000
 
 # Light capabilities
 LIGHT_MIN_KELVIN = 2700

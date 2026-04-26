@@ -18,7 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN, HEARTBEAT_INTERVAL, SRC_ADDRESS_BASE
+from .const import DOMAIN, HEARTBEAT_INTERVAL, SEQ_SEED_MIN, SRC_ADDRESS_BASE
 from .gatt import MeshGattNode
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,9 +114,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         async with self._seq_lock:
             current = self._seq_state.get(src_address)
             if current is None:
-                # First use ever for this src: seed with a time-based value so
-                # we don't collide with any historical emissions.
-                current = int(time.time()) & 0xFFFFFF
+                # First use ever for this src: seed with a value in the upper
+                # half of the SEQ space. This avoids anti-replay collisions
+                # with SEQ values that may have been emitted by previous
+                # provisioners/gateways on the same network, which the lights
+                # keep in their replay cache.
+                current = max(SEQ_SEED_MIN, int(time.time()) & 0xFFFFFF)
+                _LOGGER.info(
+                    "Seeding fresh SEQ for SRC 0x%04X at %d", src_address, current,
+                )
             seq = (current + 1) & 0xFFFFFF
             self._seq_state[src_address] = seq
             # Persist on every emission — cheap (Store debounces writes).
