@@ -308,6 +308,8 @@ class MeshProxyConnection:
         self._reassembly_buf = bytearray()
         self._rx_task: Optional[asyncio.Task] = None
         self._connect_lock = asyncio.Lock()
+        # Signalled whenever a Proxy Filter Status is received.
+        self._filter_status_event: asyncio.Event = asyncio.Event()
         # Track candidates ordered by last success so we retry smart.
         self._candidates: list[tuple[str, str]] = []
 
@@ -405,17 +407,50 @@ class MeshProxyConnection:
                 self._incoming_pump(), name=f"haefele-rx-{mac}"
             )
 
-        # Configure the proxy filter so it forwards everything from the mesh.
+        # Configure the proxy filter AND verify the node is a functional
+        # proxy. A broken 'proxy' (GATT service present but no mesh routing)
+        # will never send us the Filter Status response, so we bail out and
+        # let the caller try the next candidate. This is the definitive
+        # live-fire test: no round-trip, no proxy.
+        self._filter_status_event.clear()
         try:
             await self._configure_proxy_filter(reject_list=True)
         except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Proxy filter setup failed on %s: %s", mac, err)
+            _LOGGER.debug("Proxy filter send failed on %s: %s", mac, err)
+            await self._teardown_active()
+            return False
+
+        try:
+            await asyncio.wait_for(
+                self._filter_status_event.wait(), timeout=3.0,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.debug(
+                "%s (%s) accepted GATT but did not ACK Proxy Filter Status — "
+                "not a functional mesh proxy, trying next candidate",
+                name, mac,
+            )
+            await self._teardown_active()
+            return False
 
         _LOGGER.info(
             "Mesh proxy connected via %s (%s) [nid=0x%02X aid=0x%02X src=0x%04X]",
             name, mac, self._session.nid, self._session.aid, self._session.src,
         )
         return True
+
+    async def _teardown_active(self) -> None:
+        """Drop whichever client we just attempted, without touching rx_task's
+        pump (it's shared across reconnect attempts)."""
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+        self._client = None
+        self._data_in = None
+        self._active_mac = None
+        self._active_name = ""
 
     def _on_disconnected(self, _client) -> None:
         _LOGGER.debug("BLE disconnected from proxy %s", self._active_name)
@@ -515,6 +550,7 @@ class MeshProxyConnection:
             _LOGGER.debug(
                 "Proxy Filter Status: type=0x%02X size=%d", filter_type, list_size,
             )
+            self._filter_status_event.set()
         else:
             _LOGGER.debug(
                 "Proxy-config op=0x%02X params=%s", opcode, params.hex(),
