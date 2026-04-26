@@ -311,6 +311,10 @@ class MeshProxyConnection:
         self._reassembly_buf = bytearray()
         self._rx_task: Optional[asyncio.Task] = None
         self._connect_lock = asyncio.Lock()
+        # Serialises outbound writes so two concurrent entity actions don't
+        # interleave SAR chunks on the GATT characteristic (which caused
+        # only one of two near-simultaneous turn_off calls to take effect).
+        self._send_lock = asyncio.Lock()
         # Signalled whenever a Proxy Filter Status is received.
         self._filter_status_event: asyncio.Event = asyncio.Event()
         # Signalled on the first Secure Network Beacon (proxy PDU type=0x01).
@@ -625,18 +629,19 @@ class MeshProxyConnection:
             raise ConnectionError("No active mesh-proxy connection")
         max_chunk = 19
         chunks = [pdu[i:i + max_chunk] for i in range(0, len(pdu), max_chunk)]
-        for i, chunk in enumerate(chunks):
-            if len(chunks) == 1:
-                sar = 0x00
-            elif i == 0:
-                sar = 0x40
-            elif i == len(chunks) - 1:
-                sar = 0xC0
-            else:
-                sar = 0x80
-            packet = bytes([sar | (pdu_type & 0x3F)]) + chunk
-            await self._client.write_gatt_char(self._data_in, packet, response=False)
-            await asyncio.sleep(0.05)
+        async with self._send_lock:
+            for i, chunk in enumerate(chunks):
+                if len(chunks) == 1:
+                    sar = 0x00
+                elif i == 0:
+                    sar = 0x40
+                elif i == len(chunks) - 1:
+                    sar = 0xC0
+                else:
+                    sar = 0x80
+                packet = bytes([sar | (pdu_type & 0x3F)]) + chunk
+                await self._client.write_gatt_char(self._data_in, packet, response=False)
+                await asyncio.sleep(0.05)
 
     async def send_access(self, dst: int, opcode: int, params: bytes) -> None:
         """Send an access-layer message (encrypted with AppKey) to dst."""
