@@ -33,6 +33,14 @@ SEQ_STORAGE_VERSION = 1
 SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
 SEQ_STARTUP_JUMP = 200
 
+# How often we poll each node for its current state. External control
+# (wall remotes, Häfele app) doesn't reliably publish Status to groups
+# we subscribe to, so polling is the simplest way to keep HA in sync.
+STATE_POLL_INTERVAL = 15  # seconds
+# Small gap between the Gets we send to different nodes to avoid
+# flooding the proxy link.
+STATE_POLL_PER_NODE_GAP = 0.2
+
 
 class HaefeleCoordinator(DataUpdateCoordinator):
     """Owns mesh session + single proxy connection for all nodes."""
@@ -56,6 +64,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.session: MeshSession | None = None
         self.proxy: MeshProxyConnection | None = None
         self._nodes_cfg: list[dict] = config.get("nodes", [])
+        self._poll_task: asyncio.Task | None = None
         # Per-node availability (True means the mesh is reachable *and* we
         # have no reason to believe the node specifically is offline; we
         # don't currently track per-node liveness beyond "mesh is up").
@@ -166,7 +175,20 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         for nid in self.availability:
             self.availability[nid] = ok
 
+        # Start the state-polling loop.
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = asyncio.create_task(
+                self._state_poll_loop(), name="haefele-state-poll",
+            )
+
     async def async_shutdown(self) -> None:
+        if self._poll_task is not None and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._poll_task = None
         if self.proxy is not None:
             try:
                 await self.proxy.disconnect()
@@ -192,6 +214,43 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     def is_available(self, node_id: str) -> bool:
         return self.availability.get(node_id, False)
+
+    # ------------------------------------------------------------------
+    # State polling
+    # ------------------------------------------------------------------
+
+    async def _state_poll_loop(self) -> None:
+        """Poll each node for its current on/off + CTL state.
+
+        Keeps HA in sync with physical remote presses and Häfele-app
+        changes — the lamps don't reliably publish status to groups
+        that we subscribe to, so active polling is the most robust path.
+        """
+        # Small initial delay so initial_sync gets to run first.
+        await asyncio.sleep(3.0)
+        while True:
+            try:
+                await asyncio.sleep(STATE_POLL_INTERVAL)
+                if self.proxy is None or not self.proxy.is_connected:
+                    continue
+                for node_cfg in self._nodes_cfg:
+                    unicast = node_cfg.get("unicast")
+                    if not unicast:
+                        continue
+                    try:
+                        await self.proxy.get_onoff(unicast)
+                        await asyncio.sleep(STATE_POLL_PER_NODE_GAP)
+                        await self.proxy.get_ctl(unicast)
+                        await asyncio.sleep(STATE_POLL_PER_NODE_GAP)
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug(
+                            "State poll for %s failed: %s",
+                            node_cfg.get("name", "?"), err,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("State poll loop crashed, continuing")
 
 
 def _node_id(node_cfg: dict) -> str:
