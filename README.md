@@ -71,7 +71,9 @@ Restart Home Assistant.
 ## Setup
 
 1. **Settings → Devices & Services → + Add Integration** → search **Häfele Connect Mesh**
-2. Paste the full contents of your `.connect` export file
+2. Provide your `.connect` export in either of these two ways:
+   - **Upload `.connect` file** — recommended, just attach the file you exported from the Häfele Connect app
+   - **…or paste file contents** — fallback for when the file picker isn't convenient (e.g. mobile browsers), open the export in a text editor and paste the full JSON
 3. Confirm discovered devices — one HA device per light is created
 
 HA picks the Bluetooth adapter automatically via the core `bluetooth` integration (configure the preferred adapter there if you have more than one).
@@ -80,8 +82,12 @@ HA picks the Bluetooth adapter automatically via the core `bluetooth` integratio
 
 1. Open the **Häfele Connect** app
 2. **Menu → Settings → Export Configuration**
-3. Share the file to yourself (email, Files app, …) and open it in a text editor
-4. Copy the entire contents and paste into the HA setup form
+3. Share the file to yourself (email, Files app, …) — save it somewhere your HA browser can reach
+4. In the HA setup form, either upload it directly or open it in a text editor and paste the contents
+
+### Updating after changes in the Häfele app
+
+If you add / rename / remove lights in the Häfele app later, export a new `.connect` and use **Settings → Devices & Services → Häfele Connect Mesh → ⋮ → Reconfigure**. The integration preserves the persisted mesh SEQ counter and IV Index, so your keys stay valid; it will only show you an added / removed / kept diff before applying.
 
 ## Supported Devices
 
