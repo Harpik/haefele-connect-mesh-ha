@@ -1,0 +1,29 @@
+name: Secret scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Weekly full-history scan catches keys that sneaked in before the
+  # hook existed, plus re-runs on newly published gitleaks rules.
+  schedule:
+    - cron: "0 5 * * 1"  # Mon 05:00 UTC
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so scheduled scans inspect everything, not
+          # just the last commit. On push/pull_request the checkout
+          # cost is negligible for this repo.
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          # Public repo: no GITLEAKS_LICENSE needed.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml

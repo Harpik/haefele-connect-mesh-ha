@@ -22,6 +22,7 @@ very welcome.
 git clone https://github.com/Harpik/haefele-connect-mesh-ha.git
 cd haefele-connect-mesh-ha
 pip install -r requirements_test.txt
+pip install pre-commit && pre-commit install   # installs the secret-scan + lint hooks
 pytest -v tests/
 ```
 
@@ -29,6 +30,12 @@ The unit tests run without Home Assistant or a BLE stack — `conftest.py`
 stubs the bits of `homeassistant.*` and `bleak*` that `gatt.py` imports
 at module load. If you add a module that pulls more HA runtime, extend
 the stubs there instead of adding HA to the test requirements.
+
+The pre-commit setup runs **gitleaks** (secret scan, BT-Mesh-key
+aware — see `.gitleaks.toml`), `ruff` (Python lint), and standard
+hygiene hooks. The same gitleaks config runs in CI via
+`.github/workflows/gitleaks.yml` on every push / PR and weekly against
+the full history.
 
 For manual end-to-end testing, install the component into a real HA
 instance (e.g. via HACS with a custom repository pointing at your
@@ -80,6 +87,15 @@ fork / branch) and pair it against a physical mesh.
 
 - The integration stores BT Mesh keys in the HA config entry. Never
   log raw key bytes, never include them in error messages.
+- **Never commit real NetKey / AppKey / DevKey values** — not in
+  tests, not in fixtures, not in sample `.connect` files. Use the
+  synthetic placeholders `00112233445566778899AABBCCDDEEFF` /
+  `FFEEDDCCBBAA99887766554433221100` (whitelisted in `.gitleaks.toml`)
+  or all-same-nibble patterns like `"a" * 32`.
+- The pre-commit gitleaks hook and the CI workflow will both reject a
+  commit that ships a 32-hex string near a key-like identifier. If
+  you're blocked by a legitimate example, extend the allowlist in
+  `.gitleaks.toml` rather than disabling the hook.
 - Persisted SEQ / IV Index must monotonically increase — if you touch
   that logic, add a replay-resistance test.
 - Treat every `.connect` blob as potentially untrusted: validate

@@ -1,0 +1,72 @@
+# gitleaks configuration for Häfele Connect Mesh integration.
+#
+# Extends the default ruleset with BT-Mesh-specific detectors (NetKey,
+# AppKey, DevKey are all 128-bit hex strings). The default gitleaks
+# rules already cover AWS/GCP/Stripe/etc. — we only add what's domain-
+# specific here.
+#
+# Tested locally with `gitleaks protect --staged --config .gitleaks.toml`
+# and `gitleaks detect --config .gitleaks.toml` on the full history.
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# BT Mesh keys — 32 hex chars, typically assigned to variables named
+# after their role (network_key, app_key, dev_key, netKey, appKey, …)
+# or surrounded by the JSON shape used by the .connect export.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "bt-mesh-key-assignment"
+description = "BT Mesh NetKey / AppKey / DevKey assigned to a named variable or JSON field"
+# Matches:
+#   network_key = "00112233445566778899AABBCCDDEEFF"
+#   "netKey": "311B…CB3"
+#   APP_KEY_HEX = "7ABE…949"
+#   deviceKey = "aaaa…"
+regex = '''(?i)(net[-_]?key|app[-_]?key|dev(?:ice)?[-_]?key|network[-_]?key)(?:_hex)?["\s]*[:=]["\s]*["']?([0-9a-f]{32})["']?'''
+secretGroup = 2
+tags = ["bt-mesh", "crypto"]
+
+[[rules]]
+id = "bt-mesh-connect-export-key"
+description = "Raw .connect JSON field carrying a 32-hex key"
+# Matches { "key": "311B…CB3" } inside netKeys[]/appKeys[] lists.
+regex = '''"key"\s*:\s*"([0-9a-f]{32})"'''
+secretGroup = 1
+tags = ["bt-mesh", "crypto"]
+
+# ---------------------------------------------------------------------------
+# Allowlist — synthetic / obviously-fake values we deliberately commit
+# to tests so the test suite stays self-contained. Keep this list tight.
+# ---------------------------------------------------------------------------
+
+[allowlist]
+description = "Synthetic test values and obvious placeholders"
+regexes = [
+    # All-same-nibble patterns: "0"*32, "a"*32, "A"*32, "B"*32, "f"*32, "1"*32 …
+    '''^([0-9a-fA-F])\1{31}$''',
+    # Our canonical synthetic keys used in unit tests.
+    '''00112233445566778899AABBCCDDEEFF''',
+    '''FFEEDDCCBBAA99887766554433221100''',
+    # Tutorial/example pattern starting with "deadbeef" or "cafebabe" etc.
+    '''^(dead|beef|cafe|babe|face|feed|f00d)[0-9a-fA-F]{24}$''',
+]
+paths = [
+    # Documentation is expected to show example (non-real) key shapes.
+    '''README\.md$''',
+    '''CONTRIBUTING\.md$''',
+    '''\.github/ISSUE_TEMPLATE/.*''',
+    # Memory / scratch notes outside the component aren't shipped.
+    '''_pending/''',
+]
+# stopwords trigger the allowlist only when the secret contains them.
+stopwords = [
+    "example",
+    "placeholder",
+    "synthetic",
+    "redacted",
+    "aaaaaaaaaaaaaaaa",
+    "bbbbbbbbbbbbbbbb",
+]

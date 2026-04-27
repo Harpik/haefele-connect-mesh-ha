@@ -1,0 +1,40 @@
+# Pre-commit hooks for haefele-connect-mesh-ha.
+#
+# Install once per clone:
+#   pip install pre-commit
+#   pre-commit install
+#
+# From then on, `git commit` runs these checks automatically. CI runs
+# the same hooks (see .github/workflows/ci.yml) so nothing slips through
+# a developer who forgot to install pre-commit locally.
+
+repos:
+  # --- Secret scanning --------------------------------------------------
+  # gitleaks catches BT Mesh NetKey / AppKey / DevKey accidentally
+  # hard-coded in tests or fixtures. Config: .gitleaks.toml.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        name: gitleaks (secret scan)
+
+  # --- Basic hygiene ----------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+  # --- Python lint (fast) ----------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
