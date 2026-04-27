@@ -150,11 +150,29 @@ CI runs `pytest` on Python 3.11 / 3.12, plus [HACS action](https://github.com/ha
 
 ## Roadmap
 
-- [ ] Brand logo/icon in Home Assistant (PR to [`home-assistant/brands`](https://github.com/home-assistant/brands))
-- [ ] RGB light support
-- [ ] Status feedback (parse incoming OnOff/CTL status messages)
-- [ ] Scene/group pass-through for Häfele scenes defined in the `.connect` file
-- [ ] Config options flow (tweak heartbeat interval, TTL, etc.)
+### Shipped
+
+- [x] **Brand logo/icon** (bundled in `custom_components/haefele_mesh/brand/`; served locally on HA 2026.3+ via the [Brands Proxy API](https://developers.home-assistant.io/blog/2026/02/24/brands-proxy-api))
+- [x] **RGB light support** (experimental — standard Light HSL Set opcode `0x8277`; needs real-hardware validation, please open an issue with diagnostics if it doesn't drive your fixture)
+- [x] **Capability tiers** — tunable-white, dimmable, RGB, on-off-only, auto-detected from the `.connect` export
+- [x] **Reconfigure flow** — re-import an updated `.connect` without losing mesh state (SEQ, IV Index)
+- [x] **Downloadable diagnostics** with redacted keys (Settings → Devices & Services → ⋮ → Download diagnostics)
+- [x] **Immediate auto-reconnect** on unsolicited BLE disconnect (no more 60 s heartbeat wait)
+- [x] **Issue / PR templates + `CONTRIBUTING.md`**
+- [x] **Secret-scanning infrastructure** (gitleaks pre-commit + CI, BT-Mesh-aware rules)
+
+### Next up
+
+- [ ] **Status feedback** — parse incoming OnOff / CTL / HSL status messages so `light.is_on` / brightness / color reflect physical-switch changes without polling
+- [ ] **Scene / group pass-through** for Häfele scenes defined in the `.connect` file
+- [ ] **Options flow** — tweak heartbeat interval, GATT timeouts, reconnect back-off, etc. without re-adding the integration
+- [ ] **`haefele_mesh.scan_probe` service** — active BLE sonar from Developer Tools without needing the proxy to be connected
+- [ ] **ESPHome Bluetooth Proxy (`active: true`) compatibility audit** — code should already work via `bleak` but wants a documented happy-path + README note
+
+### Upstream / blocked on others
+
+- [ ] **HACS icon display** — waiting on [hacs/integration#5179](https://github.com/hacs/integration/issues/5179) to consume the HA Brands Proxy API; the icon is already correct inside HA itself
+- [ ] **HAOS `bluetoothd 5.85` SIGSEGV** — planning an upstream issue in [`home-assistant/operating-system`](https://github.com/home-assistant/operating-system) with the reproducer we collected on Pi 5
 
 ## Acknowledgements
 
