@@ -13,16 +13,31 @@
         "title": "Confirm Configuration",
         "description": "Ready to set up **{node_count}** light(s):\n\n{node_names}\n\nIV Index: **{iv_index}**\n\nHome Assistant will use its configured Bluetooth adapter (including ESPHome Bluetooth Proxies) to reach the mesh. Click Submit to continue.",
         "data": {}
+      },
+      "reconfigure_upload": {
+        "title": "Re-import Häfele Connect Mesh",
+        "description": "Upload a fresh `.connect` export from the Häfele Connect app. The existing BT Mesh sequence counters and IV Index are preserved — this only refreshes the node list, groups and keys.\n\nIf file upload is not available on your client, paste the file contents into the text box instead.",
+        "data": {
+          "connect_file_upload": "Upload .connect file",
+          "connect_file_text": "…or paste file contents"
+        }
+      },
+      "reconfigure_confirm": {
+        "title": "Confirm re-import",
+        "description": "Changes detected:\n\n- ➕ **{added_count}** new light(s): {added_list}\n- ➖ **{removed_count}** removed light(s): {removed_list}\n- ✅ **{kept_count}** unchanged light(s) kept\n\nIV Index in new export: **{iv_index}** (the live IV Index learned from the mesh is never downgraded).\n\nClick Submit to apply.",
+        "data": {}
       }
     },
     "error": {
       "invalid_config": "Invalid or unrecognized .connect file. Make sure you exported a valid Häfele Connect Mesh configuration.",
       "file_read_error": "Could not read the uploaded file. Try again or paste the contents manually.",
       "no_input": "Please either upload a .connect file or paste its contents.",
+      "different_network": "This `.connect` file is for a different BT Mesh network (the NetKey does not match). To set up a different network, remove this integration and add a new one.",
       "unknown": "Unexpected error. Check the logs for details."
     },
     "abort": {
-      "already_configured": "Häfele Connect Mesh is already configured."
+      "already_configured": "Häfele Connect Mesh is already configured.",
+      "reconfigure_successful": "Configuration updated."
     }
   }
 }
