@@ -13,8 +13,9 @@ Home Assistant itself plays the role of a BT Mesh **GATT Proxy client**. It conn
 - 🔵 Native BLE via Home Assistant's `bluetooth` integration
 - 📡 **ESPHome Bluetooth Proxy compatible** — extend range without extra software
 - 💡 On/Off, brightness, color temperature (Tunable White)
-- 🔁 Automatic reconnection with `bleak-retry-connector`
-- 💾 Persistent BT Mesh sequence numbers (survives HA restarts — no replay risk)
+- 🔁 Automatic reconnection with `bleak-retry-connector` — immediate retry on disconnect plus a 60 s heartbeat as a safety net
+- 🎛️ **Physical remote changes are reflected in HA** — the coordinator polls every light every 15 s so wall-switch / Häfele-app presses show up in HA within seconds
+- 💾 Persistent BT Mesh sequence numbers and IV Index (survives HA restarts — no replay risk)
 - 🧩 HACS compatible, setup 100% via UI
 - 🔐 No cloud. No phone. Keys stay on your HA install.
 
@@ -32,7 +33,9 @@ Home Assistant itself plays the role of a BT Mesh **GATT Proxy client**. It conn
                                               └───────────────────────────┘
 ```
 
-HA opens one GATT connection to the closest Häfele node (the "proxy"), then every command flows through the mesh to the target node or group.
+HA opens **one** GATT connection to a single Häfele node that has the BT Mesh **Proxy feature** enabled. That node forwards every command and status update between HA and the rest of the mesh — so only one proxy-capable node needs to be reachable over BLE, regardless of how many lights are in the network.
+
+> ⚠️ **Your network must contain at least one node with the Proxy feature active** (this is the Häfele app default for mains-powered lights). Nodes that only implement the GATT Proxy *service* without the Proxy feature (e.g. some battery-powered spots with it disabled for power reasons) will advertise UUID `0x1828`, accept a GATT connection, but never forward mesh traffic. The integration probes for a real Secure Network Beacon on connect and skips those automatically.
 
 ## Requirements
 
@@ -90,9 +93,11 @@ Remotes, sensors and switches are parsed but **skipped** (they don't expose writ
 
 - `.connect` is parsed as Bluetooth Mesh CDB JSON with Häfele extensions (`tos_node`, `tos_devices`).
 - Each light becomes a `light` entity inside an HA device keyed on MAC.
-- The coordinator keeps one GATT connection open to the mesh proxy and maintains a per-source BT Mesh sequence counter persisted in `.storage/haefele_mesh_seq`.
-- Commands are built as BT Mesh Network PDUs (encrypted with AES-CCM, obfuscated with AES-ECB) and segmented over the Mesh Proxy PDU bearer (spec § 6.6.2).
-- A 60-second heartbeat verifies connectivity and reconnects dropped links.
+- The coordinator keeps **one** GATT connection open to a functional mesh proxy node and maintains a per-source BT Mesh sequence counter (and last-seen IV Index) persisted in `.storage/haefele_mesh_seq`.
+- Commands are built as BT Mesh Network PDUs (encrypted with AES-CCM, obfuscated with AES-ECB) and sent over the Mesh Proxy PDU bearer (spec § 6.6.2).
+- An immediate reconnect is attempted whenever the BLE link drops; a 60 s heartbeat also verifies connectivity as a safety net.
+- Every 15 s the coordinator polls each light for On/Off + CTL state so manual changes from the physical remote or the Häfele app are reflected in HA.
+- Secure Network Beacons from the mesh are parsed live; the IV Index is auto-updated if the mesh advances it.
 
 See [`custom_components/haefele_mesh/gatt.py`](custom_components/haefele_mesh/gatt.py) and [`mesh_crypto.py`](custom_components/haefele_mesh/mesh_crypto.py) for the mesh implementation, and [`connect_parser.py`](custom_components/haefele_mesh/connect_parser.py) for the import format.
 
@@ -105,7 +110,11 @@ Your `.connect` file only contains remotes/sensors, or the export is from a non-
 HA can't reach any mesh proxy over BLE. Check:
 1. `Settings → System → Hardware → Bluetooth` shows an active adapter or ESPHome proxy.
 2. Move the HA host / proxy closer to one light (≤ 10 m line of sight is a good test).
-3. Look for `haefele_mesh` entries in `Settings → System → Logs`.
+3. At least one mains-powered light must have the BT Mesh **Proxy feature** enabled (default in the Häfele app).
+4. Look for `haefele_mesh` entries in `Settings → System → Logs`. A line saying `No Häfele node reachable as a mesh proxy` means none of your nodes emitted a Secure Network Beacon within 5 s of connecting — the proxy candidates are either out of range, powered off, or have the Proxy feature disabled.
+
+**Physical remote presses aren't reflected in HA**
+The coordinator polls every 15 s, so expect up to ~15 s of lag after a wall-switch press. If it never catches up, check HA logs for `State poll for ... failed` entries.
 
 **Commands fail after a while**
 BT Mesh requires monotonically increasing sequence numbers. The integration persists them on every emission, but if you restore an HA snapshot you may need to wait a few minutes for the network to accept new SEQ values (or re-provision).
