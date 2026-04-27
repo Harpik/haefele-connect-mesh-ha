@@ -169,11 +169,6 @@ CI runs `pytest` on Python 3.11 / 3.12, plus [HACS action](https://github.com/ha
 - [ ] **`haefele_mesh.scan_probe` service** — active BLE sonar from Developer Tools without needing the proxy to be connected
 - [ ] **ESPHome Bluetooth Proxy (`active: true`) compatibility audit** — code should already work via `bleak` but wants a documented happy-path + README note
 
-### Upstream / blocked on others
-
-- [ ] **HACS icon display** — waiting on [hacs/integration#5179](https://github.com/hacs/integration/issues/5179) to consume the HA Brands Proxy API; the icon is already correct inside HA itself
-- [ ] **HAOS `bluetoothd 5.85` SIGSEGV** — planning an upstream issue in [`home-assistant/operating-system`](https://github.com/home-assistant/operating-system) with the reproducer we collected on Pi 5
-
 ## Acknowledgements
 
 - [Bluetooth Mesh Profile 1.0](https://www.bluetooth.com/specifications/specs/mesh-profile-1-0-1/) — the spec that made this possible
