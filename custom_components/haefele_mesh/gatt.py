@@ -855,6 +855,36 @@ class MeshProxyConnection:
             "CTL -> lightness=%d temp=%dK dst=%04X", lightness, temperature, dst,
         )
 
+    async def set_hsl(
+        self, dst: int, lightness: int, hue: int, saturation: int,
+    ) -> None:
+        """Light HSL Set Unacknowledged (0x8277).
+
+        Used for RGB-capable Häfele nodes. Standard BT Mesh Light HSL
+        server model. hue/saturation/lightness are all 16-bit unsigned
+        (0–65535). hue wraps at 65536 ≡ 360°.
+
+        NOTE: not yet verified against physical Häfele RGB hardware —
+        the opcode and framing are straight from the Mesh Model spec
+        §6.3.4. If your device uses a vendor opcode instead, please file
+        an issue with a diagnostics dump.
+        """
+        tid = (await self._session._seq_provider(self._session.src)) & 0xFF
+        await self.send_access(
+            dst, 0x8277,
+            struct.pack(
+                "<HHHB",
+                lightness & 0xFFFF,
+                hue & 0xFFFF,
+                saturation & 0xFFFF,
+                tid,
+            ),
+        )
+        _LOGGER.debug(
+            "HSL -> lightness=%d hue=%d sat=%d dst=%04X",
+            lightness, hue, saturation, dst,
+        )
+
     async def get_onoff(self, dst: int) -> None:
         await self.send_access(dst, 0x8201, b"")
         _LOGGER.debug("OnOff Get -> dst=%04X", dst)
@@ -866,3 +896,8 @@ class MeshProxyConnection:
     async def get_ctl(self, dst: int) -> None:
         await self.send_access(dst, 0x825D, b"")
         _LOGGER.debug("CTL Get -> dst=%04X", dst)
+
+    async def get_hsl(self, dst: int) -> None:
+        """Light HSL Get (0x826D)."""
+        await self.send_access(dst, 0x826D, b"")
+        _LOGGER.debug("HSL Get -> dst=%04X", dst)

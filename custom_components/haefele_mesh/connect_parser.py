@@ -190,8 +190,12 @@ def parse_connect_file(content: str) -> dict:
                 continue
             if "tw" in type_lower or "tunable" in type_lower:
                 device_type = "tunable_white"
-            elif "rgb" in type_lower:
+            elif "rgb" in type_lower or "hsl" in type_lower or "color" in type_lower:
                 device_type = "rgb"
+            elif "relay" in type_lower or "onoff" in type_lower or "switch_out" in type_lower:
+                device_type = "onoff"
+            elif "dim" in type_lower:
+                device_type = "dimmable"
             elif any(type_lower.startswith(p) for p in _LIGHT_TYPE_PREFIXES):
                 device_type = "dimmable"
         else:

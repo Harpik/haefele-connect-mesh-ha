@@ -12,7 +12,7 @@ Home Assistant itself plays the role of a BT Mesh **GATT Proxy client**. It conn
 
 - 🔵 Native BLE via Home Assistant's `bluetooth` integration
 - 📡 **ESPHome Bluetooth Proxy compatible** — extend range without extra software
-- 💡 On/Off, brightness, color temperature (Tunable White)
+- 💡 On/Off, brightness, color temperature (Tunable White), hue/saturation (RGB, experimental)
 - 🔁 Automatic reconnection with `bleak-retry-connector` — immediate retry on disconnect plus a 60 s heartbeat as a safety net
 - 🎛️ **Physical remote changes are reflected in HA** — the coordinator polls every light every 15 s so wall-switch / Häfele-app presses show up in HA within seconds
 - 💾 Persistent BT Mesh sequence numbers and IV Index (survives HA restarts — no replay risk)
@@ -85,7 +85,18 @@ HA picks the Bluetooth adapter automatically via the core `bluetooth` integratio
 
 ## Supported Devices
 
-Tested with Häfele Meshbox Tunable White spots. Other Häfele Connect Mesh light nodes (RGB, dimmable drivers, LED strips) are recognised by the parser and should work, but have not been verified end-to-end — reports welcome.
+Tested end-to-end with Häfele Meshbox Tunable White spots. The integration detects four capability tiers from the `.connect` export:
+
+| Capability tier   | Triggers on `tos_node.type` containing | HA surface               | Status       |
+|-------------------|-----------------------------------------|--------------------------|--------------|
+| `tunable_white`   | `tw`, `tunable`                         | brightness + color_temp  | ✅ verified   |
+| `dimmable`        | `dim`, any `com.haefele.driver/led.*`   | brightness               | ⚠️ likely     |
+| `rgb`             | `rgb`, `hsl`, `color`                   | brightness + hs_color    | 🧪 experimental |
+| `onoff`           | `relay`, `onoff`, `switch_out`          | on/off                   | ⚠️ likely     |
+
+RGB support uses the standard BT Mesh **Light HSL Set Unacknowledged** opcode (`0x8277`). If your RGB fixture uses a vendor-specific opcode instead, colour changes won't apply — please open an issue with a diagnostics dump and we'll add a per-model override.
+
+Remotes, sensors and wall switches are recognised and deliberately skipped: they're battery-powered, don't act as proxies, and don't expose an entity on the HA side.
 
 Remotes, sensors and switches are parsed but **skipped** (they don't expose writable light models).
 
