@@ -1,79 +1,88 @@
 # Changelog
 
-## 0.3.0 — 2026-04-26
+All notable changes to this integration are documented here.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-A complete rewrite of the BLE transport after a deep debug session on real
-Häfele hardware. The integration now talks to the mesh through **one
-shared GATT Proxy connection** and understands Häfele's firmware quirks.
+## [0.4.0] — 2026-04-27
 
-### Highlights
-- Fully controllable from Home Assistant (on/off, brightness, color
-  temperature) even on nodes that don't have the Proxy feature enabled.
-- External-change feedback: physical wall remote and the Häfele app both
-  reflect in HA within ≈15 s via active polling.
-- Bulk off/on automations (presence triggers, etc.) now target multiple
-  lamps reliably, without the "only one lamp responds" race.
+Big quality-of-life release: more device types, recover automatically
+from BLE drops, re-import your `.connect` without losing mesh state,
+and a downloadable diagnostics bundle for bug reports.
 
 ### Added
-- **Single shared `MeshProxyConnection`** (one GATT link for the whole
-  mesh). Candidates are tried in order and the first functional proxy
-  is kept; successful candidates move to the head of the list for the
-  next startup.
-- **Functional-proxy health check**: wait for a Secure Network Beacon
-  within 5 s of GATT connect. Nodes that advertise the Mesh Proxy
-  service but don't actually route (`Cocina fuegos` style) are skipped.
-- **Live IV Index auto-sync** from Secure Network Beacons (k3-authenticated
-  against our own Network ID). Survives network-wide IV Updates without
-  touching the config.
-- **Persisted IV Index** in the SEQ store, so subsequent restarts begin
-  with the correct IV instead of the stale value in `casa-2.connect`.
-- **Explicit accept-list proxy filter** with our SRC, every lamp unicast,
-  and every subscribed group — required because Häfele firmware ignores
-  `Set Filter Type` silently.
-- **State polling** (every 15 s) as a robust fallback for external
-  state changes when lamps' publish configuration is unpredictable.
-- **Outbound write serialisation** (`_send_lock`) so concurrent
-  `turn_off` / `turn_on` calls can't interleave SAR chunks on the
-  characteristic.
-- **Richer debug logging** at every RX early-return (NID mismatch,
-  Net MIC failure, AID mismatch, non-access PDUs) and on every
-  outbound operation.
 
-### Changed
-- `turn_on` now sends a single **Light Lightness Set Unack (0x824D)**
-  instead of the old OnOff + Level two-step. Lightness > 0 implies
-  OnOff=1 on the subscribed server, so this replaces both commands
-  atomically.
-- Default brightness on `turn_on` without `ATTR_BRIGHTNESS` is now 255.
-  Previously the integration started at 128 which the lamp translated
-  to ~0.4 % visible brightness.
-- `HaefeleCoordinator` owns `MeshSession` + `MeshProxyConnection`
-  directly. The old `MeshGattNode` class (one BLE connection per lamp)
-  is gone.
-- Availability is now mesh-wide (true if any proxy is reachable)
-  instead of per-lamp ping.
+- **Capability tiers — support for more Häfele models.** The parser
+  now detects four light tiers from the `.connect` export and the
+  light entity picks the matching BT Mesh opcodes automatically:
+    - `tunable_white` → on/off + brightness + color temp (CTL) _[verified]_
+    - `dimmable` → on/off + brightness (Light Lightness) _[plausible]_
+    - `rgb` → on/off + brightness + hue/saturation via
+      Light HSL Set Unack `0x8277` _[experimental, standard spec
+      opcode; vendor-opcode-only fixtures not yet supported]_
+    - `onoff` → on/off only (Generic OnOff) _[plausible]_
+- **Reconfigure flow.** Integration three-dot menu → _Reconfigure_
+  lets you re-import an updated `.connect` file after adding /
+  renaming / removing lights in the Häfele app. Preserves the
+  persisted BT Mesh SEQ counters and the live IV Index so the mesh
+  keeps accepting our frames; shows an added / removed / kept diff
+  before applying. Rejects a `.connect` with a different NetKey.
+- **Downloadable diagnostics.** Settings → Devices & Services →
+  Häfele Connect Mesh → ⋮ → Download diagnostics. Ships the
+  coordinator state, per-node BLE visibility (RSSI, service
+  UUIDs, last-seen, mesh proxy / mesh provisioning flags) and the
+  full GATT service tree of the active proxy. All keys redacted
+  via triple-layer scrubbing; safe to attach to a bug report.
+- **Immediate auto-reconnect on unsolicited BLE disconnect.** The
+  proxy relinks within ~3 s of a bluez drop instead of waiting up
+  to 60 s for the next heartbeat. The heartbeat remains as the
+  long-term safety net.
+- **Issue / PR templates + `CONTRIBUTING.md`.** Structured bug
+  report form that includes a `diagnostics.json` drop zone and
+  sanity checkboxes for the two most common root causes. Dev-setup
+  recipe for offline tests, security rules, and a concrete
+  "add a new device type" walkthrough.
 
-### Fixed
-- `set_ctl` used CTL Status opcode `0x8260` instead of CTL Set Unack
-  `0x825F`, so color-temperature changes were silently dropped.
-- `OnOff Set` was being addressed to groups, but Häfele Generic OnOff
-  Server (model `0x1000`) is **not subscribed to any group**. OnOff is
-  now always sent to unicast.
-- Preferred group selection skipped shared groups (`0xC002`, `0xC003`,
-  `0xC006`, `0xC007`, `0xC017`, `0xC018`) to avoid cross-lamp triggers.
-- SEQ seeding uses `max(time.time() & 0xFFFFFF, 0x800000)` to dodge
-  anti-replay caches left by the old Raspberry Pi 3 gateway script.
-- Race between two near-simultaneous sends that caused only one of
-  two "turn off both lamps" commands to land.
+### Security
 
-### Known quirks (not bugs on our side)
-- Häfele firmware does not send `Filter Status` in response to
-  `Set Filter Type`, contrary to Mesh Profile 1.0 §6.5.3. We no longer
-  rely on that ACK.
-- Some provisioned nodes (`Cocina fuegos` in Jose's network) advertise
-  the Mesh Proxy service but are not functional proxies. They are
-  detected and skipped automatically.
+- **New secret-scanning infrastructure.** `.gitleaks.toml` with
+  BT-Mesh-aware detectors (NetKey / AppKey / DevKey), pre-commit
+  hook, and a CI workflow running on every push / PR plus a
+  weekly full-history scan. Triggered by a real-key leak that
+  was patched within ~80 min on 2026-04-27; history rewritten.
+  Contributors: run `pre-commit install` after cloning.
 
-## 0.2.0
+### Tests
 
-Initial public drop.
+- `tests/test_mesh_session.py`: PDU build / decode round-trips
+  for access and proxy-config frames, rejection of foreign
+  NetKey / AppKey / IV Index, SEQ counter plumbing.
+- `tests/test_proxy_candidates.py`: iteration order, winner
+  promotion, empty list, already-connected short-circuit.
+- `tests/test_connect_parser_models.py`: device-type detection
+  for each capability tier plus remote-skip.
+- `tests/test_models_capability.py`: `resolve_capability`
+  parametric table (12 cases) + Light HSL Set opcode / payload
+  framing (0x8277) + value masking.
+- `tests/test_diagnostics.py`: `dump_active_gatt_tree` service
+  tree extraction, disconnected / missing-services handling.
+
+### Docs
+
+- README: single-proxy architecture, Proxy-feature requirement,
+  15 s polling, troubleshooting section (including diagnostics
+  usage), capability-tier table.
+
+### Breaking changes
+
+- _None for end users._ SEQ / IV-Index storage layout unchanged,
+  config-entry shape backward-compatible.
+
+## [0.3.0]
+
+Initial tagged release after the single-proxy refactor
+(`MeshSession` + `MeshProxyConnection` + `HaefeleCoordinator`,
+with the legacy per-node `MeshGattNode` removed).
+
+[0.4.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.0
+[0.3.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.3.0
