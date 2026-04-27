@@ -1,0 +1,107 @@
+name: 🐛 Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! 🐧
+
+        **Before filing, please:**
+        - Search existing issues — maybe it's already known.
+        - Attach a diagnostics dump: **Settings → Devices & Services → Häfele Connect Mesh → ⋮ → Download diagnostics**. All keys are redacted, so it's safe to share.
+        - Include any relevant lines from the HA log (debug logs are 10× more useful — see below).
+
+  - type: input
+    id: integration_version
+    attributes:
+      label: Integration version
+      description: From `manifest.json` or HACS.
+      placeholder: "0.3.0"
+    validations:
+      required: true
+
+  - type: input
+    id: ha_version
+    attributes:
+      label: Home Assistant version
+      description: Settings → About.
+      placeholder: "2026.4.3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ha_install
+    attributes:
+      label: Home Assistant installation
+      options:
+        - Home Assistant OS
+        - Home Assistant Supervised
+        - Home Assistant Container
+        - Home Assistant Core
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: bt_adapter
+    attributes:
+      label: Bluetooth adapter(s) used
+      description: Built-in adapter, USB dongle model, and/or ESPHome proxy name.
+      placeholder: "Pi 5 built-in + ESPHome proxy (living_room)"
+
+  - type: textarea
+    id: devices
+    attributes:
+      label: Häfele devices involved
+      description: Models + roughly how many; note whether any are battery-powered remotes.
+      placeholder: "2× Meshbox TW 1C + 1× Remote v2"
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: What did you expect, what did you see instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+        3. …
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        Enable debug first:
+        ```yaml
+        logger:
+          logs:
+            custom_components.haefele_mesh: debug
+            bleak: info
+            habluetooth: info
+        ```
+      render: shell
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics JSON
+      description: Drag-and-drop the downloaded `*.json` into this box, or paste its contents.
+      render: json
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Sanity checks
+      options:
+        - label: At least one of my lights has the BT Mesh **Proxy feature** enabled (mains-powered, reachable over BLE from HA).
+          required: true
+        - label: I verified the `.connect` file was exported from the Häfele Connect app **after** provisioning the affected light.
+          required: true

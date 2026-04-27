@@ -1,0 +1,49 @@
+name: ✨ Feature request
+description: Suggest a new feature or improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape the integration! 🐧
+        Please search existing feature requests first to avoid duplicates.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case, not the solution.
+      placeholder: "When I press the wall remote, HA catches up a few seconds later. I want scene triggering to feel instant."
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposed solution
+      description: How would this feature look from a user's perspective? Mockups / config snippets welcome.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways you thought about solving this.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - New hardware support (RGB / dimmer / sensor / remote …)
+        - New Home Assistant capability (entity type, service, …)
+        - UX / config flow improvement
+        - Observability (logs, diagnostics, sensors)
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Extra context
+      description: Device models, `.connect` snippets (redact keys!), screenshots, related issues, etc.

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation / README
+    url: https://github.com/Harpik/haefele-connect-mesh-ha#readme
+    about: Installation, troubleshooting and architecture overview.
+  - name: 💬 Home Assistant community
+    url: https://community.home-assistant.io/
+    about: General HA questions are better answered on the HA forum.
