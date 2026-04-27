@@ -471,6 +471,61 @@ class MeshProxyConnection:
         )
         return True
 
+    def dump_active_gatt_tree(self) -> list[dict] | None:
+        """Return the cached GATT tree of the currently connected proxy.
+
+        Intended for diagnostics only — reads from the active bleak
+        client's cached service collection, so it does not open a new
+        connection or disturb the mesh proxy link at all. Returns None
+        when nothing is connected.
+
+        Shape::
+
+            [
+              {"uuid": "0000180a-...", "handle": 1,
+               "characteristics": [
+                 {"uuid": "...", "handle": 3,
+                  "properties": ["read", "notify"],
+                  "descriptors": [{"uuid": "...", "handle": 5}]},
+                 ...
+               ]},
+              ...
+            ]
+        """
+        if self._client is None or not self._client.is_connected:
+            return None
+        services = getattr(self._client, "services", None)
+        if services is None:
+            return None
+
+        try:
+            service_iter = list(services)
+        except Exception:  # noqa: BLE001
+            return None
+
+        out: list[dict] = []
+        for service in service_iter:
+            chars: list[dict] = []
+            for char in getattr(service, "characteristics", []) or []:
+                descriptors: list[dict] = []
+                for desc in getattr(char, "descriptors", []) or []:
+                    descriptors.append({
+                        "uuid": str(getattr(desc, "uuid", "")),
+                        "handle": getattr(desc, "handle", None),
+                    })
+                chars.append({
+                    "uuid": str(getattr(char, "uuid", "")),
+                    "handle": getattr(char, "handle", None),
+                    "properties": list(getattr(char, "properties", []) or []),
+                    "descriptors": descriptors,
+                })
+            out.append({
+                "uuid": str(getattr(service, "uuid", "")),
+                "handle": getattr(service, "handle", None),
+                "characteristics": chars,
+            })
+        return out
+
     async def _teardown_active(self) -> None:
         """Drop whichever client we just attempted, without touching rx_task's
         pump (it's shared across reconnect attempts)."""

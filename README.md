@@ -116,6 +116,14 @@ HA can't reach any mesh proxy over BLE. Check:
 **Physical remote presses aren't reflected in HA**
 The coordinator polls every 15 s, so expect up to ~15 s of lag after a wall-switch press. If it never catches up, check HA logs for `State poll for ... failed` entries.
 
+**Need to see what's really going on**
+Download the integration's diagnostics from **Settings → Devices & Services → Häfele Connect Mesh → ⋮ → Download diagnostics**. The JSON includes:
+- Coordinator state (active proxy, candidate order, per-node availability, current IV Index, SEQ snapshot)
+- Latest BLE advertising data for every provisioned node (RSSI, advertised service UUIDs, `advertises_mesh_proxy` flag, seconds since last seen)
+- Full GATT service/characteristic tree of whichever node is currently acting as the mesh proxy (read from the cached bleak client — zero extra BLE traffic)
+
+All network/app/device keys are redacted before export, so the file is safe to share in a bug report.
+
 **Commands fail after a while**
 BT Mesh requires monotonically increasing sequence numbers. The integration persists them on every emission, but if you restore an HA snapshot you may need to wait a few minutes for the network to accept new SEQ values (or re-provision).
 
