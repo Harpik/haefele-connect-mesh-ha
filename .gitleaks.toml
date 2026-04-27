@@ -45,13 +45,15 @@ tags = ["bt-mesh", "crypto"]
 [allowlist]
 description = "Synthetic test values and obvious placeholders"
 regexes = [
-    # All-same-nibble patterns: "0"*32, "a"*32, "A"*32, "B"*32, "f"*32, "1"*32 …
-    '''^([0-9a-fA-F])\1{31}$''',
+    # All-same-nibble patterns: 0{32}, 1{32}, ..., f{32}, A{32}, ..., F{32}.
+    # Enumerated because gitleaks' RE2 engine does not support
+    # backreferences (the original `^([0-9a-fA-F])\1{31}$` crashed it).
+    '''(?i)^(?:0{32}|1{32}|2{32}|3{32}|4{32}|5{32}|6{32}|7{32}|8{32}|9{32}|a{32}|b{32}|c{32}|d{32}|e{32}|f{32})$''',
     # Our canonical synthetic keys used in unit tests.
     '''00112233445566778899AABBCCDDEEFF''',
     '''FFEEDDCCBBAA99887766554433221100''',
     # Tutorial/example pattern starting with "deadbeef" or "cafebabe" etc.
-    '''^(dead|beef|cafe|babe|face|feed|f00d)[0-9a-fA-F]{24}$''',
+    '''(?i)^(?:dead|beef|cafe|babe|face|feed|f00d)[0-9a-f]{24}$''',
 ]
 paths = [
     # Documentation is expected to show example (non-real) key shapes.
