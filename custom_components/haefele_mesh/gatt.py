@@ -298,10 +298,15 @@ class MeshProxyConnection:
         hass: HomeAssistant,
         session: MeshSession,
         message_handler: MessageHandler | None = None,
+        reconnect_callback: Callable[[], Awaitable[None]] | None = None,
     ):
         self._hass = hass
         self._session = session
         self._message_handler = message_handler
+        # Called (with no args) after an unsolicited reconnect attempt
+        # finishes — lets the coordinator refresh availability as soon as
+        # the link comes back, instead of waiting for the next heartbeat.
+        self._reconnect_callback = reconnect_callback
 
         self._client: Optional[BleakClientWithServiceCache] = None
         self._data_in = None
@@ -325,6 +330,13 @@ class MeshProxyConnection:
         self._candidates: list[tuple[str, str]] = []
         # Addresses to explicitly accept-list on the proxy after connect.
         self._filter_addresses: list[int] = []
+        # Set True while a user-initiated disconnect is in flight so the
+        # bleak disconnected callback doesn't trigger an auto-reconnect.
+        self._user_disconnecting: bool = False
+        # Tracks the in-flight auto-reconnect task (if any). Prevents a
+        # storm of reconnect tasks if bleak fires _on_disconnected more
+        # than once for the same drop.
+        self._reconnect_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -462,20 +474,86 @@ class MeshProxyConnection:
     async def _teardown_active(self) -> None:
         """Drop whichever client we just attempted, without touching rx_task's
         pump (it's shared across reconnect attempts)."""
-        if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-        self._client = None
-        self._data_in = None
-        self._active_mac = None
-        self._active_name = ""
+        # Teardown of a failed/unusable candidate is a user-initiated
+        # disconnect from the auto-reconnect perspective — we don't want
+        # it to trigger another reconnect cycle through _on_disconnected.
+        was_flagging = self._user_disconnecting
+        self._user_disconnecting = True
+        try:
+            if self._client is not None:
+                try:
+                    await self._client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._client = None
+            self._data_in = None
+            self._active_mac = None
+            self._active_name = ""
+        finally:
+            self._user_disconnecting = was_flagging
 
     def _on_disconnected(self, _client) -> None:
         _LOGGER.debug("BLE disconnected from proxy %s", self._active_name)
+        # Skip auto-reconnect when the disconnect was user-initiated
+        # (explicit disconnect() call, teardown of a failed candidate,
+        # or integration unload).
+        if self._user_disconnecting:
+            return
+        # Avoid stacking reconnect tasks if bleak fires the callback more
+        # than once (can happen on some stacks during teardown).
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        # Schedule a short-delay reconnect on the HA event loop.
+        self._reconnect_task = self._hass.async_create_task(
+            self._auto_reconnect(),
+            name="haefele-auto-reconnect",
+        )
+
+    async def _auto_reconnect(self) -> None:
+        """Try to re-establish the proxy link right after an unsolicited drop.
+
+        Called from the bleak disconnected callback. We wait briefly so
+        the BLE stack / peer has time to settle, then attempt one
+        `connect_any` cycle. The periodic heartbeat remains as the
+        safety net if this immediate attempt fails.
+        """
+        try:
+            # Small settle delay — immediate reconnects on some stacks
+            # (BlueZ in particular) race the peer teardown and fail.
+            await asyncio.sleep(2.0)
+            if self._user_disconnecting:
+                return
+            if self.is_connected:
+                return
+            _LOGGER.debug("Auto-reconnect: attempting immediate proxy reconnect")
+            ok = await self.connect_any()
+            if ok:
+                _LOGGER.info("Auto-reconnect: proxy link restored via %s",
+                             self._active_name)
+            else:
+                _LOGGER.debug(
+                    "Auto-reconnect: no proxy reachable yet, "
+                    "will retry on next heartbeat",
+                )
+            if self._reconnect_callback is not None:
+                try:
+                    await self._reconnect_callback()
+                except Exception:  # noqa: BLE001
+                    _LOGGER.exception("Reconnect callback raised")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Auto-reconnect task crashed")
 
     async def disconnect(self) -> None:
+        self._user_disconnecting = True
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._reconnect_task = None
         if self._rx_task is not None and not self._rx_task.done():
             self._rx_task.cancel()
             try:
@@ -492,6 +570,7 @@ class MeshProxyConnection:
         self._data_in = None
         self._active_mac = None
         self._active_name = ""
+        self._user_disconnecting = False
 
     async def ensure_connected(self) -> bool:
         if self.is_connected:

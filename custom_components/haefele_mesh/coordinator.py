@@ -190,6 +190,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             hass=self.hass,
             session=self.session,
             message_handler=self._dispatch_status,
+            reconnect_callback=self._on_proxy_reconnect,
         )
         self.proxy.set_candidates([
             (n["mac"], n["name"]) for n in self._nodes_cfg if n.get("mac")
@@ -221,6 +222,24 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 await self.proxy.disconnect()
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _on_proxy_reconnect(self) -> None:
+        """Called by MeshProxyConnection after an auto-reconnect attempt.
+
+        We refresh availability for every node off the proxy's current
+        connection state so entities recover (or report unavailable)
+        without waiting for the next 60 s heartbeat.
+        """
+        if self.proxy is None:
+            return
+        ok = self.proxy.is_connected
+        for nid in self.availability:
+            self.availability[nid] = ok
+        # Push the new state to every listener (light entities) and also
+        # schedule a regular refresh so the next heartbeat stays aligned.
+        self.async_set_updated_data(
+            {nid: {"available": ok} for nid in self.availability},
+        )
 
     # ------------------------------------------------------------------
     # Heartbeat — just keep the single connection alive
