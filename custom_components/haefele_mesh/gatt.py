@@ -400,6 +400,13 @@ class MeshProxyConnection:
                 name, mac,
             )
             return False
+        return await self._try_connect_device(device, name, timeout=timeout)
+
+    async def _try_connect_device(
+        self, device: BLEDevice, name: str, timeout: float,
+    ) -> bool:
+        """Connect to a specific BLEDevice and validate it as a mesh proxy."""
+        mac = (device.address or "").upper() or "?"
 
         try:
             client = await establish_connection(
