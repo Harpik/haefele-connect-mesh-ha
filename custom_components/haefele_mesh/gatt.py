@@ -370,25 +370,145 @@ class MeshProxyConnection:
         return self._active_name if self.is_connected else ""
 
     async def connect_any(self, timeout_per_candidate: float = 15.0) -> bool:
-        """Try each candidate in order; return True on first success."""
+        """Discover proxies advertising our Network ID; connect to the first usable one.
+
+        Discovery is done by scanning HA's currently-known BLE devices for
+        advertisements carrying the Mesh Proxy Service UUID (0x1828) with
+        Service Data of the form ``0x00 || NetworkID(8 bytes)``, where
+        the Network ID matches ``self._session.network_id`` (k3 of our
+        NetKey). This is the standard BT Mesh way to locate "our" mesh
+        and avoids depending on stored MAC addresses, which may be
+        absent or non-MAC-shaped depending on which platform exported
+        the .connect file.
+
+        ``self._candidates`` (set via :meth:`set_candidates`) is treated
+        as an *ordering hint*: a discovered device whose address matches
+        a stored candidate is tried first. Devices outside the candidate
+        list still get tried — stale stored MACs no longer block recovery.
+        """
         async with self._connect_lock:
             if self.is_connected:
                 return True
-            for mac, name in self._candidates:
-                ok = await self._try_connect(mac, name, timeout=timeout_per_candidate)
+
+            discovered = self._discover_proxy_candidates()
+            if not discovered:
+                # Give HA's passive scan a brief moment in case we were
+                # called before any advertisement has been observed yet
+                # (typical at startup or right after the BT adapter
+                # came back).
+                _LOGGER.debug(
+                    "No mesh-proxy advertisements seen yet; waiting briefly for discovery",
+                )
+                await asyncio.sleep(5.0)
+                discovered = self._discover_proxy_candidates()
+
+            if not discovered:
+                _LOGGER.warning(
+                    "No Häfele node advertising our mesh proxy is currently visible "
+                    "to Home Assistant (network_id=%s, %d configured candidate(s))",
+                    self._session.network_id.hex(),
+                    len(self._candidates),
+                )
+                return False
+
+            for device, name in discovered:
+                mac = (device.address or "").upper()
+                ok = await self._try_connect_device(
+                    device, name, timeout=timeout_per_candidate,
+                )
                 if ok:
-                    # Move the winner to the front for next time.
-                    self._candidates = (
-                        [(mac, name)]
-                        + [c for c in self._candidates if c[0] != mac]
-                    )
+                    # Move any matching stored candidate to the front so
+                    # subsequent reconnects prefer the same proxy first.
+                    if mac:
+                        in_list = next(
+                            (c for c in self._candidates if c[0] == mac), None,
+                        )
+                        if in_list is not None:
+                            self._candidates = (
+                                [in_list]
+                                + [c for c in self._candidates if c[0] != mac]
+                            )
                     return True
-                _LOGGER.debug("Proxy candidate %s (%s) unusable, trying next", name, mac)
+                _LOGGER.debug(
+                    "Proxy candidate %s (%s) unusable, trying next",
+                    name, mac or "?",
+                )
+
             _LOGGER.warning(
-                "No Häfele node reachable as a mesh proxy (%d candidates tried)",
-                len(self._candidates),
+                "No Häfele node reachable as a mesh proxy (%d advertising our network)",
+                len(discovered),
             )
             return False
+
+    def _discover_proxy_candidates(self) -> list[tuple[BLEDevice, str]]:
+        """Scan HA's known BLE devices for proxies advertising our Network ID.
+
+        Returns a list of ``(BLEDevice, friendly_name)`` ordered so that
+        devices matching our stored MAC candidates come first, then any
+        other proxies that match our network. Friendly name is taken
+        from the stored candidate when known, otherwise from the BLE
+        advertisement.
+        """
+        wanted_network_id = self._session.network_id  # 8 bytes
+        candidate_macs = {mac for mac, _ in self._candidates}
+        candidate_names = {mac: name for mac, name in self._candidates}
+
+        preferred: list[tuple[BLEDevice, str]] = []
+        others: list[tuple[BLEDevice, str]] = []
+        seen_addrs: set[str] = set()
+
+        try:
+            service_infos = list(
+                bluetooth.async_discovered_service_info(
+                    self._hass, connectable=True,
+                ),
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("async_discovered_service_info failed: %s", err)
+            return []
+
+        for info in service_infos:
+            if not _advertises_mesh_proxy(info):
+                continue
+            if not _service_data_matches_network_id(info, wanted_network_id):
+                continue
+
+            device: BLEDevice | None = getattr(info, "device", None)
+            if device is None:
+                # Fall back to looking up by address — some HA versions
+                # may not expose .device on every service-info object.
+                addr = getattr(info, "address", None)
+                if not addr:
+                    continue
+                device = bluetooth.async_ble_device_from_address(
+                    self._hass, addr, connectable=True,
+                )
+                if device is None:
+                    continue
+
+            mac = (device.address or "").upper()
+            if not mac or mac in seen_addrs:
+                continue
+            seen_addrs.add(mac)
+
+            friendly = (
+                candidate_names.get(mac)
+                or getattr(info, "name", None)
+                or getattr(device, "name", None)
+                or mac
+            )
+            entry = (device, friendly)
+            if mac in candidate_macs:
+                preferred.append(entry)
+            else:
+                others.append(entry)
+
+        if preferred or others:
+            _LOGGER.debug(
+                "Discovered %d proxy candidate(s) on our network (%d matched stored MACs)",
+                len(preferred) + len(others), len(preferred),
+            )
+        return preferred + others
 
     async def _try_connect(self, mac: str, name: str, timeout: float) -> bool:
         device = bluetooth.async_ble_device_from_address(
