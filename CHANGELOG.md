@@ -4,6 +4,36 @@ All notable changes to this integration are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Proxy connection no longer depends on stored MAC addresses**
+  ([#1](https://github.com/Harpik/haefele-connect-mesh-ha/issues/1)).
+  The integration now locates the mesh proxy by scanning live BLE
+  advertisements for the Mesh Proxy service UUID (`0x1828`) with a
+  Service Data payload of `0x00 || NetworkID(8 bytes)` matching
+  `k3(NetKey)` for your session — the standard BT Mesh discovery
+  pattern. Stored candidate MACs (when valid) are still used as an
+  ordering hint to keep reconnect stickiness, but stale or
+  non-MAC-shaped identifiers in the `.connect` file no longer block
+  recovery: any proxy-capable node on your network that's currently
+  in BLE range is now reachable.
+
+### Tests
+
+- `tests/test_proxy_candidates.py` rewritten against the new
+  discovery internals (`_discover_proxy_candidates` +
+  `_try_connect_device`); adds coverage for the empty-discovery
+  branch and for the "stored MAC stale, different proxy advertising"
+  recovery case.
+
+### Docs
+
+- README architecture and troubleshooting sections updated to
+  describe Network-ID-based discovery and the two distinct
+  log-message cases for unreachable mesh.
+
 ## [0.4.0] — 2026-04-27
 
 Big quality-of-life release: more device types, recover automatically
