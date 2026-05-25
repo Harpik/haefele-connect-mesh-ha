@@ -39,7 +39,14 @@ from homeassistant.core import HomeAssistant
 from .const import (
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
+    MESH_PROXY_SERVICE_UUID,
 )
+
+# Mesh Proxy advertisement service-data "Identification Type" byte values
+# (Mesh Profile spec 7.2.2.2). We currently match Network ID only — it's
+# what Häfele MeshBoxes advertise; Node Identity (0x01) is a future hook.
+PROXY_AD_TYPE_NETWORK_ID = 0x00
+PROXY_AD_TYPE_NODE_IDENTITY = 0x01
 from .access_codec import decode_opcode, encode_opcode
 from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
 
@@ -901,3 +908,52 @@ class MeshProxyConnection:
         """Light HSL Get (0x826D)."""
         await self.send_access(dst, 0x826D, b"")
         _LOGGER.debug("HSL Get -> dst=%04X", dst)
+
+
+# ---------------------------------------------------------------------------
+# Proxy advertisement parsing helpers
+# ---------------------------------------------------------------------------
+#
+# BT Mesh proxies advertise themselves with a Service Data field keyed by
+# the Mesh Proxy Service UUID (0x1828). The payload starts with a 1-byte
+# Identification Type, followed by:
+#
+#   * Type 0x00 (Network ID)    : 8 bytes  — k3(NetKey)
+#   * Type 0x01 (Node Identity) : 16 bytes — Hash(8) || Random(8)
+#
+# We use these helpers to decide whether a discovered BLE device belongs to
+# our mesh, without depending on stored MAC addresses (which may be absent
+# or non-MAC-shaped depending on which platform exported the .connect file).
+
+
+def _advertises_mesh_proxy(service_info) -> bool:
+    """Return True if the BluetoothServiceInfo advertises the Mesh Proxy UUID."""
+    target_full = MESH_PROXY_SERVICE_UUID.lower()
+    target_short = "1828"
+    for raw in (getattr(service_info, "service_uuids", None) or []):
+        u = str(raw).lower()
+        if u == target_full or u == target_short:
+            return True
+    return False
+
+
+def _proxy_service_data(service_info) -> bytes | None:
+    """Return raw service-data bytes for the Mesh Proxy UUID, or None."""
+    sd = getattr(service_info, "service_data", None) or {}
+    target_full = MESH_PROXY_SERVICE_UUID.lower()
+    target_short = "1828"
+    for k, v in sd.items():
+        ks = str(k).lower()
+        if ks == target_full or ks == target_short:
+            return bytes(v) if v is not None else None
+    return None
+
+
+def _service_data_matches_network_id(service_info, network_id: bytes) -> bool:
+    """Return True if proxy service-data is `0x00 || network_id` (8 bytes)."""
+    payload = _proxy_service_data(service_info)
+    if payload is None or len(payload) < 1 + 8:
+        return False
+    if payload[0] != PROXY_AD_TYPE_NETWORK_ID:
+        return False
+    return payload[1:9] == network_id
