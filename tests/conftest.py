@@ -74,7 +74,8 @@ class _StubBleakClient:
 async def _stub_establish_connection(*args, **kwargs):  # pragma: no cover
     raise RuntimeError(
         "establish_connection() called in a unit test — tests must "
-        "monkeypatch MeshProxyConnection._try_connect instead.",
+        "monkeypatch MeshProxyConnection._try_connect_device (or "
+        "_discover_proxy_candidates) instead.",
     )
 
 

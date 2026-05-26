@@ -33,7 +33,7 @@ Home Assistant itself plays the role of a BT Mesh **GATT Proxy client**. It conn
                                               └───────────────────────────┘
 ```
 
-HA opens **one** GATT connection to a single Häfele node that has the BT Mesh **Proxy feature** enabled. That node forwards every command and status update between HA and the rest of the mesh — so only one proxy-capable node needs to be reachable over BLE, regardless of how many lights are in the network.
+HA opens **one** GATT connection to a single Häfele node that has the BT Mesh **Proxy feature** enabled. The integration locates that node by scanning live BLE advertisements for the Mesh Proxy service UUID (`0x1828`) carrying a Network ID derived from your `.connect` NetKey — it does not rely on stored MAC addresses, so reconnect still works when proxies move, get replaced, or the `.connect` export carries non-MAC identifiers. The connected node forwards every command and status update between HA and the rest of the mesh — so only one proxy-capable node needs to be reachable over BLE, regardless of how many lights are in the network.
 
 > ⚠️ **Your network must contain at least one node with the Proxy feature active** (this is the Häfele app default for mains-powered lights). Nodes that only implement the GATT Proxy *service* without the Proxy feature (e.g. some battery-powered spots with it disabled for power reasons) will advertise UUID `0x1828`, accept a GATT connection, but never forward mesh traffic. The integration probes for a real Secure Network Beacon on connect and skips those automatically.
 
@@ -128,7 +128,11 @@ HA can't reach any mesh proxy over BLE. Check:
 1. `Settings → System → Hardware → Bluetooth` shows an active adapter or ESPHome proxy.
 2. Move the HA host / proxy closer to one light (≤ 10 m line of sight is a good test).
 3. At least one mains-powered light must have the BT Mesh **Proxy feature** enabled (default in the Häfele app).
-4. Look for `haefele_mesh` entries in `Settings → System → Logs`. A line saying `No Häfele node reachable as a mesh proxy` means none of your nodes emitted a Secure Network Beacon within 5 s of connecting — the proxy candidates are either out of range, powered off, or have the Proxy feature disabled.
+4. Look for `haefele_mesh` entries in `Settings → System → Logs`. Two messages narrow this down:
+   - `No Häfele node advertising our mesh proxy is currently visible` — nothing on your network is broadcasting the Mesh Proxy service (UUID `0x1828`) with a Network ID matching your `.connect`. Likely root cause: every proxy-capable node is out of range, powered off, or has the Proxy feature disabled.
+   - `No Häfele node reachable as a mesh proxy` after one or more discovery hits — a node was found but never emitted a Secure Network Beacon within 5 s of a fresh GATT link, so it's not acting as a functional proxy. Try moving closer or enabling the Proxy feature on a different node.
+
+   The integration **does not depend on stored MAC addresses** to find the proxy: it discovers it live via BLE advertisements keyed on your Network ID, so a stale or non-MAC-shaped address in the `.connect` file is no longer a blocker.
 
 **Physical remote presses aren't reflected in HA**
 The coordinator polls every 15 s, so expect up to ~15 s of lag after a wall-switch press. If it never catches up, check HA logs for `State poll for ... failed` entries.

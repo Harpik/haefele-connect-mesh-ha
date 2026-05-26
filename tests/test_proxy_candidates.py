@@ -1,11 +1,11 @@
 """
-Tests for MeshProxyConnection's candidate selection + reorder-on-success
-behaviour.
+Tests for MeshProxyConnection's discovery + connect-and-promote behaviour.
 
-We don't open real GATT links here — `_try_connect` is monkeypatched
-so each test drives a deterministic sequence of "reachable / not
-reachable" outcomes. The actual BLE path is exercised via integration
-testing against real Häfele hardware (see `_pending/live-checklist.md`).
+We don't open real GATT links here — `_discover_proxy_candidates` and
+`_try_connect_device` are monkeypatched so each test drives a deterministic
+sequence of "discovered / reachable" outcomes. The actual BLE path is
+exercised via integration testing against real Häfele hardware (see
+`_pending/live-checklist.md`).
 """
 
 from __future__ import annotations
@@ -38,12 +38,18 @@ def _make_session() -> MeshSession:
 
 def _make_proxy() -> MeshProxyConnection:
     """Build a MeshProxyConnection with a dummy `hass` (never touched by
-    these tests because `_try_connect` is patched)."""
+    these tests because the discovery + connect path is patched)."""
     return MeshProxyConnection(
-        hass=SimpleNamespace(),  # unused once _try_connect is patched
+        hass=SimpleNamespace(),  # unused once internals are patched
         session=_make_session(),
         message_handler=None,
     )
+
+
+def _fake_device(mac: str):
+    """Minimal BLEDevice stand-in exposing the .address attribute the
+    production code reads from."""
+    return SimpleNamespace(address=mac, name=None)
 
 
 # ---------------------------------------------------------------------------
@@ -68,13 +74,17 @@ def test_set_candidates_replaces_previous_list():
 
 
 # ---------------------------------------------------------------------------
-# connect_any: iteration order + winner promotion
+# connect_any: discovery → iteration order → winner promotion
 # ---------------------------------------------------------------------------
 
-def _patch_try_connect(proxy: MeshProxyConnection, successful_mac: str | None):
-    """Install a fake `_try_connect` that flips the connection state on
-    for exactly one MAC (or never, if successful_mac is None) and records
-    every attempt."""
+def _patch_discovery_and_connect(
+    proxy: MeshProxyConnection,
+    discovered_macs: list[str],
+    successful_mac: str | None,
+):
+    """Install a fake discovery returning the given MACs (in order) and
+    a fake connect that succeeds for at most one of them. Returns the
+    list that records every connect attempt."""
     attempts: list[str] = []
 
     # Fake "connected" client — just needs a truthy is_connected attr.
@@ -84,7 +94,23 @@ def _patch_try_connect(proxy: MeshProxyConnection, successful_mac: str | None):
         async def disconnect(self):
             type(self).is_connected = False
 
-    async def _fake_try(mac: str, name: str, timeout: float) -> bool:
+    def _fake_discover() -> list[tuple[object, str]]:
+        # Reflect the production ordering hint: stored candidates first,
+        # in their stored order; then any other discovered devices.
+        candidate_macs = [mac for mac, _ in proxy._candidates]
+        candidate_names = {mac: name for mac, name in proxy._candidates}
+        preferred = [
+            (_fake_device(m), candidate_names.get(m, m))
+            for m in candidate_macs if m in discovered_macs
+        ]
+        others = [
+            (_fake_device(m), m)
+            for m in discovered_macs if m not in candidate_macs
+        ]
+        return preferred + others
+
+    async def _fake_try(device, name: str, timeout: float) -> bool:
+        mac = device.address
         attempts.append(mac)
         if successful_mac is not None and mac == successful_mac:
             proxy._client = _FakeClient()
@@ -93,7 +119,8 @@ def _patch_try_connect(proxy: MeshProxyConnection, successful_mac: str | None):
             return True
         return False
 
-    proxy._try_connect = _fake_try  # type: ignore[assignment]
+    proxy._discover_proxy_candidates = _fake_discover  # type: ignore[assignment]
+    proxy._try_connect_device = _fake_try  # type: ignore[assignment]
     return attempts
 
 
@@ -104,7 +131,13 @@ def test_connect_any_tries_candidates_in_given_order_until_one_succeeds():
         ("BB:BB:BB:BB:BB:BB", "second"),
         ("CC:CC:CC:CC:CC:CC", "third"),
     ])
-    attempts = _patch_try_connect(p, successful_mac="BB:BB:BB:BB:BB:BB")
+    attempts = _patch_discovery_and_connect(
+        p,
+        discovered_macs=[
+            "AA:AA:AA:AA:AA:AA", "BB:BB:BB:BB:BB:BB", "CC:CC:CC:CC:CC:CC",
+        ],
+        successful_mac="BB:BB:BB:BB:BB:BB",
+    )
 
     ok = asyncio.run(p.connect_any())
 
@@ -119,12 +152,16 @@ def test_connect_any_returns_false_when_no_candidate_works():
         ("AA:AA:AA:AA:AA:AA", "first"),
         ("BB:BB:BB:BB:BB:BB", "second"),
     ])
-    attempts = _patch_try_connect(p, successful_mac=None)
+    attempts = _patch_discovery_and_connect(
+        p,
+        discovered_macs=["AA:AA:AA:AA:AA:AA", "BB:BB:BB:BB:BB:BB"],
+        successful_mac=None,
+    )
 
     ok = asyncio.run(p.connect_any())
 
     assert ok is False
-    # Every candidate was tried exactly once.
+    # Every discovered candidate was tried exactly once.
     assert attempts == ["AA:AA:AA:AA:AA:AA", "BB:BB:BB:BB:BB:BB"]
 
 
@@ -137,7 +174,11 @@ def test_connect_any_promotes_winner_to_front_for_next_cycle():
         ("AA:AA:AA:AA:AA:AA", "cocina-fuegos-lookalike"),
         ("BB:BB:BB:BB:BB:BB", "luz-desayunos-lookalike"),
     ])
-    _patch_try_connect(p, successful_mac="BB:BB:BB:BB:BB:BB")
+    _patch_discovery_and_connect(
+        p,
+        discovered_macs=["AA:AA:AA:AA:AA:AA", "BB:BB:BB:BB:BB:BB"],
+        successful_mac="BB:BB:BB:BB:BB:BB",
+    )
 
     asyncio.run(p.connect_any())
 
@@ -147,11 +188,15 @@ def test_connect_any_promotes_winner_to_front_for_next_cycle():
 
 
 def test_connect_any_skips_when_already_connected():
-    """Second call must early-return True without touching the candidate
-    list (no spurious re-probes if an entity calls ensure_connected twice)."""
+    """Second call must early-return True without touching the discovery
+    path (no spurious re-probes if an entity calls ensure_connected twice)."""
     p = _make_proxy()
     p.set_candidates([("AA:AA:AA:AA:AA:AA", "only")])
-    attempts = _patch_try_connect(p, successful_mac="AA:AA:AA:AA:AA:AA")
+    attempts = _patch_discovery_and_connect(
+        p,
+        discovered_macs=["AA:AA:AA:AA:AA:AA"],
+        successful_mac="AA:AA:AA:AA:AA:AA",
+    )
 
     assert asyncio.run(p.connect_any()) is True
     assert attempts == ["AA:AA:AA:AA:AA:AA"]
@@ -161,8 +206,40 @@ def test_connect_any_skips_when_already_connected():
     assert attempts == ["AA:AA:AA:AA:AA:AA"]
 
 
-def test_connect_any_with_empty_candidate_list_returns_false():
+def test_connect_any_with_no_discovery_returns_false(monkeypatch):
+    """When nothing on our network is currently advertising as a proxy,
+    connect_any must give up cleanly (after the brief discovery wait)."""
+    # Skip the 5s discovery-retry sleep — we just want to assert the
+    # "no candidate ⇒ False" branch.
+    from custom_components.haefele_mesh import gatt as gatt_mod
+
+    async def _instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(gatt_mod.asyncio, "sleep", _instant_sleep)
+
     p = _make_proxy()
-    p.set_candidates([])
-    # Don't patch — no candidates means _try_connect is never called anyway.
+    p.set_candidates([("AA:AA:AA:AA:AA:AA", "only")])
+    attempts = _patch_discovery_and_connect(
+        p,
+        discovered_macs=[],  # nothing discovered
+        successful_mac=None,
+    )
+
     assert asyncio.run(p.connect_any()) is False
+    assert attempts == []
+
+
+def test_connect_any_uses_unstored_discovered_proxy():
+    """If the .connect-stored MAC is stale/wrong but a different node on
+    our network advertises itself, we must still connect through it."""
+    p = _make_proxy()
+    p.set_candidates([("AA:AA:AA:AA:AA:AA", "stale-stored")])
+    attempts = _patch_discovery_and_connect(
+        p,
+        discovered_macs=["DD:DD:DD:DD:DD:DD"],  # not in stored list
+        successful_mac="DD:DD:DD:DD:DD:DD",
+    )
+
+    assert asyncio.run(p.connect_any()) is True
+    assert attempts == ["DD:DD:DD:DD:DD:DD"]
