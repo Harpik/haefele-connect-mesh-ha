@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_try_connect_device`); adds coverage for the empty-discovery
   branch and for the "stored MAC stale, different proxy advertising"
   recovery case.
+- `tests/test_proxy_discovery_recovery.py` adds an end-to-end-style
+  test that drives the *real* `_discover_proxy_candidates` against a
+  mocked HA bluetooth layer and asserts the MAC-stale → Network-ID
+  recovery path: stale stored MAC is never probed, the advertising
+  node is connected through, and the
+  `Discovered N proxy candidate(s) on our network (0 matched stored
+  MACs)` debug line is emitted.
 
 ### Docs
 
