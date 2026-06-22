@@ -177,7 +177,16 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # One SRC for the whole integration. SRC_ADDRESS_BASE is chosen to
         # be fresh vs the Haefele app (provisioner address, usually 0x7FFD)
         # and any earlier gateway implementation.
-        src_address = self._config.get("src_address", SRC_ADDRESS_BASE) & 0xFFFF
+        #
+        # config_flow persists this under "src_address_base"; older builds
+        # mistakenly read "src_address" here, so the stored override never
+        # took effect and the SRC was pinned to the constant. Accept both
+        # keys (new name first) and fall back to the constant.
+        src_address = (
+            self._config.get("src_address_base")
+            or self._config.get("src_address")
+            or SRC_ADDRESS_BASE
+        ) & 0xFFFF
 
         self.session = MeshSession(
             net_key_hex=net_key,
