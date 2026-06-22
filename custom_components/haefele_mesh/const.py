@@ -25,10 +25,25 @@ IV_INDEX_DEFAULT = 1
 # used 0x0060/0x0080, and the Haefele mobile app uses the provisioner
 # address from the .connect file (typically 0x7FFD). 0x00C0+ is fresh in all
 # known deployments, leaving 0x10 headroom between nodes.
-# Our mesh SRC. 0x00C0 is in an unallocated range for this network,
+# Our mesh SRC. 0x00C8 is in an unallocated range for this network,
 # picked to avoid collisions with real Häfele nodes (0x0017, 0x002F,
-# 0x003A) and the provisioner (0x7FFD, used by the Häfele app).
-SRC_ADDRESS_BASE = 0x00C0
+# 0x003A), the provisioner (0x7FFD, used by the Häfele app) and the
+# C0xx group addresses we subscribe to.
+#
+# NOTE: bumped 0x00C0 -> 0x00C8 in 0.4.2. Deleting the persisted SEQ store
+# rewound the SEQ counter for the old SRC 0x00C0 *below* the replay
+# watermark the lamps had already cached for that address, so every frame
+# we emitted looked like a replay and was silently dropped (no Status
+# replies, no actuation). Moving to a brand-new SRC the lamps have never
+# seen gives us an empty replay list there, so they accept us from the
+# very first frame.
+SRC_ADDRESS_BASE = 0x00C8
+
+# SRC values shipped by earlier builds. A config entry still carrying one
+# of these under "src_address_base" was never a deliberate user override
+# (the override read path was broken), so async_migrate_entry rewrites it
+# to the current SRC_ADDRESS_BASE.
+LEGACY_SRC_ADDRESSES = (0x0060, 0x0080, 0x00C0)
 
 # Lower bound used when seeding a brand-new SEQ counter. Starting at
 # 0x800000 (half the 24-bit SEQ space) guarantees we're above anything any

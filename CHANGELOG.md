@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-06-22
+
+### Fixed
+
+- **Commands silently dropped after a SEQ store reset (replay-cache
+  lockout).** The mesh SRC override persisted by the config flow under
+  `src_address_base` was read from the wrong key in the coordinator, so
+  the SRC was always pinned to the shipped constant (`0x00C0`). When the
+  persisted SEQ store (`.storage/haefele_mesh_seq`) was deleted, the SEQ
+  counter for that SRC rewound *below* the replay-protection watermark
+  the lamps had already cached, so every Set/Get we emitted looked like a
+  replay and was discarded by the nodes (no Status replies, no
+  actuation) while RX/decryption kept working perfectly. Fixed by:
+  - bumping `SRC_ADDRESS_BASE` to a fresh `0x00C8` (empty replay list on
+    every lamp -> accepted from the first frame);
+  - reading the override from `src_address_base` (with a legacy
+    `src_address` fallback) so the value is honoured for real;
+  - a v1->v2 config-entry migration that rewrites any legacy/default SRC
+    (`0x0060`/`0x0080`/`0x00C0`) to the current `SRC_ADDRESS_BASE`,
+    leaving a genuinely custom SRC untouched.
+
 ## [0.4.1] — 2026-05-26
 
 ### Fixed

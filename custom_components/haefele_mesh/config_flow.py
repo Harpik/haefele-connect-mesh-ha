@@ -40,7 +40,7 @@ _FIELD_TEXT = "connect_file_text"
 class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle Häfele Connect Mesh configuration flow."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self) -> None:
         self._parsed_config: dict[str, Any] | None = None
