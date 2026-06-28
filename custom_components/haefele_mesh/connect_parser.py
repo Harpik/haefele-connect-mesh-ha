@@ -26,6 +26,101 @@ _REMOTE_TYPE_PREFIXES = (
     "com.haefele.switch",
 )
 
+MODEL_GENERIC_ONOFF_SERVER = 0x1000
+MODEL_LIGHT_LIGHTNESS_SERVER = 0x1300
+MODEL_LIGHT_CTL_SERVER = 0x1303
+MODEL_LIGHT_CTL_TEMPERATURE_SERVER = 0x1306
+MODEL_LIGHT_HSL_SERVER = 0x1307
+
+_MODEL_ID_KEYS = ("modelId", "modelID", "model_id", "id")
+
+
+def _parse_model_id(raw: Any) -> int | None:
+    """Parse a Bluetooth Mesh model ID from CDB JSON."""
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw.strip(), 16)
+        except ValueError:
+            return None
+    return None
+
+
+def _model_id_from_entry(model: Any) -> int | None:
+    """Extract one model ID from a CDB model entry."""
+    if isinstance(model, dict):
+        for key in _MODEL_ID_KEYS:
+            if key in model:
+                return _parse_model_id(model[key])
+        return None
+    return _parse_model_id(model)
+
+
+def detect_device_type_from_models(models: list[Any]) -> str:
+    """Detect a light device type from Bluetooth Mesh SIG server models."""
+    model_ids = {
+        model_id
+        for model in models
+        if (model_id := _model_id_from_entry(model)) is not None
+    }
+
+    if MODEL_LIGHT_HSL_SERVER in model_ids:
+        return "rgb"
+    if (
+        MODEL_LIGHT_CTL_SERVER in model_ids
+        or MODEL_LIGHT_CTL_TEMPERATURE_SERVER in model_ids
+    ):
+        return "tunable_white"
+    if MODEL_LIGHT_LIGHTNESS_SERVER in model_ids:
+        return "dimmable"
+    if MODEL_GENERIC_ONOFF_SERVER in model_ids:
+        return "onoff"
+    return "unknown"
+
+
+def _detect_device_type_from_node_models(node: dict[str, Any]) -> str:
+    """Detect a light device type from all element models in a node."""
+    node_models: list[Any] = []
+    elements = node.get("elements", [])
+    if not isinstance(elements, list):
+        return "unknown"
+
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        models = element.get("models", [])
+        if isinstance(models, list):
+            node_models.extend(models)
+
+    return detect_device_type_from_models(node_models)
+
+
+def _detect_device_type_from_tos_type(node_type: str, name: str) -> str | None:
+    """Fallback device type detection from Häfele product metadata."""
+    if node_type:
+        type_lower = node_type.lower()
+        if any(type_lower.startswith(p) for p in _REMOTE_TYPE_PREFIXES):
+            _LOGGER.debug("Skipping non-light node %s (%s)", name, node_type)
+            return None
+        if "tw" in type_lower or "tunable" in type_lower:
+            return "tunable_white"
+        if "rgb" in type_lower or "hsl" in type_lower or "color" in type_lower:
+            return "rgb"
+        if "relay" in type_lower or "onoff" in type_lower or "switch_out" in type_lower:
+            return "onoff"
+        if "dim" in type_lower:
+            return "dimmable"
+        if any(type_lower.startswith(p) for p in _LIGHT_TYPE_PREFIXES):
+            return "dimmable"
+        return "unknown"
+
+    # Fallback: guess from name
+    name_lower = name.lower()
+    if "remote" in name_lower or "sensor" in name_lower or "switch" in name_lower:
+        return None
+    return "tunable_white"  # safe default for Häfele lights
+
 
 def _extract_key_from_list(key_list: Any) -> str | None:
     """Extract first key value from a netKeys/appKeys list."""
@@ -182,28 +277,15 @@ def parse_connect_file(content: str) -> dict:
             if isinstance(dev, dict):
                 name = dev.get("name", "").strip() or "Unknown"
 
-        # Determine device type from tos_node.type
-        if node_type:
-            type_lower = node_type.lower()
-            if any(type_lower.startswith(p) for p in _REMOTE_TYPE_PREFIXES):
-                _LOGGER.debug("Skipping non-light node %s (%s)", name, node_type)
+        # Prefer Bluetooth Mesh SIG server models when present. The
+        # tos_node.type string is a vendor product ID and is only a
+        # compatibility fallback for exports without useful model data.
+        device_type = _detect_device_type_from_node_models(node)
+        if device_type == "unknown":
+            fallback_type = _detect_device_type_from_tos_type(node_type, name)
+            if fallback_type is None:
                 continue
-            if "tw" in type_lower or "tunable" in type_lower:
-                device_type = "tunable_white"
-            elif "rgb" in type_lower or "hsl" in type_lower or "color" in type_lower:
-                device_type = "rgb"
-            elif "relay" in type_lower or "onoff" in type_lower or "switch_out" in type_lower:
-                device_type = "onoff"
-            elif "dim" in type_lower:
-                device_type = "dimmable"
-            elif any(type_lower.startswith(p) for p in _LIGHT_TYPE_PREFIXES):
-                device_type = "dimmable"
-        else:
-            # Fallback: guess from name
-            name_lower = name.lower()
-            if "remote" in name_lower or "sensor" in name_lower or "switch" in name_lower:
-                continue
-            device_type = "tunable_white"  # safe default for Häfele lights
+            device_type = fallback_type
 
         # Fallback MAC: not in tos_node (shouldn't happen, but be safe)
         if not mac:

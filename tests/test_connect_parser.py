@@ -57,8 +57,9 @@ def test_parse_rejects_empty_nodes():
 
 def test_parse_skips_remotes_and_sensors():
     doc = json.loads(_load("minimal.connect.json"))
-    # Turn the second node into a remote — should be filtered out.
+    # Turn the second node into a remote without light server models — should be filtered out.
     doc["nodes"][1]["tos_node"]["type"] = "com.haefele.remote.4button"
+    doc["nodes"][1]["elements"] = []
     result = parse_connect_file(json.dumps(doc))
     assert len(result["nodes"]) == 1
     assert result["nodes"][0]["name"] == "Kitchen TW"
