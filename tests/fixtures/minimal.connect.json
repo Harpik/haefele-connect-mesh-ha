@@ -32,7 +32,9 @@
       "elements": [
         {
           "models": [
-            { "modelId": "1000", "subscribe": ["C000"] }
+            { "modelId": "1000", "subscribe": ["C000"] },
+            { "modelId": "1300" },
+            { "modelId": "1303" }
           ]
         }
       ]
@@ -51,7 +53,9 @@
       "elements": [
         {
           "models": [
-            { "modelId": "1000", "subscribe": ["C000"] }
+            { "modelId": "1000", "subscribe": ["C000"] },
+            { "modelId": "1300" },
+            { "modelId": "1303" }
           ]
         }
       ]
