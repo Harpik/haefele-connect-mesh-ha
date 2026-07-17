@@ -181,3 +181,31 @@ def test_remote_skipped():
     ]))
     assert len(parsed["nodes"]) == 1
     assert parsed["nodes"][0]["name"] == "actual light"
+
+
+def test_non_light_types_with_onoff_model_are_skipped():
+    parsed = parse_connect_file(_mk_connect([
+        {
+            "type": "com.haefele.remote.wall_switch",
+            "name": "wall remote",
+            "models": [{"modelId": "1000"}],
+        },
+        {
+            "type": "com.haefele.sensor.motion",
+            "name": "motion sensor",
+            "models": [{"modelId": "1000"}],
+        },
+        {
+            "type": "com.haefele.switch.wall",
+            "name": "wall switch",
+            "models": [{"modelId": "1000"}],
+        },
+        {
+            "type": "com.haefele.meshbox.esp.mw.1c",
+            "name": "actual light",
+            "models": [{"modelId": "1303"}],
+        },
+    ]))
+    assert len(parsed["nodes"]) == 1
+    assert parsed["nodes"][0]["name"] == "actual light"
+    assert parsed["nodes"][0]["device_type"] == "tunable_white"

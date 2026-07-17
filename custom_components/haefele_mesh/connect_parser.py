@@ -41,6 +41,7 @@ def _parse_model_id(raw: Any) -> int | None:
         return raw
     if isinstance(raw, str):
         try:
+            # CDB model IDs are hex strings: "1000" means 0x1000, not decimal 1000.
             return int(raw.strip(), 16)
         except ValueError:
             return None
@@ -276,6 +277,11 @@ def parse_connect_file(content: str) -> dict:
             dev = tos_devices[0]
             if isinstance(dev, dict):
                 name = dev.get("name", "").strip() or "Unknown"
+
+        type_lower = node_type.lower() if isinstance(node_type, str) else ""
+        if any(type_lower.startswith(p) for p in _REMOTE_TYPE_PREFIXES):
+            _LOGGER.debug("Skipping non-light node %s (%s)", name, node_type)
+            continue
 
         # Prefer Bluetooth Mesh SIG server models when present. The
         # tos_node.type string is a vendor product ID and is only a
