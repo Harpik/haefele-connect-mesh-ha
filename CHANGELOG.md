@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-07-18
+
+### Fixed
+
+- **Light capabilities are now detected from the Bluetooth Mesh SIG server
+  models a node advertises, not only from `tos_node.type`**
+  ([#6](https://github.com/Harpik/haefele-connect-mesh-ha/pull/6)). The
+  Häfele product-type string (e.g. `com.haefele.meshbox.esp.mw.1c`) can be
+  too generic to describe what a node actually implements, so tunable-white
+  distributors were mis-detected (the type exported without `tw`/`tunable`
+  even though the node advertises Light CTL models). The `.connect` parser
+  now resolves the capability from the advertised SIG models — Light HSL →
+  `rgb`, Light CTL / CTL Temperature → `tunable_white`, Light Lightness →
+  `dimmable`, Generic OnOff → `onoff` — and keeps the `tos_node.type` string
+  match as a backward-compatible fallback for older exports.
+  Remote/sensor/switch nodes are still filtered by an early guard before
+  model detection, so they never produce spurious light entities.
+
 ## [0.4.2] — 2026-06-22
 
 ### Fixed
@@ -144,5 +162,6 @@ Initial tagged release after the single-proxy refactor
 (`MeshSession` + `MeshProxyConnection` + `HaefeleCoordinator`,
 with the legacy per-node `MeshGattNode` removed).
 
+[0.4.3]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.3
 [0.4.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.3.0
