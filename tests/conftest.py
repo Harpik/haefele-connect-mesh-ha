@@ -97,11 +97,21 @@ class _StubBluetoothModule:
     def async_ble_device_from_address(hass, mac, connectable=True):  # pragma: no cover
         return None
 
+    @staticmethod
+    def async_scanner_count(hass, connectable=True):  # pragma: no cover
+        """Pretend HA has one usable adapter unless a test says otherwise.
+
+        Tests that exercise the no-connectable-transport guard monkeypatch
+        this; everything else should behave as if a normal adapter exists.
+        """
+        return 1
+
 
 _bt_stub = types.ModuleType("homeassistant.components.bluetooth")
 _bt_stub.async_ble_device_from_address = (
     _StubBluetoothModule.async_ble_device_from_address
 )
+_bt_stub.async_scanner_count = _StubBluetoothModule.async_scanner_count
 sys.modules.setdefault("homeassistant.components.bluetooth", _bt_stub)
 # And attach to the parent package so `from homeassistant.components import
 # bluetooth` works.

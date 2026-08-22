@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Scanner-only Bluetooth gateways are now called out explicitly instead of
+  failing as "no proxy visible"**
+  ([#7](https://github.com/Harpik/haefele-connect-mesh-ha/issues/7)). Shelly
+  BLE gateways, BTHome-style bridges and ESPHome proxies without
+  `active: true` forward advertisements to Home Assistant but never open
+  outbound GATT connections, so they can't carry the mesh proxy link. The
+  connection path now checks whether HA has *any* connectable scanner before
+  attempting discovery and, when it doesn't, logs a single explicit error
+  naming that as the cause — the previous generic warning read like a range
+  problem and sent users looking for a Häfele Proxy-feature setting that
+  wasn't involved. The requirements and troubleshooting sections of the
+  README now state the limitation up front.
+
 ## [0.4.3] — 2026-07-18
 
 ### Fixed
