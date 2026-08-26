@@ -43,6 +43,7 @@ HA opens **one** GATT connection to a single Häfele node that has the BT Mesh *
 - A Bluetooth adapter reachable by Home Assistant — either:
   - Local HCI adapter on the HA host (Pi built-in, USB dongle, …), **or**
   - An [ESPHome Bluetooth Proxy](https://esphome.io/components/bluetooth_proxy.html) on the same network
+  - ⚠️ **Scanner-only BLE gateways do not work.** Shelly BLE gateways, BTHome-style bridges and ESPHome proxies without `active: true` forward advertisements to HA but never open outbound GATT connections. This integration needs a real GATT link to a mesh proxy node, so an advertisement-only gateway can't drive it — no matter how well it hears the lights.
 - Häfele Connect Mesh lights provisioned via the Häfele Connect app
 - A `.connect` export file from that app
 
@@ -128,7 +129,8 @@ HA can't reach any mesh proxy over BLE. Check:
 1. `Settings → System → Hardware → Bluetooth` shows an active adapter or ESPHome proxy.
 2. Move the HA host / proxy closer to one light (≤ 10 m line of sight is a good test).
 3. At least one mains-powered light must have the BT Mesh **Proxy feature** enabled (default in the Häfele app).
-4. Look for `haefele_mesh` entries in `Settings → System → Logs`. Two messages narrow this down:
+4. Look for `haefele_mesh` entries in `Settings → System → Logs`. Three messages narrow this down:
+   - `Home Assistant has no Bluetooth transport that can open connections` — every Bluetooth source HA knows about is advertisement-only (typically a Shelly BLE gateway or a passive ESPHome proxy). Nothing else will work until you add a local adapter or an ESPHome proxy with `active: true`; the lights being visible in the gateway's scan makes no difference.
    - `No Häfele node advertising our mesh proxy is currently visible` — nothing on your network is broadcasting the Mesh Proxy service (UUID `0x1828`) with a Network ID matching your `.connect`. Likely root cause: every proxy-capable node is out of range, powered off, or has the Proxy feature disabled.
    - `No Häfele node reachable as a mesh proxy` after one or more discovery hits — a node was found but never emitted a Secure Network Beacon within 5 s of a fresh GATT link, so it's not acting as a functional proxy. Try moving closer or enabling the Proxy feature on a different node.
 

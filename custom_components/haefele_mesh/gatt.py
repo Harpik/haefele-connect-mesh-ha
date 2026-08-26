@@ -344,6 +344,10 @@ class MeshProxyConnection:
         # storm of reconnect tasks if bleak fires _on_disconnected more
         # than once for the same drop.
         self._reconnect_task: Optional[asyncio.Task] = None
+        # True while we've already logged the "no connectable transport"
+        # error, so a permanent misconfiguration doesn't spam the log on
+        # every heartbeat. Reset as soon as a connectable scanner shows up.
+        self._no_transport_warned: bool = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -389,6 +393,9 @@ class MeshProxyConnection:
         async with self._connect_lock:
             if self.is_connected:
                 return True
+
+            if self._no_connectable_transport():
+                return False
 
             discovered = self._discover_proxy_candidates()
             if not discovered:
@@ -439,6 +446,48 @@ class MeshProxyConnection:
                 len(discovered),
             )
             return False
+
+    def _no_connectable_transport(self) -> bool:
+        """Return True when HA has no Bluetooth transport that can connect.
+
+        Scanner-only gateways (Shelly BLE gateways, BTHome-style bridges,
+        ESPHome proxies without ``active: true``) forward advertisements
+        but never open outbound GATT connections, so they cannot carry
+        mesh traffic no matter how well they hear the lights.
+
+        Without this check the failure surfaces as the generic "no proxy
+        visible" warning below, which reads like a range problem and
+        sends users hunting for a Proxy-feature setting that isn't the
+        cause (see issue #7).
+        """
+        connectable = _scanner_count(self._hass, connectable=True)
+        if connectable is None:
+            # Core too old to tell us — fall through to normal discovery.
+            return False
+        if connectable > 0:
+            self._no_transport_warned = False
+            return False
+
+        total = _scanner_count(self._hass, connectable=False)
+        if self._no_transport_warned:
+            _LOGGER.debug(
+                "Still no connectable Bluetooth transport (%s scanner(s) total)",
+                "?" if total is None else total,
+            )
+            return True
+
+        self._no_transport_warned = True
+        _LOGGER.error(
+            "Home Assistant has no Bluetooth transport that can open connections "
+            "(%s scanner(s) visible, none connectable). Häfele Connect Mesh needs "
+            "a real GATT link to a mesh proxy node: scanner-only gateways such as "
+            "Shelly BLE gateways, BTHome bridges or ESPHome proxies without "
+            "'active: true' only forward advertisements and cannot be used. "
+            "Add a local Bluetooth adapter to the Home Assistant host, or an "
+            "ESPHome Bluetooth Proxy with active connections enabled.",
+            "?" if total is None else total,
+        )
+        return True
 
     def _discover_proxy_candidates(self) -> list[tuple[BLEDevice, str]]:
         """Scan HA's known BLE devices for proxies advertising our Network ID.
@@ -1084,3 +1133,17 @@ def _service_data_matches_network_id(service_info, network_id: bytes) -> bool:
     if payload[0] != PROXY_AD_TYPE_NETWORK_ID:
         return False
     return payload[1:9] == network_id
+
+
+def _scanner_count(hass: HomeAssistant, connectable: bool) -> int | None:
+    """Count BLE scanners known to HA, or None if core doesn't expose the API.
+
+    ``connectable=True`` counts only scanners able to open outbound GATT
+    connections; ``connectable=False`` counts every scanner, including
+    advertisement-only ones.
+    """
+    try:
+        return bluetooth.async_scanner_count(hass, connectable=connectable)
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("async_scanner_count(connectable=%s) failed: %s", connectable, err)
+        return None
