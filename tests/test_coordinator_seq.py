@@ -333,29 +333,211 @@ def test_seq_is_persisted_in_blocks_and_store_stays_ahead():
     assert saves <= n // SEQ_PERSIST_BLOCK + 2, saves
 
 
-def test_restart_after_unclean_shutdown_resumes_above_last_emitted():
-    c1 = _coordinator()
-
-    async def first_life():
-        await c1.async_setup()
+def _emit_then_crash(c, n):
+    async def run():
+        await c.async_setup()
         last = 0
-        for _ in range(10):
-            last = await c1.next_seq(c1.session.src)
+        for _ in range(n):
+            last = await c.next_seq(c.session.src)
         # no async_shutdown: simulate power loss
-        if c1._poll_task:
-            c1._poll_task.cancel()
+        if c._poll_task:
+            c._poll_task.cancel()
         return last
+    return asyncio.run(run())
 
-    last = asyncio.run(first_life())
-    c2 = _coordinator()
 
-    async def second_life():
-        await c2.async_setup()
-        seq = await c2.next_seq(c2.session.src)
-        await c2.async_shutdown()
+def _first_seq_after_restart(c):
+    async def run():
+        await c.async_setup()
+        seq = await c.next_seq(c.session.src)
+        await c.async_shutdown()
+        return seq
+    return asyncio.run(run())
+
+
+def test_restart_after_unclean_shutdown_resumes_above_last_emitted(monkeypatch):
+    # Without the +200 startup jump, only the persisted block ceiling can
+    # keep the restart above what was really sent. Emit several blocks so
+    # a store that lags behind (e.g. saving the last SEQ instead of the
+    # ceiling, or not refreshing it) is caught.
+    monkeypatch.setattr(coord_mod, "SEQ_STARTUP_JUMP", 0)
+    last = _emit_then_crash(_coordinator(), 3 * SEQ_PERSIST_BLOCK + 17)
+    assert _first_seq_after_restart(_coordinator()) > last
+
+
+# ---------------------------------------------------------------------------
+# Save-then-commit
+# ---------------------------------------------------------------------------
+
+def _failing_saves(monkeypatch, key, fail_times):
+    """Make the first `fail_times` saves to `key` raise OSError."""
+    real = FakeStore.async_save
+    state = {"left": fail_times, "attempts": 0}
+
+    async def save(self, data):
+        if self.key == key:
+            state["attempts"] += 1
+            if state["left"] > 0:
+                state["left"] -= 1
+                raise OSError("disk full")
+        await real(self, data)
+
+    monkeypatch.setattr(FakeStore, "async_save", save)
+    return state
+
+
+def test_failed_block_save_never_hands_out_unpersisted_seq(monkeypatch):
+    c = _coordinator()
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: 1000}
+    state = _failing_saves(monkeypatch, STORE_KEY, fail_times=1)
+
+    async def run():
+        with pytest.raises(OSError):
+            await c.next_seq(0x00C8)
+        handed = []
+        for _ in range(5):
+            seq = await c.next_seq(0x00C8)
+            handed.append(seq)
+            # every SEQ handed out is covered by what is on disk
+            assert FakeStore.data[STORE_KEY]["200"] >= seq
+        return handed
+
+    handed = asyncio.run(run())
+    assert handed == [1001, 1002, 1003, 1004, 1005]
+    assert state["attempts"] == 2  # the failed save was retried, not skipped
+
+
+def test_failed_rotation_save_keeps_old_src_and_retries(monkeypatch):
+    c = _coordinator()
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD - 1}
+    c._seq_reserved = {0x00C8: SEQ_ROTATE_THRESHOLD + 1000}  # no block save due
+    _failing_saves(monkeypatch, STORE_KEY, fail_times=1)
+
+    async def run():
+        await c.next_seq(0x00C8)  # crosses threshold, rotation save fails
+        assert c._active_src == 0x00C8
+        assert STORE_KEY not in FakeStore.data
+        await c.next_seq(0x00C8)  # retry succeeds
+        return c._active_src
+
+    new_src = asyncio.run(run())
+    assert new_src != 0x00C8
+    assert FakeStore.data[STORE_KEY][STORE_KEY_ACTIVE_SRC] == new_src
+
+
+# ---------------------------------------------------------------------------
+# Per-entry storage
+# ---------------------------------------------------------------------------
+
+def _entry_coordinator(entry_id, **overrides):
+    return HaefeleCoordinator(object(), _config(**overrides), entry_id=entry_id)
+
+
+def test_two_entries_do_not_overwrite_each_others_seq(monkeypatch):
+    monkeypatch.setattr(coord_mod, "SEQ_STARTUP_JUMP", 0)
+    a, b = _entry_coordinator("A"), _entry_coordinator("B")
+
+    async def run():
+        await a.async_setup()
+        await b.async_setup()
+        last_a = 0
+        for _ in range(3 * SEQ_PERSIST_BLOCK):
+            last_a = await a.next_seq(a.session.src)
+        await b.next_seq(b.session.src)  # B saves after A
+        await a.async_shutdown()
+        await b.async_shutdown()
+        return last_a
+
+    last_a = asyncio.run(run())
+    assert FakeStore.data[f"{STORE_KEY}_A"]["200"] >= last_a
+    assert _first_seq_after_restart(_entry_coordinator("A")) > last_a
+
+
+def test_rotated_src_of_one_entry_does_not_leak_to_another():
+    a = _entry_coordinator("A")
+    a._active_src = 0x00D9
+    a._seq_reserved = {0x00C8: SEQ_ROTATE_THRESHOLD, 0x00D9: 5}
+    asyncio.run(a._save_seq())  # A persists its rotated SRC
+    # B is a network added with this release (per-entry marker set).
+    b = _entry_coordinator("B", seq_store="per_entry")
+    asyncio.run(_setup(b))
+    assert b.session.src == 0x00C8
+    assert b._seq_state.get(0x00C8, 0) < SEQ_ROTATE_THRESHOLD  # nothing inherited
+
+
+def test_pre_existing_entry_migrating_never_adopts_anothers_active_src():
+    # Both entries predate per-entry storage (no marker): A mirrors to the
+    # shared file, then B migrates from it on its first start.
+    a = _entry_coordinator("A")
+    a._active_src = 0x00D9
+    a._seq_reserved = {0x00C8: 1000, 0x00D9: 5}
+    asyncio.run(a._save_seq())
+    assert STORE_KEY_ACTIVE_SRC not in FakeStore.data[STORE_KEY]
+    b = _entry_coordinator("B")
+    asyncio.run(_setup(b))
+    assert b.session.src == 0x00C8
+
+
+def test_new_entry_never_reads_or_writes_the_shared_store():
+    FakeStore.data[STORE_KEY] = {"200": 9_000_000, "_iv_index": 3}
+    c = _entry_coordinator("N", seq_store="per_entry")
+
+    async def run():
+        await c.async_setup()
+        await c.next_seq(c.session.src)
+        await c.async_shutdown()
+
+    asyncio.run(run())
+    assert FakeStore.data[STORE_KEY] == {"200": 9_000_000, "_iv_index": 3}
+    assert c.session.iv_index == 1  # config value, not the shared file's 3
+
+
+def test_per_entry_store_migrates_from_shared_and_keeps_it_mirrored():
+    FakeStore.data[STORE_KEY] = {"200": 123456, "_iv_index": 7}
+    c = _entry_coordinator("A")
+
+    async def run():
+        await c.async_setup()
+        seq = await c.next_seq(c.session.src)
+        await c.async_shutdown()
         return seq
 
-    assert asyncio.run(second_life()) > last
+    seq = asyncio.run(run())
+    assert seq > 123456
+    assert c.session.iv_index == 7
+    assert FakeStore.data[f"{STORE_KEY}_A"]["200"] >= seq
+    # shared file still current, so a downgrade resumes safely
+    assert FakeStore.data[STORE_KEY]["200"] >= seq
+
+
+# ---------------------------------------------------------------------------
+# Background task ownership
+# ---------------------------------------------------------------------------
+
+def test_rotation_filter_task_is_tracked_and_cancelled_on_shutdown():
+    c = _coordinator()
+
+    async def run():
+        await c.async_setup()
+        proxy = FakeProxy.instances[0]
+        proxy.is_connected = True
+        gate = asyncio.Event()
+
+        async def slow_add(addresses):
+            await gate.wait()
+
+        proxy.add_filter_addresses = slow_add
+        c._on_src_rotated(0x00C9)
+        assert len(c._background_tasks) == 1
+        task = next(iter(c._background_tasks))
+        await c.async_shutdown()
+        return task
+
+    task = asyncio.run(run())
+    assert task.cancelled()
+    assert not c._background_tasks
 
 
 # ---------------------------------------------------------------------------

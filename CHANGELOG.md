@@ -41,6 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   last SEQ sent, so an unclean shutdown still never rewinds the counter. The
   IV Index is also saved on shutdown. Stores written by older releases are
   read as before.
+- **SEQ is only handed out once it is safely on disk.** A failed write at
+  the start of a block used to raise the in-memory ceiling anyway, so the
+  next SEQs went out unpersisted and could be reused after a crash. Block
+  saves and SRC rotation are now save-then-commit: on a failed write nothing
+  changes, the frame isn't sent, and the next call retries. A failed rotation
+  save keeps the old SRC (still far from exhaustion) and retries.
+- **One SEQ store per config entry** (`haefele_mesh_seq_<entry_id>`). All
+  entries used to share one file, so a second Häfele network could overwrite
+  the first one's SEQ (and, with rotation, its active SRC). Entries created
+  before this release migrate from the shared file once and keep mirroring to
+  it, without the active SRC, so a downgrade resumes from a current SEQ. New
+  entries never touch the shared file.
+- The rotation filter update now runs as a tracked background task, cancelled
+  on shutdown, instead of an unreferenced `asyncio.create_task`.
 - Dropped `cryptography` from the manifest requirements. It ships with Home
   Assistant core, and hassfest now rejects custom integrations that list it.
 

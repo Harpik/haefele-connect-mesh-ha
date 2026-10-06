@@ -6,6 +6,10 @@ CONF_NETWORK_KEY = "network_key"
 CONF_APP_KEY = "app_key"
 CONF_IV_INDEX = "iv_index"
 CONF_NODES = "nodes"
+# Marks entries created with per-entry SEQ storage (see coordinator).
+# Absent on entries created by earlier releases.
+CONF_SEQ_STORE = "seq_store"
+SEQ_STORE_PER_ENTRY = "per_entry"
 
 # BLE
 MESH_PROXY_SERVICE_UUID  = "00001828-0000-1000-8000-00805f9b34fb"

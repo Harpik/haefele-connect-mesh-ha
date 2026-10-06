@@ -20,6 +20,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    CONF_SEQ_STORE,
     DOMAIN,
     HEARTBEAT_INTERVAL,
     LEGACY_SRC_ADDRESSES,
@@ -29,6 +30,7 @@ from .const import (
     SEQ_PERSIST_BLOCK,
     SEQ_ROTATE_THRESHOLD,
     SEQ_SEED_MIN,
+    SEQ_STORE_PER_ENTRY,
     SRC_ADDRESS_BASE,
     UNICAST_MAX,
 )
@@ -63,7 +65,9 @@ STATE_POLL_PER_NODE_GAP = 0.2
 class HaefeleCoordinator(DataUpdateCoordinator):
     """Owns mesh session + single proxy connection for all nodes."""
 
-    def __init__(self, hass: HomeAssistant, config: dict):
+    def __init__(
+        self, hass: HomeAssistant, config: dict, entry_id: str | None = None,
+    ):
         super().__init__(
             hass,
             _LOGGER,
@@ -76,7 +80,28 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # SEQ store. Keyed by SRC: the active one plus every SRC we have
         # retired (kept so we never reuse an address whose SEQ space we
         # already burnt).
-        self._seq_store: Store = Store(hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY)
+        #
+        # One file per config entry: a shared file let two meshes overwrite
+        # each other's SEQ / active SRC (last writer wins).
+        #
+        # Entries created before per-entry storage (no CONF_SEQ_STORE marker)
+        # migrate once from the shared file and keep mirroring to it, so a
+        # downgrade to a release that only knows the shared file resumes
+        # from a current SEQ instead of a stale one. Entries created with
+        # the marker never touch the shared file, so a new network can't
+        # inherit another network's SEQ state.
+        self._legacy_seq_store: Store = Store(
+            hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY,
+        )
+        self._uses_legacy_store = (
+            config.get(CONF_SEQ_STORE) != SEQ_STORE_PER_ENTRY
+        )
+        if entry_id:
+            self._seq_store: Store = Store(
+                hass, SEQ_STORAGE_VERSION, f"{SEQ_STORAGE_KEY}_{entry_id}",
+            )
+        else:
+            self._seq_store = self._legacy_seq_store
         # Last SEQ handed out, per SRC.
         self._seq_state: dict[int, int] = {}
         # Persisted ceiling per SRC (>= last SEQ handed out). This is what
@@ -88,6 +113,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._persisted_active_src: int | None = None
         self._active_src: int | None = None
         self._rotation_exhausted_logged = False
+        self._rotation_save_failed_logged = False
+        # Fire-and-forget tasks we own; kept referenced (the event loop only
+        # holds weak references) and cancelled on shutdown.
+        self._background_tasks: set[asyncio.Task] = set()
         # Persisted IV Index from last session (auto-updated by Secure
         # Network Beacons). None until _load_seq runs.
         self._persisted_iv_index: int | None = None
@@ -134,6 +163,16 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     async def _load_seq(self) -> None:
         raw = await self._seq_store.async_load()
+        if (
+            raw is None
+            and self._uses_legacy_store
+            and self._seq_store is not self._legacy_seq_store
+        ):
+            # First start with per-entry storage: migrate from the shared
+            # file written by earlier releases.
+            raw = await self._legacy_seq_store.async_load()
+            if raw is not None:
+                _LOGGER.info("Migrating SEQ state from the shared store")
         state: dict[int, int] = {}
         iv: int | None = None
         active: int | None = None
@@ -165,20 +204,41 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._persisted_iv_index = iv
         self._persisted_active_src = active
 
-    def _store_payload(self) -> dict[str, int]:
-        payload: dict[str, int] = {
-            str(k): v for k, v in self._seq_reserved.items()
-        }
+    def _store_payload(
+        self,
+        reserved: dict[int, int] | None = None,
+        active_src: int | None = None,
+    ) -> dict[str, int]:
+        """Build what goes to disk. Overrides let callers persist a state
+        *before* committing it in memory (save-then-commit)."""
+        if reserved is None:
+            reserved = self._seq_reserved
+        if active_src is None:
+            active_src = self._active_src
+        payload: dict[str, int] = {str(k): v for k, v in reserved.items()}
         if self.session is not None:
             payload[STORE_KEY_IV_INDEX] = int(self.session.iv_index)
         elif self._persisted_iv_index is not None:
             payload[STORE_KEY_IV_INDEX] = int(self._persisted_iv_index)
-        if self._active_src is not None:
-            payload[STORE_KEY_ACTIVE_SRC] = self._active_src
+        if active_src is not None:
+            payload[STORE_KEY_ACTIVE_SRC] = active_src
         return payload
 
+    async def _write_store(self, payload: dict[str, int]) -> None:
+        """Persist payload. Raises if the per-entry (authoritative) write fails."""
+        await self._seq_store.async_save(payload)
+        if self._uses_legacy_store and self._seq_store is not self._legacy_seq_store:
+            # The mirror never carries the active SRC: older releases ignore
+            # it, and a newly added entry migrating from the shared file must
+            # not inherit another network's rotated SRC.
+            mirror = {k: v for k, v in payload.items() if k != STORE_KEY_ACTIVE_SRC}
+            try:
+                await self._legacy_seq_store.async_save(mirror)
+            except Exception:
+                _LOGGER.debug("Legacy SEQ store mirror write failed", exc_info=True)
+
     async def _save_seq(self) -> None:
-        await self._seq_store.async_save(self._store_payload())
+        await self._write_store(self._store_payload())
 
     async def next_seq(self, src_address: int) -> int:
         rotated_to: int | None = None
@@ -196,12 +256,16 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                     f"SEQ space for SRC 0x{src_address:04X} is exhausted and "
                     "no fresh SRC could be allocated"
                 )
-            self._seq_state[src_address] = seq
             if seq > self._seq_reserved.get(src_address, -1):
-                self._seq_reserved[src_address] = min(
-                    seq + SEQ_PERSIST_BLOCK, SEQ_MAX,
-                )
-                await self._save_seq()
+                # Save-then-commit: a SEQ is only handed out once a ceiling
+                # >= it is on disk. If the write fails, nothing is committed
+                # and the exception reaches the caller, so no frame goes out
+                # with an unpersisted SEQ and the next call retries the save.
+                new_reserved = dict(self._seq_reserved)
+                new_reserved[src_address] = min(seq + SEQ_PERSIST_BLOCK, SEQ_MAX)
+                await self._write_store(self._store_payload(reserved=new_reserved))
+                self._seq_reserved = new_reserved
+            self._seq_state[src_address] = seq
             if src_address == self._active_src:
                 rotated_to = await self._maybe_rotate_src_locked()
         if rotated_to is not None:
@@ -273,12 +337,29 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 )
                 self._rotation_exhausted_logged = True
             return None
-        self._active_src = new
+        # Save-then-commit: persist the new SRC and its first block before
+        # switching. If the write fails we keep emitting from the old SRC
+        # (still far below SEQ_MAX) and retry on the next SEQ.
+        new_reserved = dict(self._seq_reserved)
+        new_reserved[new] = ROTATED_SRC_SEQ_START + SEQ_PERSIST_BLOCK
+        try:
+            await self._write_store(
+                self._store_payload(reserved=new_reserved, active_src=new),
+            )
+        except Exception:
+            if not self._rotation_save_failed_logged:
+                _LOGGER.warning(
+                    "Could not persist SRC rotation 0x%04X -> 0x%04X; staying "
+                    "on 0x%04X and retrying", old, new, old, exc_info=True,
+                )
+                self._rotation_save_failed_logged = True
+            return None
+        self._rotation_save_failed_logged = False
+        self._seq_reserved = new_reserved
         self._seq_state[new] = ROTATED_SRC_SEQ_START
-        self._seq_reserved[new] = ROTATED_SRC_SEQ_START + SEQ_PERSIST_BLOCK
+        self._active_src = new
         if self.session is not None:
             self.session.src = new
-        await self._save_seq()
         _LOGGER.warning(
             "SRC 0x%04X reached SEQ %d (limit %d); switched to fresh SRC "
             "0x%04X so the lamps keep accepting our frames",
@@ -294,10 +375,21 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         if self.proxy.is_connected:
             # Fire-and-forget: add_filter_addresses consumes a SEQ itself,
             # so it must not run while the caller still holds _seq_lock.
-            asyncio.create_task(
+            self._spawn_background(
                 self._push_filter_address(new_src),
-                name="haefele-src-rotation-filter",
+                "haefele-src-rotation-filter",
             )
+
+    def _spawn_background(self, coro, name: str) -> asyncio.Task:
+        """Start a task we keep a reference to and cancel on shutdown."""
+        create = getattr(self.hass, "async_create_background_task", None)
+        if callable(create):
+            task = create(coro, name)
+        else:  # bare test harness without a real hass
+            task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _push_filter_address(self, address: int) -> None:
         if self.proxy is None:
@@ -403,6 +495,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._poll_task = None
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         if self.proxy is not None:
             try:
                 await self.proxy.disconnect()
