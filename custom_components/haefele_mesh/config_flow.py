@@ -29,7 +29,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
 from .connect_parser import parse_connect_file
-from .const import DOMAIN, SRC_ADDRESS_BASE
+from .const import CONF_SEQ_STORE, DOMAIN, SEQ_STORE_PER_ENTRY, SRC_ADDRESS_BASE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -260,6 +260,7 @@ class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             entry_data = {
                 **self._parsed_config,
                 "src_address_base": SRC_ADDRESS_BASE,
+                CONF_SEQ_STORE: SEQ_STORE_PER_ENTRY,
             }
             return self.async_create_entry(
                 title="Häfele Connect Mesh",

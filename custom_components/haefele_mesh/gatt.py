@@ -99,7 +99,10 @@ class MeshSession:
         self, dst: int, opcode: int, params: bytes
     ) -> bytes:
         """Encode an access-layer message as a BT Mesh Network PDU."""
-        seq = await self._seq_provider(self.src)
+        # Snapshot SRC *before* awaiting the SEQ provider: the provider may
+        # rotate self.src, and SRC/SEQ must come from the same space.
+        src = self.src
+        seq = await self._seq_provider(src)
         ctl, ttl = 0, 5
 
         access_pdu = encode_opcode(opcode) + params
@@ -107,7 +110,7 @@ class MeshSession:
         app_nonce = (
             bytes([0x01, 0x00])
             + seq.to_bytes(3, "big")
-            + struct.pack(">HH", self.src, dst)
+            + struct.pack(">HH", src, dst)
             + struct.pack(">I", self.iv_index)
         )
         upper_transport = aes_ccm_encrypt(self._app_key, app_nonce, access_pdu, tag_length=4)
@@ -116,7 +119,7 @@ class MeshSession:
 
         return self._wrap_network_pdu(
             plaintext=struct.pack(">H", dst) + trans_pdu,
-            ctl=ctl, ttl=ttl, seq=seq,
+            ctl=ctl, ttl=ttl, seq=seq, src=src,
         )
 
     # ------------------------------------------------------------------
@@ -125,19 +128,23 @@ class MeshSession:
 
     async def build_proxy_config_pdu(self, message: bytes) -> bytes:
         """Wrap a Proxy Configuration message as a Network PDU (CTL=1, TTL=0)."""
-        seq = await self._seq_provider(self.src)
+        src = self.src
+        seq = await self._seq_provider(src)
         ctl, ttl = 1, 0
         plaintext = struct.pack(">H", 0x0000) + message  # DST = 0x0000
-        return self._wrap_network_pdu(plaintext, ctl=ctl, ttl=ttl, seq=seq)
+        return self._wrap_network_pdu(plaintext, ctl=ctl, ttl=ttl, seq=seq, src=src)
 
     def _wrap_network_pdu(
-        self, plaintext: bytes, ctl: int, ttl: int, seq: int
+        self, plaintext: bytes, ctl: int, ttl: int, seq: int,
+        src: int | None = None,
     ) -> bytes:
         """Encrypt + obfuscate a network-layer plaintext into a Network PDU."""
+        if src is None:
+            src = self.src
         net_nonce = (
             bytes([0x00, (ctl << 7) | (ttl & 0x7F)])
             + seq.to_bytes(3, "big")
-            + struct.pack(">H", self.src)
+            + struct.pack(">H", src)
             + bytes([0x00, 0x00])
             + struct.pack(">I", self.iv_index)
         )
@@ -149,7 +156,7 @@ class MeshSession:
         cleartext_header = (
             bytes([(ctl << 7) | (ttl & 0x7F)])
             + seq.to_bytes(3, "big")
-            + struct.pack(">H", self.src)
+            + struct.pack(">H", src)
         )
         obfuscated = bytes(a ^ b for a, b in zip(cleartext_header, pecb[:6]))
 

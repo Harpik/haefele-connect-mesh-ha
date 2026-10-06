@@ -20,10 +20,19 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    CONF_SEQ_STORE,
     DOMAIN,
     HEARTBEAT_INTERVAL,
+    LEGACY_SRC_ADDRESSES,
+    NODE_ADDRESS_MARGIN,
+    ROTATED_SRC_SEQ_START,
+    SEQ_MAX,
+    SEQ_PERSIST_BLOCK,
+    SEQ_ROTATE_THRESHOLD,
     SEQ_SEED_MIN,
+    SEQ_STORE_PER_ENTRY,
     SRC_ADDRESS_BASE,
+    UNICAST_MAX,
 )
 from .gatt import MeshProxyConnection, MeshSession
 
@@ -32,6 +41,17 @@ _LOGGER = logging.getLogger(__name__)
 SEQ_STORAGE_VERSION = 1
 SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
 SEQ_STARTUP_JUMP = 200
+# Reserved keys inside the SEQ store (everything else is "<src>": seq).
+STORE_KEY_IV_INDEX = "_iv_index"
+STORE_KEY_ACTIVE_SRC = "_active_src"
+
+
+class SeqExhaustedError(RuntimeError):
+    """The active SRC ran out of SEQ space and no fresh SRC was available.
+
+    Raised instead of wrapping to 0: a wrapped SEQ would be dropped as a
+    replay by every lamp, silently.
+    """
 
 # How often we poll each node for its current state. External control
 # (wall remotes, Häfele app) doesn't reliably publish Status to groups
@@ -45,7 +65,9 @@ STATE_POLL_PER_NODE_GAP = 0.2
 class HaefeleCoordinator(DataUpdateCoordinator):
     """Owns mesh session + single proxy connection for all nodes."""
 
-    def __init__(self, hass: HomeAssistant, config: dict):
+    def __init__(
+        self, hass: HomeAssistant, config: dict, entry_id: str | None = None,
+    ):
         super().__init__(
             hass,
             _LOGGER,
@@ -55,11 +77,46 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._config = config
         # {unicast_address -> list[callback(opcode, params)]}
         self._status_handlers: dict[int, list[Callable[[int, bytes], None]]] = {}
-        # SEQ store (shared by our single SRC, but kept as a map for safety
-        # in case SRC_ADDRESS_BASE is bumped in future releases).
-        self._seq_store: Store = Store(hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY)
+        # SEQ store. Keyed by SRC: the active one plus every SRC we have
+        # retired (kept so we never reuse an address whose SEQ space we
+        # already burnt).
+        #
+        # One file per config entry: a shared file let two meshes overwrite
+        # each other's SEQ / active SRC (last writer wins).
+        #
+        # Entries created before per-entry storage (no CONF_SEQ_STORE marker)
+        # migrate once from the shared file and keep mirroring to it, so a
+        # downgrade to a release that only knows the shared file resumes
+        # from a current SEQ instead of a stale one. Entries created with
+        # the marker never touch the shared file, so a new network can't
+        # inherit another network's SEQ state.
+        self._legacy_seq_store: Store = Store(
+            hass, SEQ_STORAGE_VERSION, SEQ_STORAGE_KEY,
+        )
+        self._uses_legacy_store = (
+            config.get(CONF_SEQ_STORE) != SEQ_STORE_PER_ENTRY
+        )
+        if entry_id:
+            self._seq_store: Store = Store(
+                hass, SEQ_STORAGE_VERSION, f"{SEQ_STORAGE_KEY}_{entry_id}",
+            )
+        else:
+            self._seq_store = self._legacy_seq_store
+        # Last SEQ handed out, per SRC.
         self._seq_state: dict[int, int] = {}
+        # Persisted ceiling per SRC (>= last SEQ handed out). This is what
+        # goes to disk; see SEQ_PERSIST_BLOCK.
+        self._seq_reserved: dict[int, int] = {}
         self._seq_lock = asyncio.Lock()
+        # SRC we emit from. Persisted so an automatic rotation survives
+        # restarts; falls back to the config entry value.
+        self._persisted_active_src: int | None = None
+        self._active_src: int | None = None
+        self._rotation_exhausted_logged = False
+        self._rotation_save_failed_logged = False
+        # Fire-and-forget tasks we own; kept referenced (the event loop only
+        # holds weak references) and cancelled on shutdown.
+        self._background_tasks: set[asyncio.Task] = set()
         # Persisted IV Index from last session (auto-updated by Secure
         # Network Beacons). None until _load_seq runs.
         self._persisted_iv_index: int | None = None
@@ -106,46 +163,244 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     async def _load_seq(self) -> None:
         raw = await self._seq_store.async_load()
+        if (
+            raw is None
+            and self._uses_legacy_store
+            and self._seq_store is not self._legacy_seq_store
+        ):
+            # First start with per-entry storage: migrate from the shared
+            # file written by earlier releases.
+            raw = await self._legacy_seq_store.async_load()
+            if raw is not None:
+                _LOGGER.info("Migrating SEQ state from the shared store")
         state: dict[int, int] = {}
         iv: int | None = None
+        active: int | None = None
         if isinstance(raw, dict):
             for k, v in raw.items():
-                if k == "_iv_index":
+                if k == STORE_KEY_IV_INDEX:
                     try:
                         iv = int(v)
                     except (TypeError, ValueError):
                         pass
                     continue
+                if k == STORE_KEY_ACTIVE_SRC:
+                    try:
+                        candidate = int(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 < candidate <= UNICAST_MAX:
+                        active = candidate
+                    continue
                 try:
-                    state[int(k)] = int(v)
+                    state[int(k)] = min(int(v), SEQ_MAX)
                 except (TypeError, ValueError):
                     continue
+        # Whatever is on disk is a ceiling (or, for stores written before
+        # block persistence, the exact last SEQ) — either way it is >= the
+        # last SEQ actually emitted, so it is safe to resume from.
         self._seq_state = state
+        self._seq_reserved = dict(state)
         self._persisted_iv_index = iv
+        self._persisted_active_src = active
+
+    def _store_payload(
+        self,
+        reserved: dict[int, int] | None = None,
+        active_src: int | None = None,
+    ) -> dict[str, int]:
+        """Build what goes to disk. Overrides let callers persist a state
+        *before* committing it in memory (save-then-commit)."""
+        if reserved is None:
+            reserved = self._seq_reserved
+        if active_src is None:
+            active_src = self._active_src
+        payload: dict[str, int] = {str(k): v for k, v in reserved.items()}
+        if self.session is not None:
+            payload[STORE_KEY_IV_INDEX] = int(self.session.iv_index)
+        elif self._persisted_iv_index is not None:
+            payload[STORE_KEY_IV_INDEX] = int(self._persisted_iv_index)
+        if active_src is not None:
+            payload[STORE_KEY_ACTIVE_SRC] = active_src
+        return payload
+
+    async def _write_store(self, payload: dict[str, int]) -> None:
+        """Persist payload. Raises if the per-entry (authoritative) write fails."""
+        await self._seq_store.async_save(payload)
+        if self._uses_legacy_store and self._seq_store is not self._legacy_seq_store:
+            # The mirror never carries the active SRC: older releases ignore
+            # it, and a newly added entry migrating from the shared file must
+            # not inherit another network's rotated SRC.
+            mirror = {k: v for k, v in payload.items() if k != STORE_KEY_ACTIVE_SRC}
+            try:
+                await self._legacy_seq_store.async_save(mirror)
+            except Exception:
+                _LOGGER.debug("Legacy SEQ store mirror write failed", exc_info=True)
 
     async def _save_seq(self) -> None:
-        payload: dict[str, int] = {str(k): v for k, v in self._seq_state.items()}
-        if self.session is not None:
-            payload["_iv_index"] = int(self.session.iv_index)
-        await self._seq_store.async_save(payload)
+        await self._write_store(self._store_payload())
 
     async def next_seq(self, src_address: int) -> int:
+        rotated_to: int | None = None
         async with self._seq_lock:
             current = self._seq_state.get(src_address)
             if current is None:
-                current = max(SEQ_SEED_MIN, int(time.time()) & 0xFFFFFF)
+                current = max(SEQ_SEED_MIN, int(time.time()) & SEQ_MAX)
                 _LOGGER.info(
                     "Seeding fresh SEQ for SRC 0x%04X at %d", src_address, current,
                 )
-            seq = (current + 1) & 0xFFFFFF
+            seq = current + 1
+            if seq > SEQ_MAX:
+                # Never wrap: a wrapped SEQ is a silent replay drop.
+                raise SeqExhaustedError(
+                    f"SEQ space for SRC 0x{src_address:04X} is exhausted and "
+                    "no fresh SRC could be allocated"
+                )
+            if seq > self._seq_reserved.get(src_address, -1):
+                # Save-then-commit: a SEQ is only handed out once a ceiling
+                # >= it is on disk. If the write fails, nothing is committed
+                # and the exception reaches the caller, so no frame goes out
+                # with an unpersisted SEQ and the next call retries the save.
+                new_reserved = dict(self._seq_reserved)
+                new_reserved[src_address] = min(seq + SEQ_PERSIST_BLOCK, SEQ_MAX)
+                await self._write_store(self._store_payload(reserved=new_reserved))
+                self._seq_reserved = new_reserved
             self._seq_state[src_address] = seq
-            payload: dict[str, int] = {
-                str(k): v for k, v in self._seq_state.items()
-            }
-            if self.session is not None:
-                payload["_iv_index"] = int(self.session.iv_index)
-            await self._seq_store.async_save(payload)
-            return seq
+            if src_address == self._active_src:
+                rotated_to = await self._maybe_rotate_src_locked()
+        if rotated_to is not None:
+            self._on_src_rotated(rotated_to)
+        return seq
+
+    # ------------------------------------------------------------------
+    # SRC rotation
+    # ------------------------------------------------------------------
+
+    def _reserved_addresses(self) -> set[int]:
+        """Addresses a rotation must never pick."""
+        taken: set[int] = {0x0000}
+        # Exact ranges of every provisioned node, lights *and* the remotes /
+        # switches the parser skips. Only present in entries created or
+        # reconfigured with a release that records them.
+        for r in self._config.get("reserved_unicasts") or []:
+            if not isinstance(r, dict):
+                continue
+            unicast = r.get("unicast")
+            count = r.get("elements")
+            if isinstance(unicast, int) and unicast > 0:
+                n = count if isinstance(count, int) and count > 0 else 1
+                taken.update(range(unicast, unicast + n))
+        # Lights: conservative margin, since older entries carry neither
+        # element counts nor the skipped nodes.
+        for n in self._nodes_cfg:
+            unicast = n.get("unicast")
+            if isinstance(unicast, int) and unicast > 0:
+                taken.update(range(unicast, unicast + NODE_ADDRESS_MARGIN))
+        prov = self._config.get("provisioner_address")
+        if isinstance(prov, int) and prov > 0:
+            taken.add(prov)
+        taken.update(LEGACY_SRC_ADDRESSES)
+        # Every SRC we have ever emitted from (active + retired).
+        taken.update(self._seq_state)
+        taken.update(self._seq_reserved)
+        if self._active_src is not None:
+            taken.add(self._active_src)
+        return taken
+
+    def _pick_rotation_src(self) -> int | None:
+        """Next free unicast address above the current SRC (wrapping once)."""
+        taken = self._reserved_addresses()
+        start = (self._active_src or SRC_ADDRESS_BASE) & 0xFFFF
+        for offset in range(1, UNICAST_MAX + 1):
+            candidate = ((start - 1 + offset) % UNICAST_MAX) + 1
+            if candidate not in taken:
+                return candidate
+        return None
+
+    async def _maybe_rotate_src_locked(self) -> int | None:
+        """Switch to a fresh SRC if the active one is near SEQ exhaustion.
+
+        Must be called with ``_seq_lock`` held. Returns the new SRC, or
+        None if no rotation happened.
+        """
+        old = self._active_src
+        if old is None or self._seq_state.get(old, 0) < SEQ_ROTATE_THRESHOLD:
+            return None
+        new = self._pick_rotation_src()
+        if new is None:
+            if not self._rotation_exhausted_logged:
+                _LOGGER.error(
+                    "SRC 0x%04X is close to SEQ exhaustion (%d) but no free "
+                    "unicast address is left to rotate to. Commands will "
+                    "stop working once SEQ reaches %d.",
+                    old, self._seq_state.get(old, 0), SEQ_MAX,
+                )
+                self._rotation_exhausted_logged = True
+            return None
+        # Save-then-commit: persist the new SRC and its first block before
+        # switching. If the write fails we keep emitting from the old SRC
+        # (still far below SEQ_MAX) and retry on the next SEQ.
+        new_reserved = dict(self._seq_reserved)
+        new_reserved[new] = ROTATED_SRC_SEQ_START + SEQ_PERSIST_BLOCK
+        try:
+            await self._write_store(
+                self._store_payload(reserved=new_reserved, active_src=new),
+            )
+        except Exception:
+            if not self._rotation_save_failed_logged:
+                _LOGGER.warning(
+                    "Could not persist SRC rotation 0x%04X -> 0x%04X; staying "
+                    "on 0x%04X and retrying", old, new, old, exc_info=True,
+                )
+                self._rotation_save_failed_logged = True
+            return None
+        self._rotation_save_failed_logged = False
+        self._seq_reserved = new_reserved
+        self._seq_state[new] = ROTATED_SRC_SEQ_START
+        self._active_src = new
+        if self.session is not None:
+            self.session.src = new
+        _LOGGER.warning(
+            "SRC 0x%04X reached SEQ %d (limit %d); switched to fresh SRC "
+            "0x%04X so the lamps keep accepting our frames",
+            old, self._seq_state.get(old, 0), SEQ_MAX, new,
+        )
+        return new
+
+    def _on_src_rotated(self, new_src: int) -> None:
+        """Make sure Status replies addressed to the new SRC reach us."""
+        if self.proxy is None:
+            return
+        self.proxy.set_filter_addresses(self._filter_addresses())
+        if self.proxy.is_connected:
+            # Fire-and-forget: add_filter_addresses consumes a SEQ itself,
+            # so it must not run while the caller still holds _seq_lock.
+            self._spawn_background(
+                self._push_filter_address(new_src),
+                "haefele-src-rotation-filter",
+            )
+
+    def _spawn_background(self, coro, name: str) -> asyncio.Task:
+        """Start a task we keep a reference to and cancel on shutdown."""
+        create = getattr(self.hass, "async_create_background_task", None)
+        if callable(create):
+            task = create(coro, name)
+        else:  # bare test harness without a real hass
+            task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _push_filter_address(self, address: int) -> None:
+        if self.proxy is None:
+            return
+        try:
+            await self.proxy.add_filter_addresses([address])
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Could not add rotated SRC 0x%04X to the proxy filter (%s); "
+                "it will be added on the next reconnect", address, err,
+            )
 
     # ------------------------------------------------------------------
     # Setup / teardown
@@ -153,11 +408,14 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     async def async_setup(self) -> None:
         await self._load_seq()
-        # Jump SEQ forward on startup for every known SRC to swallow any
-        # un-persisted emissions around the last unclean shutdown.
+        # Jump SEQ forward on startup for every known SRC. With block
+        # persistence the stored value is already a ceiling; the jump is
+        # kept for stores written by older releases (exact last SEQ).
+        # Clamp instead of masking: wrapping would be a silent replay drop.
         for src, seq in list(self._seq_state.items()):
-            self._seq_state[src] = (seq + SEQ_STARTUP_JUMP) & 0xFFFFFF
-        await self._save_seq()
+            jumped = min(seq + SEQ_STARTUP_JUMP, SEQ_MAX)
+            self._seq_state[src] = jumped
+            self._seq_reserved[src] = jumped
 
         net_key = self._config["network_key"]
         app_key = self._config["app_key"]
@@ -182,11 +440,16 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # mistakenly read "src_address" here, so the stored override never
         # took effect and the SRC was pinned to the constant. Accept both
         # keys (new name first) and fall back to the constant.
+        #
+        # An automatic SEQ-exhaustion rotation (persisted as _active_src)
+        # takes precedence over the config value.
         src_address = (
-            self._config.get("src_address_base")
+            self._persisted_active_src
+            or self._config.get("src_address_base")
             or self._config.get("src_address")
             or SRC_ADDRESS_BASE
         ) & 0xFFFF
+        self._active_src = src_address
 
         self.session = MeshSession(
             net_key_hex=net_key,
@@ -195,6 +458,12 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             iv_index=iv_index,
             seq_provider=self.next_seq,
         )
+        # Rotate *before* the proxy exists if the stored SEQ is already past
+        # the threshold (e.g. first start after upgrading), so the filter
+        # list computed below already carries the fresh SRC.
+        async with self._seq_lock:
+            await self._maybe_rotate_src_locked()
+        await self._save_seq()
         self.proxy = MeshProxyConnection(
             hass=self.hass,
             session=self.session,
@@ -226,11 +495,22 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._poll_task = None
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         if self.proxy is not None:
             try:
                 await self.proxy.disconnect()
             except Exception:  # noqa: BLE001
                 pass
+        # Persist the latest IV Index (beacons may have moved it since the
+        # last block write).
+        try:
+            await self._save_seq()
+        except Exception:
+            _LOGGER.debug("Final SEQ store save failed", exc_info=True)
 
     async def _on_proxy_reconnect(self) -> None:
         """Called by MeshProxyConnection after an auto-reconnect attempt.
@@ -309,24 +589,48 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 await asyncio.sleep(STATE_POLL_INTERVAL)
                 if self.proxy is None or not self.proxy.is_connected:
                     continue
-                for node_cfg in self._nodes_cfg:
-                    unicast = node_cfg.get("unicast")
-                    if not unicast:
-                        continue
-                    try:
-                        await self.proxy.get_onoff(unicast)
-                        await asyncio.sleep(STATE_POLL_PER_NODE_GAP)
-                        await self.proxy.get_ctl(unicast)
-                        await asyncio.sleep(STATE_POLL_PER_NODE_GAP)
-                    except Exception as err:  # noqa: BLE001
-                        _LOGGER.debug(
-                            "State poll for %s failed: %s",
-                            node_cfg.get("name", "?"), err,
-                        )
+                await self._poll_all_nodes()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 _LOGGER.exception("State poll loop crashed, continuing")
+
+    async def _poll_all_nodes(self) -> None:
+        """Send exactly one state Get per node.
+
+        Every Get costs one SEQ, so we only ask for the status the light
+        entity actually consumes (see light._apply_status):
+
+          * tunable_white -> CTL Get. CTL Status carries present lightness,
+            from which is_on is derived, so an extra OnOff Get would be
+            overwritten anyway.
+          * everything else -> OnOff Get. CTL Status is ignored for these
+            capability tiers, so the old CTL Get was pure SEQ burn.
+        """
+        for node_cfg in self._nodes_cfg:
+            unicast = node_cfg.get("unicast")
+            if not unicast or self.proxy is None:
+                continue
+            try:
+                if _polls_ctl(node_cfg):
+                    await self.proxy.get_ctl(unicast)
+                else:
+                    await self.proxy.get_onoff(unicast)
+                await asyncio.sleep(STATE_POLL_PER_NODE_GAP)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug(
+                    "State poll for %s failed: %s",
+                    node_cfg.get("name", "?"), err,
+                )
+
+
+def _polls_ctl(node_cfg: dict) -> bool:
+    """True for nodes whose entity runs in the colour-temperature tier.
+
+    Mirrors light.resolve_capability ("tunable_white" -> color_temp);
+    kept local because light.py imports this module.
+    """
+    return (node_cfg.get("device_type") or "").lower() == "tunable_white"
 
 
 def _node_id(node_cfg: dict) -> str:

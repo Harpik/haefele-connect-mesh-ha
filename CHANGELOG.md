@@ -6,6 +6,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SEQ exhaustion no longer locks the integration out.** The 24-bit BT Mesh
+  sequence counter used to wrap to 0 with `& 0xFFFFFF`; every lamp then
+  treats our frames as replays and drops them silently (the same symptom as
+  the 0.4.2 lockout). With the 15 s state polling a small network burns
+  about 11.5k SEQ per light per day, so a counter seeded at `0x800000` ran
+  out in well under a year. The coordinator now switches to a fresh,
+  never-used source address once the active one crosses `0xF00000`,
+  persists that choice, and adds the new address to the proxy filter on
+  the live link. Candidates skip every node (with a 16-address margin per
+  node), the provisioner, legacy SRCs and any SRC used before. The
+  `.connect` import now also records the unicast range of every
+  provisioned node, including the remotes and switches that get no entity,
+  and rotation avoids those too; existing entries pick this up on the next
+  Reconfigure. If no
+  address is free it logs a single error and refuses to emit rather than
+  wrapping.
+- PDUs are built with the SRC captured before the SEQ is allocated, so a
+  rotation can never produce a frame mixing SRC and SEQ from different
+  address spaces.
+
+### Changed
+
+- **Half the SEQ burn from polling.** Each poll cycle now sends one Get per
+  light instead of two: CTL Get for tunable-white lights (CTL Status already
+  carries lightness, from which on/off is derived) and OnOff Get for the
+  rest (their entities ignore CTL Status, so that Get was wasted). Resulting
+  HA state is unchanged.
+- **SEQ is persisted in blocks of 256** instead of on every frame, cutting
+  `.storage` writes from tens of thousands per day to a few hundred (matters
+  on SD-card installs). The stored value is a ceiling, always ahead of the
+  last SEQ sent, so an unclean shutdown still never rewinds the counter. The
+  IV Index is also saved on shutdown. Stores written by older releases are
+  read as before.
+- **SEQ is only handed out once it is safely on disk.** A failed write at
+  the start of a block used to raise the in-memory ceiling anyway, so the
+  next SEQs went out unpersisted and could be reused after a crash. Block
+  saves and SRC rotation are now save-then-commit: on a failed write nothing
+  changes, the frame isn't sent, and the next call retries. A failed rotation
+  save keeps the old SRC (still far from exhaustion) and retries.
+- **One SEQ store per config entry** (`haefele_mesh_seq_<entry_id>`). All
+  entries used to share one file, so a second Häfele network could overwrite
+  the first one's SEQ (and, with rotation, its active SRC). Entries created
+  before this release migrate from the shared file once and keep mirroring to
+  it, without the active SRC, so a downgrade resumes from a current SEQ. New
+  entries never touch the shared file.
+- The rotation filter update now runs as a tracked background task, cancelled
+  on shutdown, instead of an unreferenced `asyncio.create_task`.
+- Dropped `cryptography` from the manifest requirements. It ships with Home
+  Assistant core, and hassfest now rejects custom integrations that list it.
+
 ## [0.4.4] — 2026-08-26
 
 ### Changed

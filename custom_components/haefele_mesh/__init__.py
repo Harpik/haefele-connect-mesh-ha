@@ -47,7 +47,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Häfele Connect Mesh from a config entry."""
-    coordinator = HaefeleCoordinator(hass, dict(entry.data))
+    coordinator = HaefeleCoordinator(hass, dict(entry.data), entry_id=entry.entry_id)
 
     try:
         await coordinator.async_setup()
