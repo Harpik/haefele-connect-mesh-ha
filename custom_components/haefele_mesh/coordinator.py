@@ -26,6 +26,7 @@ from .const import (
     LEGACY_SRC_ADDRESSES,
     NODE_ADDRESS_MARGIN,
     ROTATED_SRC_SEQ_START,
+    ROTATION_SEARCH_TOP,
     SEQ_MAX,
     SEQ_PERSIST_BLOCK,
     SEQ_ROTATE_THRESHOLD,
@@ -307,9 +308,37 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             taken.add(self._active_src)
         return taken
 
+    def _allocated_ranges(self) -> list[tuple[int, int]]:
+        """Unicast ranges provisioners will hand out to future nodes."""
+        out: list[tuple[int, int]] = []
+        for rng in self._config.get("allocated_unicast_ranges") or []:
+            if (
+                isinstance(rng, (list, tuple)) and len(rng) == 2
+                and all(isinstance(v, int) for v in rng)
+                and 0 < rng[0] <= rng[1] <= UNICAST_MAX
+            ):
+                out.append((rng[0], rng[1]))
+        return out
+
     def _pick_rotation_src(self) -> int | None:
-        """Next free unicast address above the current SRC (wrapping once)."""
+        """Pick a fresh SRC for rotation.
+
+        When the entry knows the provisioners' allocated unicast ranges
+        (imported or reconfigured from a release that records them), prefer
+        an address *outside* all of them, searching down from
+        ROTATION_SEARCH_TOP: the provisioning app will never assign those to
+        a new node. Otherwise, or if every such address is taken, fall back
+        to the next free address above the current SRC.
+        """
         taken = self._reserved_addresses()
+        ranges = self._allocated_ranges()
+        if ranges:
+            for candidate in range(ROTATION_SEARCH_TOP, 0, -1):
+                if candidate in taken:
+                    continue
+                if any(lo <= candidate <= hi for lo, hi in ranges):
+                    continue
+                return candidate
         start = (self._active_src or SRC_ADDRESS_BASE) & 0xFFFF
         for offset in range(1, UNICAST_MAX + 1):
             candidate = ((start - 1 + offset) % UNICAST_MAX) + 1

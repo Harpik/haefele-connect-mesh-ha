@@ -81,6 +81,7 @@ from custom_components.haefele_mesh.const import (
     LEGACY_SRC_ADDRESSES,
     NODE_ADDRESS_MARGIN,
     ROTATED_SRC_SEQ_START,
+    ROTATION_SEARCH_TOP,
     SEQ_MAX,
     SEQ_PERSIST_BLOCK,
     SEQ_ROTATE_THRESHOLD,
@@ -274,6 +275,29 @@ def test_rotation_skips_reserved_unicasts_of_skipped_nodes():
     c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
     assert {0x00C9, 0x00CA, 0x00CB, 0x00CC} <= c._reserved_addresses()
     assert c._pick_rotation_src() == 0x00CD
+
+
+def test_rotation_prefers_addresses_outside_provisioner_ranges():
+    c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x1000]])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == ROTATION_SEARCH_TOP
+    c._seq_state[ROTATION_SEARCH_TOP] = 10  # already used once
+    assert c._pick_rotation_src() == ROTATION_SEARCH_TOP - 1
+
+
+def test_rotation_falls_back_inside_ranges_when_nothing_else_is_free():
+    c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x7FFF]])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == 0x00C9
+
+
+def test_rotation_ignores_malformed_ranges():
+    c = _coordinator(allocated_unicast_ranges=[["0001", "1000"], [5], None])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == 0x00C9  # legacy behaviour
 
 
 def test_rotation_pushes_new_src_to_live_proxy_filter():

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SRC rotation now stays out of the provisioning app's address range.** The
+  `.connect` import records every provisioner's `allocatedUnicastRange`, and
+  rotation prefers a free address outside all of them, searching down from
+  `0x7EFF`. `0x7F00`-`0x7FFF` is left for provisioner addresses. The Häfele app
+  never hands those addresses to a new node, so a later-provisioned light can't
+  collide with our SRC. If nothing outside the ranges is free, or the entry
+  predates this (Reconfigure to pick it up), the previous behaviour applies.
+- **The app's own unicast address is now read correctly.**
+  `tos_network.provisionerMeshAddress` is a hex string (e.g. `"7FF9"`), but it
+  was parsed as decimal, which always failed. `provisioner_address` silently fell
+  back to the high end of the first allocated range (`0x1000` on a typical
+  export), so rotation never excluded the app's real address.
+
 ## [0.4.5] — 2026-10-06
 
 ### Fixed
