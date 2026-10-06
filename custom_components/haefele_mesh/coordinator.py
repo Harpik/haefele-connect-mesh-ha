@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .addressing import valid_ranges
 from .const import (
     CONF_SEQ_STORE,
     DOMAIN,
@@ -310,15 +311,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     def _allocated_ranges(self) -> list[tuple[int, int]]:
         """Unicast ranges provisioners will hand out to future nodes."""
-        out: list[tuple[int, int]] = []
-        for rng in self._config.get("allocated_unicast_ranges") or []:
-            if (
-                isinstance(rng, (list, tuple)) and len(rng) == 2
-                and all(isinstance(v, int) for v in rng)
-                and 0 < rng[0] <= rng[1] <= UNICAST_MAX
-            ):
-                out.append((rng[0], rng[1]))
-        return out
+        return valid_ranges(self._config.get("allocated_unicast_ranges"))
 
     def _pick_rotation_src(self) -> int | None:
         """Pick a fresh SRC for rotation.

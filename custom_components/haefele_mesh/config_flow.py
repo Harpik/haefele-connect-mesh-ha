@@ -28,10 +28,17 @@ from homeassistant.components import file_upload
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
+from .addressing import pick_initial_src
 from .connect_parser import parse_connect_file
-from .const import CONF_SEQ_STORE, DOMAIN, SEQ_STORE_PER_ENTRY, SRC_ADDRESS_BASE
+from .const import CONF_SEQ_STORE, DOMAIN, SEQ_STORE_PER_ENTRY
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _read_uploaded_file(hass, file_id: str) -> str:
+    """Read an uploaded .connect file. Must run in the executor."""
+    with file_upload.process_uploaded_file(hass, file_id) as path:
+        return path.read_text(encoding="utf-8")
 
 _FIELD_FILE = "connect_file_upload"
 _FIELD_TEXT = "connect_file_text"
@@ -230,11 +237,12 @@ class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if file_id:
             try:
-                def _read(path):
-                    return path.read_text(encoding="utf-8")
-
-                with file_upload.process_uploaded_file(self.hass, file_id) as path:
-                    return await self.hass.async_add_executor_job(_read, path)
+                # process_uploaded_file does blocking I/O on enter and exit
+                # (it rmtree()s the upload dir), so the whole block must run
+                # in the executor, not just the read.
+                return await self.hass.async_add_executor_job(
+                    _read_uploaded_file, self.hass, file_id,
+                )
             except Exception as e:  # noqa: BLE001
                 _LOGGER.error("Failed to read uploaded file: %s", e)
                 errors["base"] = "file_read_error"
@@ -259,7 +267,7 @@ class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             entry_data = {
                 **self._parsed_config,
-                "src_address_base": SRC_ADDRESS_BASE,
+                "src_address_base": pick_initial_src(self._parsed_config),
                 CONF_SEQ_STORE: SEQ_STORE_PER_ENTRY,
             }
             return self.async_create_entry(

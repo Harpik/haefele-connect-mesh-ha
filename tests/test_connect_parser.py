@@ -96,3 +96,11 @@ def test_allocated_unicast_ranges_from_every_provisioner():
     ]
     result = parse_connect_file(json.dumps(doc))
     assert result["allocated_unicast_ranges"] == [[0x0001, 0x1000], [0x2000, 0x2FFF]]
+
+
+def test_odd_allocated_range_containers_do_not_break_the_import():
+    for odd in ({"lowAddress": "0001", "highAddress": "1000"}, 5, None, "0001-1000"):
+        doc = json.loads(_load("minimal.connect.json"))
+        doc["provisioners"] = [{"allocatedUnicastRange": odd}]
+        result = parse_connect_file(json.dumps(doc))
+        assert result["allocated_unicast_ranges"] == []

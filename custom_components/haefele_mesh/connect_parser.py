@@ -243,7 +243,10 @@ def parse_connect_file(content: str) -> dict:
         for prov in provs:
             if not isinstance(prov, dict):
                 continue
-            for rng in prov.get("allocatedUnicastRange") or []:
+            prov_ranges = prov.get("allocatedUnicastRange")
+            if not isinstance(prov_ranges, list):
+                continue
+            for rng in prov_ranges:
                 if not isinstance(rng, dict):
                     continue
                 lo = _parse_unicast(rng.get("lowAddress"))
@@ -251,7 +254,8 @@ def parse_connect_file(content: str) -> dict:
                 if 0 < lo <= hi <= 0x7FFF:
                     allocated_unicast_ranges.append([lo, hi])
         if provs and isinstance(provs[0], dict):
-            first = (provs[0].get("allocatedUnicastRange") or [{}])[0]
+            first_ranges = provs[0].get("allocatedUnicastRange")
+            first = first_ranges[0] if isinstance(first_ranges, list) and first_ranges else None
             if isinstance(first, dict):
                 provisioner_addr = _parse_unicast(first.get("highAddress"))
     tos_net = data.get("tos_network", {})

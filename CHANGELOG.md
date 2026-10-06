@@ -8,18 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **SRC rotation now stays out of the provisioning app's address range.** The
-  `.connect` import records every provisioner's `allocatedUnicastRange`, and
-  rotation prefers a free address outside all of them, searching down from
-  `0x7EFF`. `0x7F00`-`0x7FFF` is left for provisioner addresses. The Häfele app
-  never hands those addresses to a new node, so a later-provisioned light can't
-  collide with our SRC. If nothing outside the ranges is free, or the entry
-  predates this (Reconfigure to pick it up), the previous behaviour applies.
+- **Our SRC now stays out of the provisioning app's address range.** The
+  `.connect` import records every provisioner's `allocatedUnicastRange`,
+  which the Häfele app uses for new nodes (`0x0001`-`0x1000` on a typical
+  export). A later-provisioned light could otherwise be given our SRC.
+  - *SRC rotation* prefers a free address outside all ranges, searching down
+    from `0x7EFF`. `0x7F00`-`0x7FFF` is left for provisioner addresses.
+  - *New config entries* start on such an address too, when the export
+    shows the default `0x00C8` is inside a range.
+  - *Existing entries* keep their current SRC (changing it on a running
+    install has replay/filter implications). They leave the range at their
+    next rotation, once a Reconfigure has recorded the ranges.
+  - If nothing outside the ranges is free, or the ranges are unknown, the
+    previous behaviour applies.
 - **The app's own unicast address is now read correctly.**
   `tos_network.provisionerMeshAddress` is a hex string (e.g. `"7FF9"`), but it
-  was parsed as decimal, which always failed. `provisioner_address` silently fell
-  back to the high end of the first allocated range (`0x1000` on a typical
-  export), so rotation never excluded the app's real address.
+  was parsed as decimal, which always failed. `provisioner_address` silently
+  fell back to the high end of the first allocated range (`0x1000` on a
+  typical export), so rotation never excluded the app's real address.
+- An export whose `allocatedUnicastRange` is not a list no longer makes the
+  import fail; the ranges are just skipped.
+- **Uploading a `.connect` (setup or Reconfigure) no longer blocks the event
+  loop.** HA's `process_uploaded_file` does blocking I/O (it deletes the upload
+  directory on exit) and was entered on the event loop; it now runs entirely
+  in the executor. HA logged this as "Detected blocking call to scandir".
 
 ## [0.4.5] — 2026-10-06
 

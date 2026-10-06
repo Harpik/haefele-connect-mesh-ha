@@ -286,6 +286,17 @@ def test_rotation_prefers_addresses_outside_provisioner_ranges():
     assert c._pick_rotation_src() == ROTATION_SEARCH_TOP - 1
 
 
+def test_rotation_finds_gaps_between_ranges():
+    c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x1000], [0x1100, 0x7FFF]])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == 0x10FF
+    c2 = _coordinator(allocated_unicast_ranges=[[0x7000, 0x7EFF]])
+    c2._active_src = 0x00C8
+    c2._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c2._pick_rotation_src() == 0x6FFF
+
+
 def test_rotation_falls_back_inside_ranges_when_nothing_else_is_free():
     c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x7FFF]])
     c._active_src = 0x00C8
