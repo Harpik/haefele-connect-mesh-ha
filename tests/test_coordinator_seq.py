@@ -267,6 +267,15 @@ def test_rotation_skips_nodes_legacy_and_retired_addresses():
     assert c._pick_rotation_src() == 0x00DA
 
 
+def test_rotation_skips_reserved_unicasts_of_skipped_nodes():
+    # A 4-element remote at 0x00C9 has no light entity, but emits with that SRC.
+    c = _coordinator(reserved_unicasts=[{"unicast": 0x00C9, "elements": 4}])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert {0x00C9, 0x00CA, 0x00CB, 0x00CC} <= c._reserved_addresses()
+    assert c._pick_rotation_src() == 0x00CD
+
+
 def test_rotation_pushes_new_src_to_live_proxy_filter():
     FakeStore.data[STORE_KEY] = {"200": SEQ_ROTATE_THRESHOLD - 201}
 

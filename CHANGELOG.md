@@ -17,7 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never-used source address once the active one crosses `0xF00000`,
   persists that choice, and adds the new address to the proxy filter on
   the live link. Candidates skip every node (with a 16-address margin per
-  node), the provisioner, legacy SRCs and any SRC used before. If no
+  node), the provisioner, legacy SRCs and any SRC used before. The
+  `.connect` import now also records the unicast range of every
+  provisioned node, including the remotes and switches that get no entity,
+  and rotation avoids those too; existing entries pick this up on the next
+  Reconfigure. If no
   address is free it logs a single error and refuses to emit rather than
   wrapping.
 - PDUs are built with the SRC captured before the SEQ is allocated, so a

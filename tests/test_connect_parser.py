@@ -63,3 +63,14 @@ def test_parse_skips_remotes_and_sensors():
     result = parse_connect_file(json.dumps(doc))
     assert len(result["nodes"]) == 1
     assert result["nodes"][0]["name"] == "Kitchen TW"
+
+
+def test_reserved_unicasts_include_skipped_remotes():
+    """Rotation must avoid remotes' addresses even though they get no entity."""
+    doc = json.loads(_load("minimal.connect.json"))
+    doc["nodes"][1]["tos_node"]["type"] = "com.haefele.remote.4button"
+    doc["nodes"][1]["elements"] = [{"index": 0}, {"index": 1}, {"index": 2}]
+    result = parse_connect_file(json.dumps(doc))
+    assert len(result["nodes"]) == 1  # the remote is still skipped as a light
+    assert {"unicast": 0x0102, "elements": 3} in result["reserved_unicasts"]
+    assert {"unicast": 0x0101, "elements": 1} in result["reserved_unicasts"]

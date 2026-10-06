@@ -167,6 +167,7 @@ def parse_connect_file(content: str) -> dict:
             "app_key": "hex string",
             "iv_index": int,
             "provisioner_address": int,
+            "reserved_unicasts": [{"unicast": int, "elements": int}],
             "nodes": [
                 {
                     "name": str,
@@ -250,6 +251,21 @@ def parse_connect_file(content: str) -> dict:
     # --- Parse nodes ---
     nodes = []
     node_list = data.get("nodes", [])
+
+    # Every provisioned unicast range in the network, including the nodes
+    # skipped below (remotes, sensors, wall switches). They never get an
+    # entity, but they do emit with their own SRC, so the coordinator must
+    # never pick one of these addresses as its own SRC.
+    reserved_unicasts: list[dict[str, int]] = []
+    for node in node_list if isinstance(node_list, list) else []:
+        if not isinstance(node, dict):
+            continue
+        addr = _parse_unicast(node.get("unicastAddress"))
+        if addr == 0:
+            continue
+        elements = node.get("elements")
+        count = len(elements) if isinstance(elements, list) else 0
+        reserved_unicasts.append({"unicast": addr, "elements": max(count, 1)})
 
     for node in node_list:
         if not isinstance(node, dict):
@@ -343,5 +359,6 @@ def parse_connect_file(content: str) -> dict:
         "app_key": app_key,
         "iv_index": iv_index,
         "provisioner_address": provisioner_addr,
+        "reserved_unicasts": reserved_unicasts,
         "nodes": nodes,
     }

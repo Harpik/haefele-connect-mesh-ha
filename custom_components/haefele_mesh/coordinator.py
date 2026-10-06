@@ -215,6 +215,19 @@ class HaefeleCoordinator(DataUpdateCoordinator):
     def _reserved_addresses(self) -> set[int]:
         """Addresses a rotation must never pick."""
         taken: set[int] = {0x0000}
+        # Exact ranges of every provisioned node, lights *and* the remotes /
+        # switches the parser skips. Only present in entries created or
+        # reconfigured with a release that records them.
+        for r in self._config.get("reserved_unicasts") or []:
+            if not isinstance(r, dict):
+                continue
+            unicast = r.get("unicast")
+            count = r.get("elements")
+            if isinstance(unicast, int) and unicast > 0:
+                n = count if isinstance(count, int) and count > 0 else 1
+                taken.update(range(unicast, unicast + n))
+        # Lights: conservative margin, since older entries carry neither
+        # element counts nor the skipped nodes.
         for n in self._nodes_cfg:
             unicast = n.get("unicast")
             if isinstance(unicast, int) and unicast > 0:
