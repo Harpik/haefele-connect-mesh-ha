@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-10-06
+
 ### Fixed
 
 - **SEQ exhaustion no longer locks the integration out.** The 24-bit BT Mesh
@@ -231,6 +233,7 @@ Initial tagged release after the single-proxy refactor
 (`MeshSession` + `MeshProxyConnection` + `HaefeleCoordinator`,
 with the legacy per-node `MeshGattNode` removed).
 
+[0.4.5]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.5
 [0.4.4]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.4
 [0.4.3]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.3
 [0.4.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.0
