@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **SEQ exhaustion no longer locks the integration out.** The 24-bit BT Mesh
+  sequence counter used to wrap to 0 with `& 0xFFFFFF`; every lamp then
+  treats our frames as replays and drops them silently (the same symptom as
+  the 0.4.2 lockout). With the 15 s state polling a small network burns
+  about 11.5k SEQ per light per day, so a counter seeded at `0x800000` ran
+  out in well under a year. The coordinator now switches to a fresh,
+  never-used source address once the active one crosses `0xF00000`,
+  persists that choice, and adds the new address to the proxy filter on
+  the live link. Candidates skip every node (with a 16-address margin per
+  node), the provisioner, legacy SRCs and any SRC used before. If no
+  address is free it logs a single error and refuses to emit rather than
+  wrapping.
+- PDUs are built with the SRC captured before the SEQ is allocated, so a
+  rotation can never produce a frame mixing SRC and SEQ from different
+  address spaces.
+
+### Changed
+
+- **Half the SEQ burn from polling.** Each poll cycle now sends one Get per
+  light instead of two: CTL Get for tunable-white lights (CTL Status already
+  carries lightness, from which on/off is derived) and OnOff Get for the
+  rest (their entities ignore CTL Status, so that Get was wasted). Resulting
+  HA state is unchanged.
+- **SEQ is persisted in blocks of 256** instead of on every frame, cutting
+  `.storage` writes from tens of thousands per day to a few hundred (matters
+  on SD-card installs). The stored value is a ceiling, always ahead of the
+  last SEQ sent, so an unclean shutdown still never rewinds the counter. The
+  IV Index is also saved on shutdown. Stores written by older releases are
+  read as before.
+- Dropped `cryptography` from the manifest requirements. It ships with Home
+  Assistant core, and hassfest now rejects custom integrations that list it.
+
 ## [0.4.4] — 2026-08-26
 
 ### Changed

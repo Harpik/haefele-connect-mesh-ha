@@ -52,6 +52,40 @@ LEGACY_SRC_ADDRESSES = (0x0060, 0x0080, 0x00C0)
 # Index update — well beyond the lifetime of any install.
 SEQ_SEED_MIN = 0x800000
 
+# --- SEQ lifecycle ---------------------------------------------------------
+#
+# SEQ is a 24-bit counter per SRC. It must never wrap: a frame carrying a
+# SEQ at or below what a lamp has already cached for our SRC is treated as
+# a replay and dropped silently (the 0.4.2 lockout symptom).
+SEQ_MAX = 0xFFFFFF
+
+# Once the active SRC hands out a SEQ at or above this value, the
+# coordinator switches to a fresh SRC and starts that one from
+# ROTATED_SRC_SEQ_START. The margin below SEQ_MAX (~1M frames, about a
+# month of polling on a small network) is only a safety buffer: rotation
+# happens on the very first SEQ that crosses the threshold.
+SEQ_ROTATE_THRESHOLD = 0xF00000
+
+# A rotated SRC is one we have never emitted from, picked to avoid every
+# known node / provisioner / legacy address, so no lamp holds a replay
+# entry for it and its SEQ space can start from the bottom.
+ROTATED_SRC_SEQ_START = 0
+
+# SEQ persistence is done in blocks: we store a *ceiling* (last handed-out
+# SEQ + block) and only write again when the ceiling is reached. After an
+# unclean shutdown we resume from the ceiling, which is always >= the
+# last SEQ actually used, so the guarantee is unchanged while disk writes
+# drop by this factor (matters on SD-card installs).
+SEQ_PERSIST_BLOCK = 256
+
+# Upper end of the BT Mesh unicast range.
+UNICAST_MAX = 0x7FFF
+
+# The config entry only stores each node's primary unicast address, not
+# its element count. When picking a rotation SRC we keep this many
+# addresses clear starting at every node's primary address.
+NODE_ADDRESS_MARGIN = 16
+
 # Light capabilities
 LIGHT_MIN_KELVIN = 2700
 LIGHT_MAX_KELVIN = 5000

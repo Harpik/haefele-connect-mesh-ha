@@ -111,10 +111,11 @@ Remotes, sensors and switches are parsed but **skipped** (they don't expose writ
 
 - `.connect` is parsed as Bluetooth Mesh CDB JSON with Häfele extensions (`tos_node`, `tos_devices`).
 - Each light becomes a `light` entity inside an HA device keyed on MAC.
-- The coordinator keeps **one** GATT connection open to a functional mesh proxy node and maintains a per-source BT Mesh sequence counter (and last-seen IV Index) persisted in `.storage/haefele_mesh_seq`.
+- The coordinator keeps **one** GATT connection open to a functional mesh proxy node and maintains a per-source BT Mesh sequence counter (and last-seen IV Index) persisted in `.storage/haefele_mesh_seq`. The counter is written in blocks of 256 (the stored value is a ceiling, always ahead of the last SEQ sent), so an unclean shutdown never rewinds it.
+- The 24-bit SEQ counter is never allowed to wrap. When the active source address gets close to the end of its SEQ space, the integration switches to a fresh, never-used source address (skipping every node, the provisioner and previously used addresses) and logs a warning. The switch is persisted and survives restarts.
 - Commands are built as BT Mesh Network PDUs (encrypted with AES-CCM, obfuscated with AES-ECB) and sent over the Mesh Proxy PDU bearer (spec § 6.6.2).
 - An immediate reconnect is attempted whenever the BLE link drops; a 60 s heartbeat also verifies connectivity as a safety net.
-- Every 15 s the coordinator polls each light for On/Off + CTL state so manual changes from the physical remote or the Häfele app are reflected in HA.
+- Every 15 s the coordinator polls each light with a single Get (CTL for tunable-white lights, On/Off for the rest) so manual changes from the physical remote or the Häfele app are reflected in HA.
 - Secure Network Beacons from the mesh are parsed live; the IV Index is auto-updated if the mesh advances it.
 
 See [`custom_components/haefele_mesh/gatt.py`](custom_components/haefele_mesh/gatt.py) and [`mesh_crypto.py`](custom_components/haefele_mesh/mesh_crypto.py) for the mesh implementation, and [`connect_parser.py`](custom_components/haefele_mesh/connect_parser.py) for the import format.
@@ -148,7 +149,7 @@ Download the integration's diagnostics from **Settings → Devices & Services �
 All network/app/device keys are redacted before export, so the file is safe to share in a bug report.
 
 **Commands fail after a while**
-BT Mesh requires monotonically increasing sequence numbers. The integration persists them on every emission, but if you restore an HA snapshot you may need to wait a few minutes for the network to accept new SEQ values (or re-provision).
+BT Mesh requires monotonically increasing sequence numbers. The integration persists them (in blocks, always ahead of what it has sent), but if you restore an HA snapshot you may need to wait a few minutes for the network to accept new SEQ values (or re-provision).
 
 ## Development
 
