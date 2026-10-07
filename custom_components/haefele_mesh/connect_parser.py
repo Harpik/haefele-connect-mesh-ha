@@ -167,6 +167,7 @@ def parse_connect_file(content: str) -> dict:
             "app_key": "hex string",
             "iv_index": int,
             "provisioner_address": int,
+            "allocated_unicast_ranges": [[low, high]],
             "reserved_unicasts": [{"unicast": int, "elements": int}],
             "nodes": [
                 {
@@ -228,25 +229,40 @@ def parse_connect_file(content: str) -> dict:
         except (ValueError, TypeError):
             pass
 
-    # --- Provisioner address ---
+    # --- Provisioner address + allocated unicast ranges ---
+    # The Häfele app stores its own unicast address in
+    # tos_network.provisionerMeshAddress as a HEX string (e.g. "7FF9").
+    # Older builds fed that to int() as decimal, which always failed and left
+    # the highAddress of the first allocated range here instead (not an
+    # address anyone uses). The highAddress heuristic is kept only as a
+    # fallback for exports without tos_network.
     provisioner_addr = 0
+    allocated_unicast_ranges: list[list[int]] = []
     provs = data.get("provisioners", [])
-    if isinstance(provs, list) and provs:
-        ranges = provs[0].get("allocatedUnicastRange", [])
-        if ranges and isinstance(ranges, list):
-            try:
-                provisioner_addr = int(ranges[0].get("highAddress", "0"), 16)
-            except (ValueError, TypeError):
-                pass
-    # Also check tos_network
+    if isinstance(provs, list):
+        for prov in provs:
+            if not isinstance(prov, dict):
+                continue
+            prov_ranges = prov.get("allocatedUnicastRange")
+            if not isinstance(prov_ranges, list):
+                continue
+            for rng in prov_ranges:
+                if not isinstance(rng, dict):
+                    continue
+                lo = _parse_unicast(rng.get("lowAddress"))
+                hi = _parse_unicast(rng.get("highAddress"))
+                if 0 < lo <= hi <= 0x7FFF:
+                    allocated_unicast_ranges.append([lo, hi])
+        if provs and isinstance(provs[0], dict):
+            first_ranges = provs[0].get("allocatedUnicastRange")
+            first = first_ranges[0] if isinstance(first_ranges, list) and first_ranges else None
+            if isinstance(first, dict):
+                provisioner_addr = _parse_unicast(first.get("highAddress"))
     tos_net = data.get("tos_network", {})
     if isinstance(tos_net, dict):
-        pma = tos_net.get("provisionerMeshAddress")
-        if pma is not None:
-            try:
-                provisioner_addr = int(pma)
-            except (ValueError, TypeError):
-                pass
+        pma = _parse_unicast(tos_net.get("provisionerMeshAddress"))
+        if 0 < pma <= 0x7FFF:
+            provisioner_addr = pma
 
     # --- Parse nodes ---
     nodes = []
@@ -359,6 +375,7 @@ def parse_connect_file(content: str) -> dict:
         "app_key": app_key,
         "iv_index": iv_index,
         "provisioner_address": provisioner_addr,
+        "allocated_unicast_ranges": allocated_unicast_ranges,
         "reserved_unicasts": reserved_unicasts,
         "nodes": nodes,
     }

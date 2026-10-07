@@ -81,6 +81,7 @@ from custom_components.haefele_mesh.const import (
     LEGACY_SRC_ADDRESSES,
     NODE_ADDRESS_MARGIN,
     ROTATED_SRC_SEQ_START,
+    ROTATION_SEARCH_TOP,
     SEQ_MAX,
     SEQ_PERSIST_BLOCK,
     SEQ_ROTATE_THRESHOLD,
@@ -274,6 +275,57 @@ def test_rotation_skips_reserved_unicasts_of_skipped_nodes():
     c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
     assert {0x00C9, 0x00CA, 0x00CB, 0x00CC} <= c._reserved_addresses()
     assert c._pick_rotation_src() == 0x00CD
+
+
+def test_rotation_prefers_addresses_outside_provisioner_ranges():
+    c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x1000]])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == ROTATION_SEARCH_TOP
+    c._seq_state[ROTATION_SEARCH_TOP] = 10  # already used once
+    assert c._pick_rotation_src() == ROTATION_SEARCH_TOP - 1
+
+
+def test_rotation_finds_gaps_between_ranges():
+    c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x1000], [0x1100, 0x7FFF]])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == 0x10FF
+    c2 = _coordinator(allocated_unicast_ranges=[[0x7000, 0x7EFF]])
+    c2._active_src = 0x00C8
+    c2._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c2._pick_rotation_src() == 0x6FFF
+
+
+def test_rotation_falls_back_inside_ranges_when_nothing_else_is_free():
+    c = _coordinator(allocated_unicast_ranges=[[0x0001, 0x7FFF]])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == 0x00C9
+
+
+def test_rotation_ignores_malformed_ranges():
+    c = _coordinator(allocated_unicast_ranges=[["0001", "1000"], [5], None])
+    c._active_src = 0x00C8
+    c._seq_state = {0x00C8: SEQ_ROTATE_THRESHOLD}
+    assert c._pick_rotation_src() == 0x00C9  # legacy behaviour
+
+
+def test_active_src_colliding_with_a_node_is_rotated_at_startup():
+    # An old entry on 0x00C8; a Reconfigure has since recorded a light there.
+    FakeStore.data[STORE_KEY] = {"200": 5000}
+    c = _coordinator(reserved_unicasts=[{"unicast": 0x00C4, "elements": 8}])
+    asyncio.run(_setup(c))
+    assert c.session.src != 0x00C8
+    assert FakeProxy.instances[0].filter_addresses
+    assert 0x00C8 not in FakeProxy.instances[0].filter_addresses
+
+
+def test_active_src_not_colliding_is_kept():
+    FakeStore.data[STORE_KEY] = {"200": 5000}
+    c = _coordinator(reserved_unicasts=[{"unicast": 0x00C9, "elements": 4}])
+    asyncio.run(_setup(c))
+    assert c.session.src == 0x00C8
 
 
 def test_rotation_pushes_new_src_to_live_proxy_filter():

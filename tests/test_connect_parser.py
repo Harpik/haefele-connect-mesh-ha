@@ -74,3 +74,41 @@ def test_reserved_unicasts_include_skipped_remotes():
     assert len(result["nodes"]) == 1  # the remote is still skipped as a light
     assert {"unicast": 0x0102, "elements": 3} in result["reserved_unicasts"]
     assert {"unicast": 0x0101, "elements": 1} in result["reserved_unicasts"]
+
+
+def test_provisioner_mesh_address_is_parsed_as_hex():
+    """tos_network.provisionerMeshAddress is a hex string like "7FF9"."""
+    doc = json.loads(_load("minimal.connect.json"))
+    doc.setdefault("tos_network", {})["provisionerMeshAddress"] = "7FF9"
+    result = parse_connect_file(json.dumps(doc))
+    assert result["provisioner_address"] == 0x7FF9
+
+
+def test_allocated_unicast_ranges_from_every_provisioner():
+    doc = json.loads(_load("minimal.connect.json"))
+    doc["provisioners"] = [
+        {"allocatedUnicastRange": [{"lowAddress": "0001", "highAddress": "1000"}]},
+        {"allocatedUnicastRange": [
+            {"lowAddress": "2000", "highAddress": "2FFF"},
+            {"lowAddress": "9000", "highAddress": "9FFF"},  # not unicast: dropped
+            {"lowAddress": "0500", "highAddress": "0100"},  # inverted: dropped
+        ]},
+    ]
+    result = parse_connect_file(json.dumps(doc))
+    assert result["allocated_unicast_ranges"] == [[0x0001, 0x1000], [0x2000, 0x2FFF]]
+
+
+def test_odd_allocated_range_containers_do_not_break_the_import():
+    for odd in ({"lowAddress": "0001", "highAddress": "1000"}, 5, None, "0001-1000"):
+        doc = json.loads(_load("minimal.connect.json"))
+        doc["provisioners"] = [{"allocatedUnicastRange": odd}]
+        result = parse_connect_file(json.dumps(doc))
+        assert result["allocated_unicast_ranges"] == []
+
+
+def test_out_of_range_provisioner_mesh_address_falls_back():
+    doc = json.loads(_load("minimal.connect.json"))
+    doc.setdefault("tos_network", {})["provisionerMeshAddress"] = "9000"  # group range
+    result = parse_connect_file(json.dumps(doc))
+    assert result["provisioner_address"] != 0x9000
+    assert result["provisioner_address"] <= 0x7FFF

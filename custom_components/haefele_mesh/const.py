@@ -85,6 +85,11 @@ SEQ_PERSIST_BLOCK = 256
 # Upper end of the BT Mesh unicast range.
 UNICAST_MAX = 0x7FFF
 
+# Rotation prefers SRCs outside every provisioner's allocated unicast range,
+# searching downward from here. 0x7F00-0x7FFF is left alone because that is
+# where the Häfele app places provisioner addresses (seen: 0x7FF9, 0x7FFD).
+ROTATION_SEARCH_TOP = 0x7EFF
+
 # The config entry only stores each node's primary unicast address, not
 # its element count. When picking a rotation SRC we keep this many
 # addresses clear starting at every node's primary address.
