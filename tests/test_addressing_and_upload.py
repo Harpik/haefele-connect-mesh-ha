@@ -48,6 +48,36 @@ def test_initial_src_ignores_malformed_ranges():
     assert pick_initial_src(parsed) == SRC_ADDRESS_BASE
 
 
+def test_initial_src_never_lands_on_a_legacy_src():
+    from custom_components.haefele_mesh.const import LEGACY_SRC_ADDRESSES
+    top = max(LEGACY_SRC_ADDRESSES)
+    # everything above the highest legacy SRC is inside a range
+    parsed = {"allocated_unicast_ranges": [[top + 1, 0x7FFF], [1, top - 1]]}
+    assert pick_initial_src(parsed) != top
+    assert pick_initial_src(parsed) not in LEGACY_SRC_ADDRESSES
+
+
+def test_initial_src_moves_when_base_is_a_node_even_outside_ranges():
+    parsed = {
+        "allocated_unicast_ranges": [[0x2000, 0x2FFF]],
+        "reserved_unicasts": [{"unicast": SRC_ADDRESS_BASE, "elements": 1}],
+    }
+    assert pick_initial_src(parsed) == ROTATION_SEARCH_TOP
+
+
+def test_initial_src_skips_the_provisioner_address():
+    parsed = {
+        "allocated_unicast_ranges": [[0x0001, 0x1000]],
+        "provisioner_address": ROTATION_SEARCH_TOP,
+    }
+    assert pick_initial_src(parsed) == ROTATION_SEARCH_TOP - 1
+
+
+def test_out_of_bounds_ranges_are_dropped():
+    from custom_components.haefele_mesh.addressing import valid_ranges
+    assert valid_ranges([[0, 5], [5, 0x8000], [9, 3], [1, 2]]) == [(1, 2)]
+
+
 # ---------------------------------------------------------------------------
 # config_flow: the upload must be processed entirely in the executor
 # ---------------------------------------------------------------------------
@@ -115,3 +145,15 @@ def test_uploaded_file_is_processed_in_the_executor(tmp_path, monkeypatch):
     assert content == "{}"
     assert errors == {}
     assert seen == {"enter": True, "exit": True}
+
+
+def test_new_entry_is_created_with_the_picked_src():
+    flow = cf.HaefeleConfigFlow.__new__(cf.HaefeleConfigFlow)
+    flow._parsed_config = {
+        "nodes": [],
+        "allocated_unicast_ranges": [[0x0001, 0x1000]],
+        "provisioner_address": 0x7FF9,
+    }
+    flow.async_create_entry = lambda **kw: kw
+    result = asyncio.run(flow.async_step_confirm({}))
+    assert result["data"]["src_address_base"] == ROTATION_SEARCH_TOP

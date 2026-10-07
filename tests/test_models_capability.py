@@ -102,15 +102,23 @@ def _load_resolve_capability():
         CoordinatorEntity=_CoordEntity,
     )
 
-    # coordinator.py pulls more HA runtime — stub its two exports.
-    if "custom_components.haefele_mesh.coordinator" not in sys.modules:
-        coord = types.ModuleType("custom_components.haefele_mesh.coordinator")
+    # coordinator.py pulls more HA runtime — stub its two exports, but only
+    # while light.py is imported: a fake left in sys.modules would shadow the
+    # real coordinator for test modules that run after this one.
+    fake_key = "custom_components.haefele_mesh.coordinator"
+    installed_fake = fake_key not in sys.modules
+    if installed_fake:
+        coord = types.ModuleType(fake_key)
         coord.HaefeleCoordinator = type("HaefeleCoordinator", (), {})
         coord._node_id = lambda cfg: cfg.get("mac", "")
-        sys.modules["custom_components.haefele_mesh.coordinator"] = coord
+        sys.modules[fake_key] = coord
 
     import importlib
-    mod = importlib.import_module("custom_components.haefele_mesh.light")
+    try:
+        mod = importlib.import_module("custom_components.haefele_mesh.light")
+    finally:
+        if installed_fake:
+            sys.modules.pop(fake_key, None)
     return mod.resolve_capability
 
 

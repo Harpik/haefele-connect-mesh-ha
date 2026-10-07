@@ -339,14 +339,41 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 return candidate
         return None
 
-    async def _maybe_rotate_src_locked(self) -> int | None:
+    def _active_src_collides_with_node(self) -> bool:
+        """True if our active SRC is a known node/element/provisioner address.
+
+        Two emitters sharing a SRC confuse every lamp's replay cache, and a
+        node discards frames whose SRC is one of its own element addresses.
+        An entry created before the provisioner ranges were known can end up
+        here once the app hands our SRC to a new node and a Reconfigure
+        records it.
+        """
+        src = self._active_src
+        if src is None:
+            return False
+        for r in self._config.get("reserved_unicasts") or []:
+            if not isinstance(r, dict):
+                continue
+            unicast, count = r.get("unicast"), r.get("elements")
+            if isinstance(unicast, int) and unicast > 0:
+                n = count if isinstance(count, int) and count > 0 else 1
+                if unicast <= src < unicast + n:
+                    return True
+        if any(n.get("unicast") == src for n in self._nodes_cfg if isinstance(n, dict)):
+            return True
+        return self._config.get("provisioner_address") == src
+
+    async def _maybe_rotate_src_locked(self, force: bool = False) -> int | None:
         """Switch to a fresh SRC if the active one is near SEQ exhaustion.
 
-        Must be called with ``_seq_lock`` held. Returns the new SRC, or
-        None if no rotation happened.
+        ``force`` rotates regardless of SEQ (used when the active SRC turned
+        out to collide with a node). Must be called with ``_seq_lock`` held.
+        Returns the new SRC, or None if no rotation happened.
         """
         old = self._active_src
-        if old is None or self._seq_state.get(old, 0) < SEQ_ROTATE_THRESHOLD:
+        if old is None:
+            return None
+        if not force and self._seq_state.get(old, 0) < SEQ_ROTATE_THRESHOLD:
             return None
         new = self._pick_rotation_src()
         if new is None:
@@ -483,8 +510,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Rotate *before* the proxy exists if the stored SEQ is already past
         # the threshold (e.g. first start after upgrading), so the filter
         # list computed below already carries the fresh SRC.
+        collides = self._active_src_collides_with_node()
+        if collides:
+            _LOGGER.error(
+                "SRC 0x%04X is used by a node in this network (per the last "
+                ".connect import); switching to a fresh SRC",
+                self._active_src,
+            )
         async with self._seq_lock:
-            await self._maybe_rotate_src_locked()
+            await self._maybe_rotate_src_locked(force=collides)
         await self._save_seq()
         self.proxy = MeshProxyConnection(
             hass=self.hass,

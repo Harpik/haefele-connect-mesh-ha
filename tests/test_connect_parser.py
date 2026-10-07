@@ -104,3 +104,11 @@ def test_odd_allocated_range_containers_do_not_break_the_import():
         doc["provisioners"] = [{"allocatedUnicastRange": odd}]
         result = parse_connect_file(json.dumps(doc))
         assert result["allocated_unicast_ranges"] == []
+
+
+def test_out_of_range_provisioner_mesh_address_falls_back():
+    doc = json.loads(_load("minimal.connect.json"))
+    doc.setdefault("tos_network", {})["provisionerMeshAddress"] = "9000"  # group range
+    result = parse_connect_file(json.dumps(doc))
+    assert result["provisioner_address"] != 0x9000
+    assert result["provisioner_address"] <= 0x7FFF

@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     next rotation, once a Reconfigure has recorded the ranges.
   - If nothing outside the ranges is free, or the ranges are unknown, the
     previous behaviour applies.
+- **An active SRC that a node turns out to use is abandoned at startup.** If
+  the last `.connect` import shows a node, element or the provisioner on our
+  current SRC (e.g. the app gave `0x00C8` to a new light on an older entry),
+  the integration logs an error and switches to a fresh SRC before
+  connecting, instead of sharing the address with that node.
 - **The app's own unicast address is now read correctly.**
   `tos_network.provisionerMeshAddress` is a hex string (e.g. `"7FF9"`), but it
   was parsed as decimal, which always failed. `provisioner_address` silently

@@ -311,6 +311,23 @@ def test_rotation_ignores_malformed_ranges():
     assert c._pick_rotation_src() == 0x00C9  # legacy behaviour
 
 
+def test_active_src_colliding_with_a_node_is_rotated_at_startup():
+    # An old entry on 0x00C8; a Reconfigure has since recorded a light there.
+    FakeStore.data[STORE_KEY] = {"200": 5000}
+    c = _coordinator(reserved_unicasts=[{"unicast": 0x00C4, "elements": 8}])
+    asyncio.run(_setup(c))
+    assert c.session.src != 0x00C8
+    assert FakeProxy.instances[0].filter_addresses
+    assert 0x00C8 not in FakeProxy.instances[0].filter_addresses
+
+
+def test_active_src_not_colliding_is_kept():
+    FakeStore.data[STORE_KEY] = {"200": 5000}
+    c = _coordinator(reserved_unicasts=[{"unicast": 0x00C9, "elements": 4}])
+    asyncio.run(_setup(c))
+    assert c.session.src == 0x00C8
+
+
 def test_rotation_pushes_new_src_to_live_proxy_filter():
     FakeStore.data[STORE_KEY] = {"200": SEQ_ROTATE_THRESHOLD - 201}
 
