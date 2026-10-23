@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14"]
+        python-version: ["3.11", "3.14"]  # oldest Python of hacs.json min HA (2024.1), newest HA (2026.10)
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

@@ -159,7 +159,7 @@ pip install -r requirements_test.txt
 pytest -v tests/
 ```
 
-CI runs `pytest` on Python 3.11 / 3.12, plus [HACS action](https://github.com/hacs/action) and [hassfest](https://developers.home-assistant.io/docs/creating_integration_manifest/#hassfest) on every push.
+CI runs `pytest` on Python 3.11 and 3.14 (oldest and newest supported HA), `ruff`, gitleaks, plus [HACS action](https://github.com/hacs/action) and [hassfest](https://developers.home-assistant.io/docs/creating_integration_manifest/#hassfest) on every push.
 
 ## Roadmap
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 import pytest
+
 from connect_parser import (
     MODEL_GENERIC_ONOFF_SERVER,
     MODEL_LIGHT_CTL_SERVER,

@@ -1,6 +1,7 @@
 # Ruff configuration. Pinned rule set so a ruff upgrade (pre-commit / CI)
 # never changes what is checked without an explicit edit here.
-target-version = "py313"
+# Lowest Python of the oldest HA in hacs.json (2024.1 -> 3.11); CI tests 3.11 and 3.14.
+target-version = "py311"
 
 [lint]
 # Codes we annotate with `noqa` on purpose but do not enforce (private
@@ -10,10 +11,15 @@ select = [
   "E4", "E7", "E9", "F",  # pycodestyle errors + pyflakes (ruff's classic defaults)
   "I",                    # import sorting
   "UP",                   # pyupgrade
-  "BLE",                  # blind except: every `except Exception` is a deliberate `# noqa: BLE001`
+  "BLE",                  # blind except: log with _LOGGER.exception, or mark a deliberate one `# noqa: BLE001`
   "RUF100",               # unused / stale `noqa` comments
 ]
 
 [lint.per-file-ignores]
 # Tests install HA/bleak stubs in sys.modules before importing the package.
 "tests/*" = ["E402"]
+
+[lint.isort]
+# Tests import some package modules by bare name (tests/conftest.py puts the
+# package directory on sys.path).
+known-first-party = ["custom_components", "access_codec", "connect_parser", "mesh_crypto"]

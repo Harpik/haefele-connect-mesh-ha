@@ -17,3 +17,7 @@ updates:
     groups:
       test-deps:
         patterns: ["*"]
+    ignore:
+      # Runtime cryptography comes from HA core; keep the test floor at HA's
+      # pin by hand instead of testing against versions HA does not ship.
+      - dependency-name: cryptography
