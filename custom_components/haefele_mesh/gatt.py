@@ -25,30 +25,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-from typing import Awaitable, Callable, Optional
+from collections.abc import Awaitable, Callable
 
 from bleak.backends.device import BLEDevice
 from bleak_retry_connector import (
     BleakClientWithServiceCache,
     establish_connection,
 )
-
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
+from .access_codec import decode_opcode, encode_opcode
 from .const import (
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
     MESH_PROXY_SERVICE_UUID,
 )
+from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
 
 # Mesh Proxy advertisement service-data "Identification Type" byte values
 # (Mesh Profile spec 7.2.2.2). We currently match Network ID only — it's
 # what Häfele MeshBoxes advertise; Node Identity (0x01) is a future hook.
 PROXY_AD_TYPE_NETWORK_ID = 0x00
 PROXY_AD_TYPE_NODE_IDENTITY = 0x01
-from .access_codec import decode_opcode, encode_opcode
-from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -167,7 +166,7 @@ class MeshSession:
     # Inbound
     # ------------------------------------------------------------------
 
-    def decode_access_pdu(self, pdu: bytes) -> Optional[tuple[int, int, int, bytes]]:
+    def decode_access_pdu(self, pdu: bytes) -> tuple[int, int, int, bytes] | None:
         """Decrypt an inbound Network PDU carrying an access message.
 
         Returns (src, dst, opcode, params) or None if the frame is not ours,
@@ -225,7 +224,7 @@ class MeshSession:
         opcode, params = decoded
         return src, dst, opcode, params
 
-    def decode_proxy_config(self, pdu: bytes) -> Optional[tuple[int, bytes]]:
+    def decode_proxy_config(self, pdu: bytes) -> tuple[int, bytes] | None:
         """Decrypt an inbound Proxy Configuration PDU, return (opcode, params)."""
         header = self._decode_network_header(pdu, expected_ctl=1)
         if header is None:
@@ -238,8 +237,8 @@ class MeshSession:
         return opcode, plaintext[3:]
 
     def _decode_network_header(
-        self, pdu: bytes, expected_ctl: Optional[int] = None
-    ) -> Optional[tuple[int, int, int, bytes]]:
+        self, pdu: bytes, expected_ctl: int | None = None
+    ) -> tuple[int, int, int, bytes] | None:
         """Strip obfuscation + net encryption. Returns (ctl, seq, src, plaintext)."""
         if len(pdu) < 10:
             _LOGGER.debug("Network PDU too short: %d bytes", len(pdu))
@@ -322,13 +321,13 @@ class MeshProxyConnection:
         # the link comes back, instead of waiting for the next heartbeat.
         self._reconnect_callback = reconnect_callback
 
-        self._client: Optional[BleakClientWithServiceCache] = None
+        self._client: BleakClientWithServiceCache | None = None
         self._data_in = None
-        self._active_mac: Optional[str] = None
+        self._active_mac: str | None = None
         self._active_name: str = ""
         self._incoming: asyncio.Queue = asyncio.Queue()
         self._reassembly_buf = bytearray()
-        self._rx_task: Optional[asyncio.Task] = None
+        self._rx_task: asyncio.Task | None = None
         self._connect_lock = asyncio.Lock()
         # Serialises outbound writes so two concurrent entity actions don't
         # interleave SAR chunks on the GATT characteristic (which caused
@@ -350,7 +349,7 @@ class MeshProxyConnection:
         # Tracks the in-flight auto-reconnect task (if any). Prevents a
         # storm of reconnect tasks if bleak fires _on_disconnected more
         # than once for the same drop.
-        self._reconnect_task: Optional[asyncio.Task] = None
+        self._reconnect_task: asyncio.Task | None = None
         # True while we've already logged the "no connectable transport"
         # error, so a permanent misconfiguration doesn't spam the log on
         # every heartbeat. Reset as soon as a connectable scanner shows up.
@@ -373,7 +372,7 @@ class MeshProxyConnection:
         return self._client is not None and self._client.is_connected
 
     @property
-    def active_mac(self) -> Optional[str]:
+    def active_mac(self) -> str | None:
         return self._active_mac if self.is_connected else None
 
     @property
@@ -634,7 +633,7 @@ class MeshProxyConnection:
         self._filter_status_event.clear()
         try:
             await asyncio.wait_for(self._beacon_event.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             _LOGGER.debug(
                 "%s (%s) accepted GATT but never emitted a Secure Network "
                 "Beacon — not a functional mesh proxy, trying next candidate",
@@ -783,11 +782,11 @@ class MeshProxyConnection:
             if self._reconnect_callback is not None:
                 try:
                     await self._reconnect_callback()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     _LOGGER.exception("Reconnect callback raised")
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             _LOGGER.exception("Auto-reconnect task crashed")
 
     async def disconnect(self) -> None:
@@ -870,7 +869,7 @@ class MeshProxyConnection:
                     _LOGGER.debug("Dropped malformed inbound PDU: %s", err)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             _LOGGER.exception("Incoming PDU pump crashed")
 
     def _handle_network_pdu(self, pdu: bytes) -> None:
@@ -885,7 +884,7 @@ class MeshProxyConnection:
         if self._message_handler is not None:
             try:
                 self._message_handler(src, opcode, params)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.exception("Message handler raised for src=%04X", src)
 
     def _parse_secure_network_beacon(self, pdu: bytes) -> None:

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from access_codec import decode_opcode, encode_opcode
 
-
 # ---------------------------------------------------------------------------
 # Encode
 # ---------------------------------------------------------------------------

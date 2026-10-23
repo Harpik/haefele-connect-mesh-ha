@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # actions/checkout, setup-python, gitleaks-action in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # requirements_test.txt (test-only; runtime deps are pinned by HA core).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      test-deps:
+        patterns: ["*"]
+    ignore:
+      # Runtime cryptography comes from HA core, not from us; the test floor
+      # (HA 2026.10's pin) is bumped by hand together with HA.
+      - dependency-name: cryptography

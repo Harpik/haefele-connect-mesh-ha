@@ -26,14 +26,11 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
-import pytest
-
 from custom_components.haefele_mesh import gatt as gatt_mod
 from custom_components.haefele_mesh.gatt import (
     MeshProxyConnection,
     MeshSession,
 )
-
 
 # Synthetic, gitleaks-allowlisted placeholder keys (see
 # tests/fixtures and .gitleaks.toml).

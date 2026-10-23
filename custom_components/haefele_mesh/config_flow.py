@@ -22,7 +22,6 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.components import file_upload
 from homeassistant.data_entry_flow import FlowResult
@@ -81,7 +80,7 @@ class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 except ValueError as e:
                     _LOGGER.error("Failed to parse .connect file: %s", e)
                     errors["base"] = "invalid_config"
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     _LOGGER.exception("Unexpected error parsing .connect: %s", e)
                     errors["base"] = "unknown"
 
@@ -138,7 +137,7 @@ class HaefeleConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 except ValueError as e:
                     _LOGGER.error("Failed to parse .connect file: %s", e)
                     errors["base"] = "invalid_config"
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     _LOGGER.exception("Unexpected error parsing .connect: %s", e)
                     errors["base"] = "unknown"
                 else:

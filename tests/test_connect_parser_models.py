@@ -15,7 +15,6 @@ from connect_parser import (
     parse_connect_file,
 )
 
-
 _NETKEY = "0" * 32
 _APPKEY = "1" * 32
 

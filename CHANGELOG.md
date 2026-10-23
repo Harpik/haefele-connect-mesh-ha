@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Maintenance only, no runtime behaviour change.** CI now tests on
+  Python 3.11, 3.13 and 3.14 (3.11 is the Python of the oldest HA in
+  `hacs.json`, 2024.1; HA 2026.10 requires 3.14) instead of 3.11/3.12, and
+  runs ruff. Tests use stubbed HA and the latest test dependencies, not each
+  HA release's pinned versions. GitHub Actions moved to their Node 24 majors
+  (`checkout` v7, `setup-python` v7, `gitleaks-action` v3). Test requirement
+  floors raised past versions with known advisories
+  (`cryptography>=50.0.1`, `pytest>=9.1`). pre-commit hooks updated
+  (gitleaks 8.30.1, pre-commit-hooks 6.0.0, ruff 0.17.2) with the ruff rule
+  set pinned in `ruff.toml` (target Python 3.11), and the code reformatted
+  to it. Dependabot now proposes Actions and test-dependency updates weekly
+  (except `cryptography`, which follows HA core).
+
 ## [0.4.6] — 2026-10-07
 
 ### Fixed

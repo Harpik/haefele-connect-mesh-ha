@@ -9,7 +9,6 @@ import pytest
 
 from connect_parser import parse_connect_file
 
-
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
