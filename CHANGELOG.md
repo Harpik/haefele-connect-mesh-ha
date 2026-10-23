@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Maintenance only, no runtime behaviour change.** CI now tests on Python
+  3.13 and 3.14 (HA 2026.10 requires 3.14) instead of 3.11/3.12, and runs
+  ruff. GitHub Actions moved to their Node 24 majors (`checkout` v7,
+  `setup-python` v7, `gitleaks-action` v3). Test requirement floors raised
+  past versions with known advisories (`cryptography>=50.0.1`, `pytest>=9.1`).
+  pre-commit hooks updated (gitleaks 8.30.1, pre-commit-hooks 6.0.0,
+  ruff 0.17.2) with the ruff rule set pinned in `ruff.toml`, and the code
+  reformatted to it. Dependabot now proposes Actions and test-dependency
+  updates weekly.
+
 ## [0.4.6] — 2026-10-07
 
 ### Fixed
