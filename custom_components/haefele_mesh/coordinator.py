@@ -12,8 +12,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Any, Callable
+from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -156,7 +157,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         for cb in self._status_handlers.get(src_address, ()):
             try:
                 cb(opcode, params)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.exception("Status handler failed for %04X", src_address)
 
     # ------------------------------------------------------------------
@@ -648,7 +649,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 await self._poll_all_nodes()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.exception("State poll loop crashed, continuing")
 
     async def _poll_all_nodes(self) -> None:

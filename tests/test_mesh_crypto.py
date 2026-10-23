@@ -21,7 +21,6 @@ from mesh_crypto import (
     s1,
 )
 
-
 NET_KEY = bytes.fromhex("00112233445566778899aabbccddeeff")
 APP_KEY = bytes.fromhex("ffeeddccbbaa99887766554433221100")
 

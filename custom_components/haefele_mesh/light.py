@@ -248,7 +248,7 @@ class HaefeleLight(CoordinatorEntity[HaefeleCoordinator], LightEntity):
         """Apply a decoded status message from this light's unicast."""
         try:
             changed = self._apply_status(opcode, params)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _LOGGER.exception("Failed to apply status 0x%04X on %s", opcode, self._name_for_log)
             return
         if changed:

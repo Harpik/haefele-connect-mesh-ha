@@ -20,7 +20,6 @@ import pytest
 
 from custom_components.haefele_mesh.gatt import MeshSession
 
-
 NET_KEY_HEX = "00112233445566778899AABBCCDDEEFF"
 APP_KEY_HEX = "FFEEDDCCBBAA99887766554433221100"
 SRC = 0x7FFD  # Provisioner address, matches the Häfele app default.

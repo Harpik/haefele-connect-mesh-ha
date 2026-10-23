@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from connect_parser import (
     MODEL_GENERIC_ONOFF_SERVER,
     MODEL_LIGHT_CTL_SERVER,
@@ -14,7 +13,6 @@ from connect_parser import (
     detect_device_type_from_models,
     parse_connect_file,
 )
-
 
 _NETKEY = "0" * 32
 _APPKEY = "1" * 32

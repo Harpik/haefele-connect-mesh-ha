@@ -23,17 +23,17 @@ def aes_ccm_decrypt(key: bytes, nonce: bytes, ciphertext_with_tag: bytes, tag_le
 
 
 def aes_ecb(key: bytes, data: bytes) -> bytes:
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     cipher = Cipher(algorithms.AES(key), modes.ECB(), backend=default_backend())
     e = cipher.encryptor()
     return e.update(data[:16]) + e.finalize()
 
 
 def aes_cmac(key: bytes, data: bytes) -> bytes:
-    from cryptography.hazmat.primitives.cmac import CMAC
-    from cryptography.hazmat.primitives.ciphers import algorithms
     from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.ciphers import algorithms
+    from cryptography.hazmat.primitives.cmac import CMAC
     c = CMAC(algorithms.AES(key), backend=default_backend())
     c.update(data)
     return c.finalize()
