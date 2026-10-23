@@ -18,6 +18,6 @@ updates:
       test-deps:
         patterns: ["*"]
     ignore:
-      # Runtime cryptography comes from HA core; keep the test floor at HA's
-      # pin by hand instead of testing against versions HA does not ship.
+      # Runtime cryptography comes from HA core, not from us; the test floor
+      # (HA 2026.10's pin) is bumped by hand together with HA.
       - dependency-name: cryptography
