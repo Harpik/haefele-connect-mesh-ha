@@ -36,6 +36,9 @@ from bleak_retry_connector import (
 from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant
 
+from .access_codec import decode_opcode, encode_opcode
+from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
+
 from .const import (
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
@@ -47,8 +50,6 @@ from .const import (
 # what Häfele MeshBoxes advertise; Node Identity (0x01) is a future hook.
 PROXY_AD_TYPE_NETWORK_ID = 0x00
 PROXY_AD_TYPE_NODE_IDENTITY = 0x01
-from .access_codec import decode_opcode, encode_opcode
-from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
 
 _LOGGER = logging.getLogger(__name__)
 

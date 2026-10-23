@@ -51,7 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         await coordinator.async_setup()
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001
         _LOGGER.error("Failed to set up Häfele Mesh coordinator: %s", err)
         return False
 
