@@ -32,6 +32,8 @@ STATUS_TIMEOUT = 3.0
 # Unanswered Sets in a row after which the remote is taken to be asleep
 # again; the rest waits for the next press.
 MAX_SILENT = 2
+# Pause after each answered Set before sending the next one.
+SETTLE_DELAY = 0.3
 
 # Returns False when a segmented message never got through.
 SendDevkey = Callable[[int, int, bytes], Awaitable[bool | None]]
@@ -274,6 +276,9 @@ class RemoteConfigurator:
                         return False
                     continue
                 silent = 0
+                # Let our Segment Ack for that Status go out (and the remote
+                # take it) before the next Set lands on top of it.
+                await asyncio.sleep(SETTLE_DELAY)
                 position["pending"].remove([element, model])
                 if status["status"] != 0 or status["address"] != publication["address"]:
                     _LOGGER.error(

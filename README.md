@@ -129,6 +129,8 @@ Each position also gets a **mode** select (in the remote's device page, under *C
 
 The remote runs on batteries and sleeps between presses, so a change is **pending** (attribute `pending: true`, hourglass icon) until you press a button on the remote, on any position that is not disabled (a disabled position sends nothing, so Home Assistant can't tell the remote is awake). The remote stays awake a few seconds after the last press; Home Assistant sends the change in that time and keeps it pending, control by control, until the remote confirms it. If it is still pending, press again. The last position that is not disabled can't be disabled from Home Assistant, or no press could ever reach the remote again. The remote's device key is needed for this: entries created before this feature need one **Reconfigure** with the export, after which the selects appear.
 
+In a *Home Assistant only* position the centre button may send *on* every time: the remote decides on/off from the state it believes the light has, and no light answers it there. Use both the *turn on* and *turn off* triggers as "centre button pressed".
+
 The Häfele app does not know about these changes: it keeps showing a position set to *Home Assistant only* as disabled, and editing the remote in the app may overwrite them. Set the mode again from Home Assistant if that happens.
 
 The ring's left and right sides send the same message whether the app sets them to colour temperature or to colour (only the target group changes), so the *ring left* / *ring right* triggers fire in both modes. The event type is reported as `color_temp_warm` / `color_temp_cold` in either case.

@@ -44,6 +44,11 @@ def _remote(device_key: str = "00" * 16) -> dict:
     }
 
 
+@pytest.fixture(autouse=True)
+def _no_settle_delay(monkeypatch):
+    monkeypatch.setattr(rc_mod, "SETTLE_DELAY", 0)
+
+
 class FakeStore:
     def __init__(self, data=None):
         self.data = data
