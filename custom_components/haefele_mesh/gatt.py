@@ -351,6 +351,11 @@ class MeshSession:
             result.ack = parse_segment_ack(src, dst, transport_pdu)
             if result.ack is None:
                 _LOGGER.debug("ctl PDU src=%04X seq=%d — not an access message", src, seq)
+            else:
+                _LOGGER.debug(
+                    "RX segment ack src=%04X dst=%04X seq_zero=%04X block=%08X",
+                    src, dst, result.ack.seq_zero, result.ack.block_ack,
+                )
             return result
 
         if transport_pdu[0] & 0x80:
@@ -360,6 +365,10 @@ class MeshSession:
             if segment is None:
                 return result
             message, block_ack = self._reassembler.add(segment)
+            _LOGGER.debug(
+                "RX segment src=%04X dst=%04X seq_zero=%04X %d/%d akf=%d",
+                src, dst, segment.seq_zero, segment.seg_o, segment.seg_n, segment.akf,
+            )
             if dst == self.src:
                 result.ack_to_send = (src, segment.seq_zero, block_ack)
             if message is None:
@@ -1220,7 +1229,9 @@ class MeshProxyConnection:
         """Send a Configuration message (device key) to node dst."""
         if not await self.ensure_connected():
             raise ConnectionError("No mesh proxy available")
-        for pdu in await self._session.build_devkey_pdus(dst, opcode, params):
+        pdus = await self._session.build_devkey_pdus(dst, opcode, params)
+        _LOGGER.debug("TX devkey dst=%04X op=%#06x in %d PDU(s)", dst, opcode, len(pdus))
+        for pdu in pdus:
             await self._send_proxy_pdu(pdu, pdu_type=0x00)
 
     def _spawn_ack(self, dst: int, seq_zero: int, block_ack: int) -> None:
@@ -1237,6 +1248,10 @@ class MeshProxyConnection:
         try:
             pdu = await self._session.build_segment_ack_pdu(dst, seq_zero, block_ack)
             await self._send_proxy_pdu(pdu, pdu_type=0x00)
+            _LOGGER.debug(
+                "TX segment ack dst=%04X seq_zero=%04X block=%08X",
+                dst, seq_zero, block_ack,
+            )
         except Exception:
             _LOGGER.debug("Segment ack to %04X failed", dst, exc_info=True)
 

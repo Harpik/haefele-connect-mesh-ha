@@ -27,7 +27,7 @@ from .remote_config import (
 _LOGGER = logging.getLogger(__name__)
 
 # How long to wait for the Publication Status of one Set.
-STATUS_TIMEOUT = 1.5
+STATUS_TIMEOUT = 3.0
 # Unanswered Sets in a row after which the remote is taken to be asleep
 # again; the rest waits for the next press.
 MAX_SILENT = 2
@@ -77,8 +77,11 @@ class RemoteConfigurator:
     # ------------------------------------------------------------------
 
     def can_configure(self, remote_cfg: dict) -> bool:
-        """Only with the remote's device key (stored by a Reconfigure)."""
-        return bool(remote_cfg.get("device_key"))
+        """Only with the remote's device key and the app's configuration of
+        its controls, both stored by a Reconfigure since this feature."""
+        return bool(remote_cfg.get("device_key")) and any(
+            m.get("clients") for m in remote_cfg.get("modules") or []
+        )
 
     def mode(self, remote_cfg: dict, module: int) -> str:
         stored = self._positions.get(_position_key(remote_cfg, module))
@@ -158,11 +161,46 @@ class RemoteConfigurator:
 
     def on_publication_status(self, src: int, params: bytes) -> None:
         status = parse_publication_status(params)
-        if status is None or src not in self._remotes:
+        remote_cfg = self._remotes.get(src)
+        if status is None or remote_cfg is None:
             return
+        _LOGGER.debug(
+            "Remote %04X publication status %d element %04X model %04X -> %04X",
+            src, status["status"], status["element"], status["model"], status["address"],
+        )
         waiter = self._waiters.get((status["element"], status["model"]))
         if waiter is not None and not waiter.done():
             waiter.set_result(status)
+            return
+        # A late answer (its Set already timed out) still confirms the model.
+        if self._confirm(remote_cfg, status):
+            self._spawn(self._save_and_notify(), "haefele-remote-config-save")
+
+    def _confirm(self, remote_cfg: dict, status: dict[str, int]) -> bool:
+        """Mark the model of a successful status as done; True if it was pending."""
+        if status["status"] != 0:
+            return False
+        item = [status["element"], status["model"]]
+        for module in range(len(remote_cfg.get("modules") or [])):
+            position = self._positions.get(_position_key(remote_cfg, module)) or {}
+            if item not in (position.get("pending") or []):
+                continue
+            client = next(
+                (c for c in self._module(remote_cfg, module).get("clients") or []
+                 if [c["element"], c["model"]] == item),
+                None,
+            )
+            if client is None or (
+                publication_for(position["mode"], client)["address"] != status["address"]
+            ):
+                return False
+            position["pending"].remove(item)
+            return True
+        return False
+
+    async def _save_and_notify(self) -> None:
+        await self._save()
+        self._notify()
 
     async def _apply(self, remote_cfg: dict) -> None:
         unicast = remote_cfg["unicast"]

@@ -224,3 +224,36 @@ def test_unavailable_mode_is_rejected():
     c, remote, _ = _configurator(FakeRemote())
     with pytest.raises(ValueError):
         asyncio.run(c.async_set_mode(remote, 3, MODE_APP))
+
+
+def test_entries_imported_without_the_app_configuration_cannot_be_configured():
+    # Device key stored, but not how the app set up each control (an
+    # export imported by an earlier build): "app" mode could not be shown.
+    remote = _remote()
+    for module in remote["modules"]:
+        module["clients"] = []
+    c, _, _ = _configurator(FakeRemote(), remote=remote)
+    assert not c.can_configure(remote)
+
+
+def test_late_status_still_confirms_the_model(monkeypatch):
+    monkeypatch.setattr(rc_mod, "STATUS_TIMEOUT", 0.01)
+    fake = FakeRemote(answers=0)  # answers nothing in time
+    c, remote, tasks = _configurator(fake)
+
+    async def run():
+        await c.async_set_mode(remote, 3, MODE_HA_ONLY)
+        c.on_remote_activity(0x0017)
+        await asyncio.gather(*tasks)
+        # Both Sets timed out; the first answer arrives afterwards.
+        c.on_publication_status(0x0017, bytes([0]) + fake.sets[0])
+        # An answer with another address confirms nothing.
+        wrong = bytearray(fake.sets[1])
+        wrong[2:4] = (0xC00F).to_bytes(2, "little")
+        c.on_publication_status(0x0017, bytes([0]) + bytes(wrong))
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    pending = c._positions["remote_r1:3"]["pending"]
+    assert len(pending) == 7
+    assert [0x23, 0x1001] not in pending
