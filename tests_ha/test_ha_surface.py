@@ -162,3 +162,47 @@ def test_trigger_matches_what_the_forwarder_fires(monkeypatch):
     # Every key the trigger filters on is present with the same value.
     for key, value in captured["event_data"].items():
         assert data[key] == value, key
+
+
+# ---------------------------------------------------------------------------
+# Position mode select
+# ---------------------------------------------------------------------------
+
+
+def test_position_mode_select():
+    from custom_components.haefele_mesh import select
+    from custom_components.haefele_mesh.remote_configurator import RemoteConfigurator
+
+    pub = {"address": 0xC00F, "app_key_index": 0, "ttl": 0xFF, "period": 0, "retransmit": 9}
+    remote = {**REMOTE, "device_key": "00" * 16, "modules": [
+        {**m, "clients": [{"element": 0x17 + 4 * i, "model": 0x1001,
+                           "publish": dict(pub) if m["enabled"] else None}]}
+        for i, m in enumerate(REMOTE["modules"])
+    ]}
+
+    class Store:
+        async def async_load(self):
+            return None
+
+        async def async_save(self, data):
+            self.data = data
+
+    async def send(*_):
+        pass
+
+    coord = FakeCoordinator()
+    coord.remote_config = RemoteConfigurator([remote], Store(), send, lambda c, n: c.close())
+    first = select.HaefeleRemotePositionMode(coord, remote, 0)
+    fourth = select.HaefeleRemotePositionMode(coord, remote, 3)
+    assert first.unique_id == "remote_94876076-1e92-440f-b6ad-e681a260d1f7_module_1_mode"
+    assert first.options == ["app", "ha_only", "disabled"]
+    assert fourth.options == ["ha_only", "disabled"]
+    assert (first.current_option, fourth.current_option) == ("app", "disabled")
+    assert first.translation_key == "remote_position_mode"
+    assert first.translation_placeholders == {"position": "1"}
+    assert first.entity_category.value == "config"
+
+    asyncio.run(fourth.async_select_option("ha_only"))
+    assert fourth.current_option == "ha_only"
+    assert fourth.extra_state_attributes == {"pending": True, "error": False}
+    assert fourth.icon == "mdi:timer-sand"

@@ -133,6 +133,9 @@ class FakeProxy:
     async def get_ctl(self, dst):
         self.calls.append(("ctl", dst))
 
+    async def send_devkey(self, dst, opcode, params):
+        self.calls.append(("devkey", dst, opcode, params))
+
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
@@ -849,3 +852,60 @@ def test_quick_poll_sends_nothing_while_the_link_is_down(monkeypatch):
 
     asyncio.run(run())
     assert c.proxy.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Remote position modes
+# ---------------------------------------------------------------------------
+
+def _configurable_remote():
+    clients = [{"element": 0x010C, "model": 0x1001, "publish": None}]
+    modules = [{"index": i, "enabled": i == 0, "name": None, "scenes": [],
+                "group_address": 0xC001 if i == 0 else None,
+                "clients": clients if i == 3 else []} for i in range(6)]
+    return {**_REMOTE, "device_key": "00" * 16, "modules": modules}
+
+
+def test_remote_positions_listen_on_the_ha_only_address():
+    c = _coordinator(remotes=[_configurable_remote()])
+    asyncio.run(_setup(c))
+    assert FakeProxy.instances[0].filter_addresses[:2] == [0x00C8, 0xFEFF]
+
+
+def test_press_sends_pending_configuration_and_status_confirms_it():
+    c = _coordinator(remotes=[_configurable_remote()])
+    c.proxy = _connected_proxy()
+    remote = c.remotes_cfg[0]
+
+    async def run():
+        await c.remote_config.async_set_mode(remote, 3, "ha_only")
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0105"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        sent = [call for call in c.proxy.calls if call[0] == "devkey"]
+        assert len(sent) == 1 and sent[0][1:3] == (0x0100, 0x03)
+        # The remote's answer comes from its primary element and is no press.
+        events = []
+        c.register_remote_listener(events.append)
+        c._dispatch_status(0x0100, 0x8019, bytes([0]) + sent[0][3])
+        await asyncio.gather(*c._background_tasks)
+        assert events == []
+
+    asyncio.run(run())
+    assert not c.remote_config.is_pending(remote, 3)
+
+
+def test_press_on_a_ha_only_position_reads_no_light(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    c = _coordinator(remotes=[_configurable_remote()])
+    c.proxy = _connected_proxy()
+    remote = c.remotes_cfg[0]
+    c.remote_config._positions["remote_r1:3"] = {"mode": "ha_only", "pending": []}
+
+    async def run():
+        c._dispatch_status(0x010C, 0x8203, bytes.fromhex("0106"))  # position 4
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == []
+    assert c.remote_config.mode(remote, 3) == "ha_only"

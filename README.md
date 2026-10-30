@@ -115,7 +115,21 @@ Each Häfele remote in the `.connect` export becomes a device with one **event e
 | Ring right / left | `color_temp_cold` / `color_temp_warm` |
 | Buttons A / B / C (only where the app assigned a scene) | `scene_a` / `scene_b` / `scene_c` (with the scene number) |
 
-The remote keeps doing what the Häfele app configured; Home Assistant only listens. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing: their entities exist but never fire until you enable the position in the app (assign a group), export again and run **Reconfigure**. Device triggers work even if you disable a position's entity. If a remote disappears from the export (for example after re-pairing it in the app, which gives it a new identity), delete its old device from the device page.
+Unless you change a position's mode (below), the remote keeps doing what the Häfele app configured. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing: their entities exist but never fire until you enable the position in the app (assign a group), export again and run **Reconfigure**. Device triggers work even if you disable a position's entity. If a remote disappears from the export (for example after re-pairing it in the app, which gives it a new identity), delete its old device from the device page.
+
+#### Setting what a position does
+
+Each position also gets a **mode** select (in the remote's device page, under *Configuration*):
+
+| Mode | What the position does |
+|---|---|
+| **Häfele app** | What the app configured (only offered where the app linked the position). |
+| **Home Assistant only** | Every control publishes to an address no light listens to (`0xFEFF`). Nothing reacts by itself; the presses still reach Home Assistant, so you decide in automations what each button does. |
+| **Disabled** | The position sends nothing. |
+
+The remote runs on batteries and sleeps between presses, so a change is **pending** (attribute `pending: true`, hourglass icon) until you press any button on the remote; it stays awake about 5 seconds after the last press. Home Assistant then sends the change and keeps it pending, control by control, until the remote confirms it. If a position has many controls left, press again. The remote's device key is needed for this: entries created before this feature need one **Reconfigure** with the export, after which the selects appear.
+
+The Häfele app does not know about these changes: it keeps showing a position set to *Home Assistant only* as disabled, and editing the remote in the app may overwrite them. Set the mode again from Home Assistant if that happens.
 
 The ring's left and right sides send the same message whether the app sets them to colour temperature or to colour (only the target group changes), so the *ring left* / *ring right* triggers fire in both modes. The event type is reported as `color_temp_warm` / `color_temp_cold` in either case.
 

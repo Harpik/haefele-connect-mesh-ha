@@ -139,7 +139,7 @@ def test_successful_setup_registers_and_forwards(integration):
     (coordinator,) = _FakeCoordinator.instances
     assert coordinator.shutdown_calls == 0
     assert hass.data[integration.DOMAIN]["abc"] is coordinator
-    assert forwarded == [(entry, ("light", "event"))]
+    assert forwarded == [(entry, ("light", "event", "select"))]
     # Remote presses are forwarded to the bus for device triggers, and the
     # listener is removed when the entry unloads.
     assert len(coordinator.remote_listeners) == 1

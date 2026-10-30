@@ -15,6 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and buttons A/B/C where the app assigned a scene. The remote's
   retransmissions are de-duplicated by TID. Existing entries need a
   **Reconfigure** with a fresh export to pick up their remotes.
+- **Remote positions configurable from Home Assistant.** A mode select per
+  position: *Häfele app* (what the app configured), *Home Assistant only*
+  (the position controls no light and only drives automations) or
+  *Disabled*. The remote sleeps between presses, so a change is sent on the
+  next press and stays pending until the remote confirms each control. Needs
+  the remote's device key: existing entries need one Reconfigure.
+- Bluetooth Mesh segmented messages: sending them, reassembling the ones
+  addressed to us and acknowledging their segments, and Configuration
+  messages encrypted with a node's device key.
 - A remote press triggers an immediate state read of the lights in the
   pressed position's group, so Home Assistant reflects the change in about a
   second (plus 0.2 s per light) instead of up to 15 s. It never overlaps the

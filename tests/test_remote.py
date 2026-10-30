@@ -16,6 +16,7 @@ from custom_components.haefele_mesh.remote import (
     RemoteDecoder,
     module_count,
 )
+from custom_components.haefele_mesh.remote_config import MODES
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -215,3 +216,38 @@ def test_translations_cover_every_event_type():
             assert set(states) == set(EVENT_TYPES), (name, key)
         assert set(triggers) == set(EVENT_TYPES), name
         assert "position_24" in data["device_automation"]["trigger_subtype"], name
+        modes = data["entity"]["select"]["remote_position_mode"]["state"]
+        assert set(modes) == set(MODES), name
+
+
+def test_client_models_and_app_publication_per_position():
+    doc = json.loads((FIXTURES / "minimal.connect.json").read_text())
+    node = _remote_node()
+    node["elements"][0]["models"] = [
+        {"modelId": "0000"},  # Configuration Server: not a client
+        {"modelId": "1001", "publish": {
+            "address": "C00F", "index": 0, "ttl": 255,
+            "period": {"numberOfSteps": 0, "resolution": 100},
+            "retransmit": {"count": 1, "interval": 100}}},
+    ]
+    node["elements"][12]["models"] = [{"modelId": "1001"}]
+    node["deviceKey"] = "00112233445566778899AABBCCDDEEFF"
+    doc["nodes"].append(node)
+    remote = parse_connect_file(json.dumps(doc))["remotes"][0]
+    assert remote["device_key"] == "00112233445566778899aabbccddeeff"
+    assert remote["modules"][0]["clients"] == [{
+        "element": 0x0017, "model": 0x1001,
+        "publish": {"address": 0xC00F, "app_key_index": 0, "ttl": 255,
+                    "period": 0, "retransmit": 0x09},
+    }]
+    assert remote["modules"][3]["clients"] == [
+        {"element": 0x0017 + 12, "model": 0x1001, "publish": None},
+    ]
+
+
+def test_malformed_device_key_is_dropped():
+    doc = json.loads((FIXTURES / "minimal.connect.json").read_text())
+    node = _remote_node()
+    node["deviceKey"] = "not-a-key"
+    doc["nodes"].append(node)
+    assert parse_connect_file(json.dumps(doc))["remotes"][0]["device_key"] == ""

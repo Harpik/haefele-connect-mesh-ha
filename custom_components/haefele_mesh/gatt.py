@@ -27,6 +27,7 @@ import hmac
 import logging
 import struct
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from bleak.backends.device import BLEDevice
 from bleak_retry_connector import (
@@ -57,6 +58,16 @@ from .mesh_crypto import (
     k4,
     secure_beacon_auth,
 )
+from .transport import (
+    MAX_UNSEGMENTED_ACCESS,
+    Reassembler,
+    SegmentAck,
+    encode_segment_ack,
+    parse_segment,
+    parse_segment_ack,
+    segment_headers,
+    split_upper_transport,
+)
 
 # Mesh Proxy advertisement service-data "Identification Type" byte values
 # (Mesh Profile spec 7.2.2.2). We currently match Network ID only — it's
@@ -67,6 +78,9 @@ PROXY_AD_TYPE_NODE_IDENTITY = 0x01
 _LOGGER = logging.getLogger(__name__)
 
 
+# TTL of the access and control messages we originate.
+DEFAULT_TTL = 5
+
 SeqProvider = Callable[[int], Awaitable[int]]
 MessageHandler = Callable[[int, int, bytes], None]
 """`(src_address, opcode, params) -> None`."""
@@ -75,6 +89,18 @@ MessageHandler = Callable[[int, int, bytes], None]
 # ---------------------------------------------------------------------------
 # Crypto + PDU construction/decoding (no BLE)
 # ---------------------------------------------------------------------------
+
+@dataclass
+class DecodedPdu:
+    """What an inbound Network PDU carried."""
+
+    # (src, dst, opcode, params) of a complete access message.
+    message: tuple[int, int, int, bytes] | None = None
+    # A Segment Acknowledgment someone sent.
+    ack: SegmentAck | None = None
+    # (dst, seq_zero, block_ack): segments addressed to us to acknowledge.
+    ack_to_send: tuple[int, int, int] | None = None
+
 
 class MeshSession:
     """BT Mesh network-/transport-/access-layer codec with no BLE.
@@ -113,6 +139,10 @@ class MeshSession:
         self.iv_update = False
         # Derived from AppKey: 6-bit AID
         self.aid = k4(self._app_key)
+        # Device keys by node primary unicast, for Configuration messages
+        # (AKF=0, device nonce).
+        self.device_keys: dict[int, bytes] = {}
+        self._reassembler = Reassembler()
 
     @property
     def tx_iv_index(self) -> int:
@@ -160,6 +190,68 @@ class MeshSession:
         return self._wrap_network_pdu(
             plaintext=struct.pack(">H", dst) + trans_pdu,
             ctl=ctl, ttl=ttl, seq=seq, src=src,
+        )
+
+    async def build_devkey_pdus(
+        self, dst: int, opcode: int, params: bytes
+    ) -> list[bytes]:
+        """Encode a Configuration message (dst's device key) as Network PDUs.
+
+        Unsegmented when the access PDU fits in 11 bytes, segmented
+        otherwise (Mesh Profile 1.0.1 §3.5.3). One Network PDU per segment.
+        """
+        dev_key = self.device_keys[dst]
+        src = self.src
+        access_pdu = encode_opcode(opcode) + params
+        if len(access_pdu) <= MAX_UNSEGMENTED_ACCESS:
+            seq = await self._seq_provider(src)
+            upper = aes_ccm_encrypt(
+                dev_key, self._upper_nonce(0x02, 0, seq, src, dst, self.tx_iv_index),
+                access_pdu, tag_length=4,
+            )
+            return [self._wrap_network_pdu(
+                plaintext=struct.pack(">H", dst) + bytes([0x00]) + upper,
+                ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src,
+            )]
+        # The first segment's SEQ is the message's SeqAuth (nonce + SeqZero).
+        seqs = [await self._seq_provider(src)]
+        upper = aes_ccm_encrypt(
+            dev_key, self._upper_nonce(0x02, 0, seqs[0], src, dst, self.tx_iv_index),
+            access_pdu, tag_length=4,
+        )
+        chunks = split_upper_transport(upper)
+        while len(seqs) < len(chunks):
+            seqs.append(await self._seq_provider(src))
+        headers = segment_headers(0, 0, 0, seqs[0], len(chunks))
+        return [
+            self._wrap_network_pdu(
+                plaintext=struct.pack(">H", dst) + header + chunk,
+                ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src,
+            )
+            for header, chunk, seq in zip(headers, chunks, seqs)
+        ]
+
+    async def build_segment_ack_pdu(
+        self, dst: int, seq_zero: int, block_ack: int
+    ) -> bytes:
+        """Segment Acknowledgment for a segmented message dst sent us."""
+        src = self.src
+        seq = await self._seq_provider(src)
+        return self._wrap_network_pdu(
+            plaintext=struct.pack(">H", dst) + encode_segment_ack(seq_zero, block_ack),
+            ctl=1, ttl=DEFAULT_TTL, seq=seq, src=src,
+        )
+
+    @staticmethod
+    def _upper_nonce(
+        kind: int, aszmic: int, seq: int, src: int, dst: int, iv_index: int,
+    ) -> bytes:
+        """Application (0x01) or Device (0x02) nonce, §3.8.5.2-3."""
+        return (
+            bytes([kind, (aszmic & 1) << 7])
+            + seq.to_bytes(3, "big")
+            + struct.pack(">HH", src, dst)
+            + struct.pack(">I", iv_index)
         )
 
     # ------------------------------------------------------------------
@@ -229,62 +321,94 @@ class MeshSession:
     # ------------------------------------------------------------------
 
     def decode_access_pdu(self, pdu: bytes) -> tuple[int, int, int, bytes] | None:
-        """Decrypt an inbound Network PDU carrying an access message.
+        """Decrypt an inbound unsegmented access message.
 
-        Returns (src, dst, opcode, params) or None if the frame is not ours,
-        not an access message, malformed, segmented (unsupported), etc.
+        Returns (src, dst, opcode, params), or None for anything else.
+        Segmented messages need ``decode_network_pdu`` (it keeps state).
         """
+        return self.decode_network_pdu(pdu, reassemble=False).message
+
+    def decode_network_pdu(self, pdu: bytes, reassemble: bool = True) -> DecodedPdu:
+        """Decrypt an inbound Network PDU.
+
+        Handles unsegmented and (with ``reassemble``) segmented access
+        messages, encrypted with the AppKey or with a known device key, and
+        Segment Acknowledgments. ``ack_to_send`` asks the caller to
+        acknowledge segments addressed to us.
+        """
+        result = DecodedPdu()
         header = self._decode_network_header(pdu)
         if header is None:
-            return None
+            return result
         ctl, seq, src, plaintext = header
-        if ctl:
-            # Control PDUs handled elsewhere if needed.
-            _LOGGER.debug("ctl PDU src=%04X seq=%d — not an access message", src, seq)
-            return None
-
         if len(plaintext) < 3:
-            return None
+            return result
         dst = int.from_bytes(plaintext[:2], "big")
         transport_pdu = plaintext[2:]
+        ivi = pdu[0] >> 7
 
-        seg = (transport_pdu[0] >> 7) & 1
-        akf = (transport_pdu[0] >> 6) & 1
-        aid = transport_pdu[0] & 0x3F
-        if seg:
-            _LOGGER.debug("Ignoring segmented PDU from %04X (unsupported)", src)
-            return None
-        if not akf:
-            _LOGGER.debug("RX devkey-encrypted PDU src=%04X (ignored)", src)
-            return None
-        if aid != self.aid:
-            _LOGGER.debug(
-                "AID mismatch (got 0x%02X, expected 0x%02X) — different AppKey",
-                aid, self.aid,
+        if ctl:
+            result.ack = parse_segment_ack(src, dst, transport_pdu)
+            if result.ack is None:
+                _LOGGER.debug("ctl PDU src=%04X seq=%d — not an access message", src, seq)
+            return result
+
+        if transport_pdu[0] & 0x80:
+            if not reassemble:
+                return result
+            segment = parse_segment(src, dst, seq, transport_pdu)
+            if segment is None:
+                return result
+            message, block_ack = self._reassembler.add(segment)
+            if dst == self.src:
+                result.ack_to_send = (src, segment.seq_zero, block_ack)
+            if message is None:
+                return result
+            result.message = self._decrypt_upper(
+                src, dst, message.seq_auth, message.akf, message.aid,
+                message.szmic, message.upper_transport, ivi,
             )
-            return None
+            return result
 
-        upper = transport_pdu[1:]
-        if len(upper) < 5:
-            return None
-        app_nonce = (
-            bytes([0x01, 0x00])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">HH", src, dst)
-            + struct.pack(">I", self.rx_iv_index(pdu[0] >> 7))
+        result.message = self._decrypt_upper(
+            src, dst, seq, (transport_pdu[0] >> 6) & 1, transport_pdu[0] & 0x3F,
+            0, transport_pdu[1:], ivi,
         )
-        try:
-            access_pdu = aes_ccm_decrypt(self._app_key, app_nonce, upper, tag_length=4)
-        except Exception:  # noqa: BLE001
-            _LOGGER.debug("App MIC failed src=%04X seq=%d", src, seq)
-            return None
+        return result
 
+    def _decrypt_upper(
+        self, src: int, dst: int, seq_auth: int, akf: int, aid: int,
+        szmic: int, upper: bytes, ivi: int,
+    ) -> tuple[int, int, int, bytes] | None:
+        """Decrypt an upper transport access PDU; (src, dst, opcode, params)."""
+        mic_len = 8 if szmic else 4
+        if len(upper) < mic_len + 1:
+            return None
+        if akf:
+            if aid != self.aid:
+                _LOGGER.debug(
+                    "AID mismatch (got 0x%02X, expected 0x%02X) — different AppKey",
+                    aid, self.aid,
+                )
+                return None
+            key, kind = self._app_key, 0x01
+        else:
+            key = self.device_keys.get(src)
+            if key is None:
+                _LOGGER.debug("RX devkey-encrypted PDU src=%04X (ignored)", src)
+                return None
+            kind = 0x02
+        nonce = self._upper_nonce(kind, szmic, seq_auth, src, dst, self.rx_iv_index(ivi))
+        try:
+            access_pdu = aes_ccm_decrypt(key, nonce, upper, tag_length=mic_len)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Upper transport MIC failed src=%04X akf=%d", src, akf)
+            return None
         decoded = decode_opcode(access_pdu)
         if decoded is None:
             _LOGGER.debug("Unable to decode opcode raw=%s", access_pdu.hex())
             return None
-        opcode, params = decoded
-        return src, dst, opcode, params
+        return src, dst, decoded[0], decoded[1]
 
     def decode_proxy_config(self, pdu: bytes) -> tuple[int, bytes] | None:
         """Decrypt an inbound Proxy Configuration PDU, return (opcode, params)."""
@@ -419,6 +543,8 @@ class MeshProxyConnection:
         # error, so a permanent misconfiguration doesn't spam the log on
         # every heartbeat. Reset as soon as a connectable scanner shows up.
         self._no_transport_warned: bool = False
+        # In-flight Segment Acknowledgments we are sending.
+        self._ack_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -868,6 +994,8 @@ class MeshProxyConnection:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._rx_task = None
+        for task in list(self._ack_tasks):
+            task.cancel()
         if self._client is not None:
             try:
                 await self._client.disconnect()
@@ -936,10 +1064,12 @@ class MeshProxyConnection:
             _LOGGER.exception("Incoming PDU pump crashed")
 
     def _handle_network_pdu(self, pdu: bytes) -> None:
-        decoded = self._session.decode_access_pdu(pdu)
-        if decoded is None:
+        result = self._session.decode_network_pdu(pdu)
+        if result.ack_to_send is not None:
+            self._spawn_ack(*result.ack_to_send)
+        if result.message is None:
             return
-        src, dst, opcode, params = decoded
+        src, dst, opcode, params = result.message
         _LOGGER.debug(
             "RX src=%04X dst=%04X op=%#06x params=%s",
             src, dst, opcode, params.hex(),
@@ -1085,6 +1215,30 @@ class MeshProxyConnection:
             raise ConnectionError("No mesh proxy available")
         pdu = await self._session.build_access_network_pdu(dst, opcode, params)
         await self._send_proxy_pdu(pdu, pdu_type=0x00)
+
+    async def send_devkey(self, dst: int, opcode: int, params: bytes) -> None:
+        """Send a Configuration message (device key) to node dst."""
+        if not await self.ensure_connected():
+            raise ConnectionError("No mesh proxy available")
+        for pdu in await self._session.build_devkey_pdus(dst, opcode, params):
+            await self._send_proxy_pdu(pdu, pdu_type=0x00)
+
+    def _spawn_ack(self, dst: int, seq_zero: int, block_ack: int) -> None:
+        """Acknowledge segments dst sent us, so it stops retransmitting."""
+        task = asyncio.get_running_loop().create_task(
+            self._send_ack(dst, seq_zero, block_ack)
+        )
+        self._ack_tasks.add(task)
+        task.add_done_callback(self._ack_tasks.discard)
+
+    async def _send_ack(self, dst: int, seq_zero: int, block_ack: int) -> None:
+        if not self.is_connected:
+            return
+        try:
+            pdu = await self._session.build_segment_ack_pdu(dst, seq_zero, block_ack)
+            await self._send_proxy_pdu(pdu, pdu_type=0x00)
+        except Exception:
+            _LOGGER.debug("Segment ack to %04X failed", dst, exc_info=True)
 
     async def _setup_proxy_filter(self) -> None:
         """Make the proxy forward the traffic we care about.

@@ -39,11 +39,15 @@ from .const import (
 )
 from .gatt import MeshProxyConnection, MeshSession
 from .remote import RemoteDecoder, RemoteEvent
+from .remote_config import HA_ONLY_ADDRESS, OP_MODEL_PUBLICATION_STATUS
+from .remote_configurator import RemoteConfigurator
 
 _LOGGER = logging.getLogger(__name__)
 
 SEQ_STORAGE_VERSION = 1
 SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
+REMOTE_STORAGE_VERSION = 1
+REMOTE_STORAGE_KEY = f"{DOMAIN}_remote_positions"
 SEQ_STARTUP_JUMP = 200
 # Reserved keys inside the SEQ store (everything else is "<src>": seq).
 STORE_KEY_IV_INDEX = "_iv_index"
@@ -144,6 +148,16 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Presses on Häfele remotes, routed to their event entities.
         self.remotes_cfg: list[dict] = config.get("remotes") or []
         self._remote_decoder = RemoteDecoder(self.remotes_cfg)
+        # Modes of remote positions set from Home Assistant.
+        self.remote_config = RemoteConfigurator(
+            self.remotes_cfg,
+            Store(
+                hass, REMOTE_STORAGE_VERSION,
+                f"{REMOTE_STORAGE_KEY}_{entry_id}" if entry_id else REMOTE_STORAGE_KEY,
+            ),
+            self._send_devkey,
+            self._spawn_background,
+        )
         self._remote_listeners: list[Callable[[RemoteEvent], None]] = []
         self._quick_poll_task: asyncio.Task | None = None
         # Groups whose lights a quick poll still has to read (None = all).
@@ -194,12 +208,18 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except Exception:
                 _LOGGER.exception("Status handler failed for %04X", src_address)
         if self._remote_decoder.owns(src_address):
+            if opcode == OP_MODEL_PUBLICATION_STATUS:
+                self.remote_config.on_publication_status(src_address, params)
+                return
             self._dispatch_remote(src_address, opcode, params)
 
     def _dispatch_remote(self, src_address: int, opcode: int, params: bytes) -> None:
         event = self._remote_decoder.decode(src_address, opcode, params)
         if event is None:
             return
+        # The remote is awake right after a press: send what is pending.
+        if not self._closing:
+            self.remote_config.on_remote_activity(event.remote_unicast)
         _LOGGER.debug("Remote %04X module %d: %s %s", event.remote_unicast,
                       event.module + 1, event.event_type, event.attributes)
         for cb in list(self._remote_listeners):
@@ -208,8 +228,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except Exception:
                 _LOGGER.exception("Remote listener failed")
         # The press changed the lights it controls: read their state now
-        # instead of waiting for the next periodic poll.
-        self._schedule_quick_poll(event.group_address)
+        # instead of waiting for the next periodic poll. A position set to
+        # "Home Assistant only" changes no light.
+        if not self.remote_config.is_ha_only(event.remote_unicast, event.module):
+            self._schedule_quick_poll(event.group_address)
+
+    async def _send_devkey(self, dst: int, opcode: int, params: bytes) -> None:
+        if self.proxy is None:
+            raise ConnectionError("Mesh not set up")
+        await self.proxy.send_devkey(dst, opcode, params)
 
     def _schedule_quick_poll(self, group: int | None) -> None:
         """Read the lights of ``group`` soon (None: every light).
@@ -567,6 +594,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     async def async_setup(self) -> None:
         await self._load_seq()
+        await self.remote_config.async_load()
         # Jump SEQ forward on startup for every known SRC. With block
         # persistence the stored value is already a ceiling; the jump is
         # kept for stores written by older releases (exact last SEQ).
@@ -620,6 +648,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Only an IV Index that an authenticated beacon confirmed counts as
         # known; one from the export can still be corrected by a big jump.
         self.session.iv_confirmed = self._persisted_iv_confirmed
+        for remote in self.remotes_cfg:
+            if remote.get("device_key"):
+                self.session.device_keys[remote["unicast"]] = bytes.fromhex(
+                    remote["device_key"]
+                )
         # Rotate *before* the proxy exists if the stored SEQ is already past
         # the threshold (e.g. first start after upgrading), so the filter
         # list computed below already carries the fresh SRC.
@@ -744,6 +777,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         ordered: list[int] = []
         if self.session is not None:
             ordered.append(self.session.src & 0xFFFF)
+        # Presses of positions set to "Home Assistant only".
+        if self.remotes_cfg:
+            ordered.append(HA_ONLY_ADDRESS)
         for addr in [*sorted(groups), *sorted(unicasts)]:
             if addr not in ordered:
                 ordered.append(addr)

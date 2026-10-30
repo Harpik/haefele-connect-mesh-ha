@@ -88,6 +88,32 @@
           }
         }
       }
+    },
+    "select": {
+      "remote_position_mode": {
+        "name": "Posición {position}: modo",
+        "state": {
+          "app": "App Häfele",
+          "ha_only": "Solo Home Assistant",
+          "disabled": "Desactivada"
+        },
+        "state_attributes": {
+          "pending": {
+            "name": "Pendiente",
+            "state": {
+              "true": "Sí",
+              "false": "No"
+            }
+          },
+          "error": {
+            "name": "Error",
+            "state": {
+              "true": "Sí",
+              "false": "No"
+            }
+          }
+        }
+      }
     }
   }
 }

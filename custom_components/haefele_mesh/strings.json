@@ -129,6 +129,32 @@
           }
         }
       }
+    },
+    "select": {
+      "remote_position_mode": {
+        "name": "Position {position} mode",
+        "state": {
+          "app": "Häfele app",
+          "ha_only": "Home Assistant only",
+          "disabled": "Disabled"
+        },
+        "state_attributes": {
+          "pending": {
+            "name": "Pending",
+            "state": {
+              "true": "Yes",
+              "false": "No"
+            }
+          },
+          "error": {
+            "name": "Error",
+            "state": {
+              "true": "Yes",
+              "false": "No"
+            }
+          }
+        }
+      }
     }
   }
 }

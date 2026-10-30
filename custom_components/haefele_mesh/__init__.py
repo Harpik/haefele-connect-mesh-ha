@@ -22,7 +22,7 @@ from .remote import (
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["light", "event"]
+PLATFORMS = ["light", "event", "select"]
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
