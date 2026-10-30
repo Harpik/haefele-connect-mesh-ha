@@ -257,3 +257,62 @@ def test_late_status_still_confirms_the_model(monkeypatch):
     pending = c._positions["remote_r1:3"]["pending"]
     assert len(pending) == 7
     assert [0x23, 0x1001] not in pending
+
+
+def test_ha_only_counts_only_once_the_remote_confirmed_it():
+    # Until then the position may still switch lights (their state must
+    # still be read after a press), and a refused change never applies.
+    c, remote, _ = _configurator(FakeRemote())
+    c._positions["remote_r1:3"] = {"mode": MODE_HA_ONLY, "pending": [[0x23, 0x1001]]}
+    assert not c.is_ha_only(0x0017, 3)
+    c._positions["remote_r1:3"] = {"mode": MODE_HA_ONLY, "pending": [], "error": True}
+    assert not c.is_ha_only(0x0017, 3)
+    c._positions["remote_r1:3"] = {"mode": MODE_HA_ONLY, "pending": []}
+    assert c.is_ha_only(0x0017, 3)
+
+
+def test_the_last_active_position_cannot_be_disabled():
+    # Only presses on a position that sends something wake the remote for
+    # us; with every position disabled it could never be changed again.
+    c, remote, _ = _configurator(FakeRemote())
+
+    async def run():
+        await c.async_set_mode(remote, 0, MODE_DISABLED)
+        await c.async_set_mode(remote, 1, MODE_DISABLED)
+        with pytest.raises(ValueError):
+            await c.async_set_mode(remote, 2, MODE_DISABLED)
+
+    asyncio.run(run())
+
+
+def test_mode_changed_while_sending_is_sent_in_the_same_wake():
+    fake = FakeRemote()
+    c, remote, tasks = _configurator(fake)
+    original = fake.send
+
+    async def send_and_change_mind(dst, opcode, params):
+        await original(dst, opcode, params)
+        if len(fake.sets) == 2:
+            await c.async_set_mode(remote, 3, MODE_DISABLED)
+
+    fake_send = send_and_change_mind
+    c._send = fake_send
+
+    async def run():
+        await c.async_set_mode(remote, 3, MODE_HA_ONLY)
+        c.on_remote_activity(0x0017)
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    assert not c.is_pending(remote, 3)
+    assert c.mode(remote, 3) == MODE_DISABLED
+    # The last 8 Sets are the new mode (no publication).
+    assert all(p[2:4] == b"\x00\x00" for p in fake.sets[-8:])
+
+
+def test_position_whose_app_setup_could_not_be_read_is_not_unknown():
+    remote = _remote()
+    for client in remote["modules"][0]["clients"]:
+        client["publish"] = None  # e.g. a virtual address
+    c, _, _ = _configurator(FakeRemote(), remote=remote)
+    assert c.mode(remote, 0) in c.modes(remote, 0)

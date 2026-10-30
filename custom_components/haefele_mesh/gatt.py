@@ -80,6 +80,13 @@ _LOGGER = logging.getLogger(__name__)
 
 # TTL of the access and control messages we originate.
 DEFAULT_TTL = 5
+# Segmented messages we send: how long to wait for the receiver's Segment
+# Ack before resending the missing segments, and how many times.
+SAR_ACK_TIMEOUT = 1.0
+SAR_RETRANSMISSIONS = 2
+# Each Segment Ack we send goes out this many times, this far apart.
+ACK_COPIES = 2
+ACK_COPY_GAP = 0.1
 
 SeqProvider = Callable[[int], Awaitable[int]]
 MessageHandler = Callable[[int, int, bytes], None]
@@ -89,6 +96,20 @@ MessageHandler = Callable[[int, int, bytes], None]
 # ---------------------------------------------------------------------------
 # Crypto + PDU construction/decoding (no BLE)
 # ---------------------------------------------------------------------------
+
+@dataclass
+class OutgoingMessage:
+    """A message we send, kept so lost segments can be retransmitted."""
+
+    dst: int
+    src: int
+    # None for an unsegmented message.
+    seq_zero: int | None
+    # Network-layer plaintext (DST + lower transport PDU) of each segment.
+    segments: list[bytes]
+    # First transmission.
+    pdus: list[bytes]
+
 
 @dataclass
 class DecodedPdu:
@@ -192,44 +213,54 @@ class MeshSession:
             ctl=ctl, ttl=ttl, seq=seq, src=src,
         )
 
-    async def build_devkey_pdus(
+    async def build_devkey_message(
         self, dst: int, opcode: int, params: bytes
-    ) -> list[bytes]:
-        """Encode a Configuration message (dst's device key) as Network PDUs.
+    ) -> OutgoingMessage:
+        """Encode a Configuration message (dst's device key).
 
         Unsegmented when the access PDU fits in 11 bytes, segmented
-        otherwise (Mesh Profile 1.0.1 §3.5.3). One Network PDU per segment.
+        otherwise (Mesh Profile 1.0.1 §3.5.3). ``pdus`` is the first
+        transmission, one Network PDU per segment; ``segments`` keeps the
+        plaintext of each so a lost one can be sent again with a new SEQ.
         """
         dev_key = self.device_keys[dst]
         src = self.src
         access_pdu = encode_opcode(opcode) + params
-        if len(access_pdu) <= MAX_UNSEGMENTED_ACCESS:
-            seq = await self._seq_provider(src)
-            upper = aes_ccm_encrypt(
-                dev_key, self._upper_nonce(0x02, 0, seq, src, dst, self.tx_iv_index),
-                access_pdu, tag_length=4,
-            )
-            return [self._wrap_network_pdu(
-                plaintext=struct.pack(">H", dst) + bytes([0x00]) + upper,
-                ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src,
-            )]
-        # The first segment's SEQ is the message's SeqAuth (nonce + SeqZero).
-        seqs = [await self._seq_provider(src)]
+        # The first SEQ is the message's SeqAuth: nonce, and SeqZero.
+        seq_auth = await self._seq_provider(src)
         upper = aes_ccm_encrypt(
-            dev_key, self._upper_nonce(0x02, 0, seqs[0], src, dst, self.tx_iv_index),
+            dev_key, self._upper_nonce(0x02, 0, seq_auth, src, dst, self.tx_iv_index),
             access_pdu, tag_length=4,
         )
-        chunks = split_upper_transport(upper)
-        while len(seqs) < len(chunks):
-            seqs.append(await self._seq_provider(src))
-        headers = segment_headers(0, 0, 0, seqs[0], len(chunks))
-        return [
-            self._wrap_network_pdu(
-                plaintext=struct.pack(">H", dst) + header + chunk,
-                ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src,
+        if len(access_pdu) <= MAX_UNSEGMENTED_ACCESS:
+            plain = struct.pack(">H", dst) + bytes([0x00]) + upper
+            return OutgoingMessage(
+                dst=dst, src=src, seq_zero=None, segments=[plain],
+                pdus=[self._wrap_network_pdu(plain, ctl=0, ttl=DEFAULT_TTL, seq=seq_auth, src=src)],
             )
-            for header, chunk, seq in zip(headers, chunks, seqs)
-        ]
+        chunks = split_upper_transport(upper)
+        headers = segment_headers(0, 0, 0, seq_auth, len(chunks))
+        segments = [struct.pack(">H", dst) + h + c for h, c in zip(headers, chunks)]
+        pdus = [self._wrap_network_pdu(segments[0], ctl=0, ttl=DEFAULT_TTL, seq=seq_auth, src=src)]
+        for plain in segments[1:]:
+            seq = await self._seq_provider(src)
+            pdus.append(self._wrap_network_pdu(plain, ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src))
+        return OutgoingMessage(
+            dst=dst, src=src, seq_zero=seq_auth & 0x1FFF, segments=segments, pdus=pdus,
+        )
+
+    async def build_devkey_pdus(
+        self, dst: int, opcode: int, params: bytes
+    ) -> list[bytes]:
+        """The Network PDUs of a Configuration message (first transmission)."""
+        return (await self.build_devkey_message(dst, opcode, params)).pdus
+
+    async def rewrap_segment(self, message: OutgoingMessage, index: int) -> bytes:
+        """Segment ``index`` of ``message`` again, with a fresh SEQ (§3.5.3.3)."""
+        seq = await self._seq_provider(message.src)
+        return self._wrap_network_pdu(
+            message.segments[index], ctl=0, ttl=DEFAULT_TTL, seq=seq, src=message.src,
+        )
 
     async def build_segment_ack_pdu(
         self, dst: int, seq_zero: int, block_ack: int
@@ -365,11 +396,15 @@ class MeshSession:
             if segment is None:
                 return result
             message, block_ack = self._reassembler.add(segment)
+            complete = block_ack == (1 << (segment.seg_n + 1)) - 1
             _LOGGER.debug(
                 "RX segment src=%04X dst=%04X seq_zero=%04X %d/%d akf=%d",
                 src, dst, segment.seq_zero, segment.seg_o, segment.seg_n, segment.akf,
             )
-            if dst == self.src:
+            # Acknowledge once the message is complete (and again if a
+            # segment of it comes back: our ack was lost). Partial acks
+            # would only make the sender retransmit sooner.
+            if dst == self.src and complete:
                 result.ack_to_send = (src, segment.seq_zero, block_ack)
             if message is None:
                 return result
@@ -402,7 +437,9 @@ class MeshSession:
                 return None
             key, kind = self._app_key, 0x01
         else:
-            key = self.device_keys.get(src)
+            # Configuration messages between other nodes (for example the
+            # remote answering the Häfele app) are not ours to act on.
+            key = self.device_keys.get(src) if dst == self.src else None
             if key is None:
                 _LOGGER.debug("RX devkey-encrypted PDU src=%04X (ignored)", src)
                 return None
@@ -554,6 +591,13 @@ class MeshProxyConnection:
         self._no_transport_warned: bool = False
         # In-flight Segment Acknowledgments we are sending.
         self._ack_tasks: set[asyncio.Task] = set()
+        # Taking a SEQ and sending its PDU happen under this lock, so a
+        # node never sees our SEQs out of order (its replay protection
+        # would drop the late one).
+        self._tx_lock = asyncio.Lock()
+        # Latest BlockAck per (node, SeqZero) of our segmented messages.
+        self._acks: dict[tuple[int, int], int] = {}
+        self._ack_event = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1076,6 +1120,13 @@ class MeshProxyConnection:
         result = self._session.decode_network_pdu(pdu)
         if result.ack_to_send is not None:
             self._spawn_ack(*result.ack_to_send)
+        ack = result.ack
+        if ack is not None and ack.dst == self._session.src:
+            key = (ack.src, ack.seq_zero)
+            self._acks[key] = self._acks.get(key, 0) | ack.block_ack
+            if ack.block_ack == 0:
+                self._acks[key] = -1  # the receiver cancelled the message
+            self._ack_event.set()
         if result.message is None:
             return
         src, dst, opcode, params = result.message
@@ -1222,17 +1273,64 @@ class MeshProxyConnection:
         """Send an access-layer message (encrypted with AppKey) to dst."""
         if not await self.ensure_connected():
             raise ConnectionError("No mesh proxy available")
-        pdu = await self._session.build_access_network_pdu(dst, opcode, params)
-        await self._send_proxy_pdu(pdu, pdu_type=0x00)
+        async with self._tx_lock:
+            pdu = await self._session.build_access_network_pdu(dst, opcode, params)
+            await self._send_proxy_pdu(pdu, pdu_type=0x00)
 
-    async def send_devkey(self, dst: int, opcode: int, params: bytes) -> None:
-        """Send a Configuration message (device key) to node dst."""
+    async def send_devkey(self, dst: int, opcode: int, params: bytes) -> bool:
+        """Send a Configuration message (device key) to node dst.
+
+        A segmented message is retransmitted segment by segment until dst
+        acknowledges all of it (§3.5.3.3). Returns False if it never did;
+        unsegmented messages return True once sent.
+        """
         if not await self.ensure_connected():
             raise ConnectionError("No mesh proxy available")
-        pdus = await self._session.build_devkey_pdus(dst, opcode, params)
-        _LOGGER.debug("TX devkey dst=%04X op=%#06x in %d PDU(s)", dst, opcode, len(pdus))
-        for pdu in pdus:
-            await self._send_proxy_pdu(pdu, pdu_type=0x00)
+        async with self._tx_lock:
+            message = await self._session.build_devkey_message(dst, opcode, params)
+            for pdu in message.pdus:
+                await self._send_proxy_pdu(pdu, pdu_type=0x00)
+        _LOGGER.debug(
+            "TX devkey dst=%04X op=%#06x in %d PDU(s)", dst, opcode, len(message.pdus),
+        )
+        if message.seq_zero is None:
+            return True
+        key = (dst, message.seq_zero)
+        full = (1 << len(message.segments)) - 1
+        try:
+            for attempt in range(SAR_RETRANSMISSIONS + 1):
+                block = await self._wait_ack(key, full, SAR_ACK_TIMEOUT)
+                if block == full:
+                    return True
+                if block < 0 or attempt == SAR_RETRANSMISSIONS:
+                    return False
+                missing = [i for i in range(len(message.segments)) if not block & (1 << i)]
+                _LOGGER.debug(
+                    "TX devkey dst=%04X seq_zero=%04X: resending segments %s",
+                    dst, message.seq_zero, missing,
+                )
+                async with self._tx_lock:
+                    for index in missing:
+                        pdu = await self._session.rewrap_segment(message, index)
+                        await self._send_proxy_pdu(pdu, pdu_type=0x00)
+            return False
+        finally:
+            self._acks.pop(key, None)
+
+    async def _wait_ack(self, key: tuple[int, int], full: int, timeout: float) -> int:
+        """Latest BlockAck for ``key`` once complete, or when ``timeout`` ends."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            block = self._acks.get(key, 0)
+            remaining = deadline - loop.time()
+            if block in (full, -1) or remaining <= 0:
+                return block
+            self._ack_event.clear()
+            try:
+                await asyncio.wait_for(self._ack_event.wait(), remaining)
+            except TimeoutError:
+                return self._acks.get(key, 0)
 
     def _spawn_ack(self, dst: int, seq_zero: int, block_ack: int) -> None:
         """Acknowledge segments dst sent us, so it stops retransmitting."""
@@ -1246,8 +1344,14 @@ class MeshProxyConnection:
         if not self.is_connected:
             return
         try:
-            pdu = await self._session.build_segment_ack_pdu(dst, seq_zero, block_ack)
-            await self._send_proxy_pdu(pdu, pdu_type=0x00)
+            # Twice: a battery node listens only briefly after it sends,
+            # and a lost ack makes it repeat its message for seconds.
+            for copy in range(ACK_COPIES):
+                if copy:
+                    await asyncio.sleep(ACK_COPY_GAP)
+                async with self._tx_lock:
+                    pdu = await self._session.build_segment_ack_pdu(dst, seq_zero, block_ack)
+                    await self._send_proxy_pdu(pdu, pdu_type=0x00)
             _LOGGER.debug(
                 "TX segment ack dst=%04X seq_zero=%04X block=%08X",
                 dst, seq_zero, block_ack,
@@ -1297,8 +1401,9 @@ class MeshProxyConnection:
     async def _configure_proxy_filter(self, reject_list: bool = True) -> None:
         filter_type = 0x01 if reject_list else 0x00
         message = bytes([0x00, filter_type])  # Opcode 0x00 = Set Filter Type
-        pdu = await self._session.build_proxy_config_pdu(message)
-        await self._send_proxy_pdu(pdu, pdu_type=0x02)
+        async with self._tx_lock:
+            pdu = await self._session.build_proxy_config_pdu(message)
+            await self._send_proxy_pdu(pdu, pdu_type=0x02)
         _LOGGER.debug(
             "Proxy filter set to %s",
             "reject-empty (forward all)" if reject_list else "accept-empty",
@@ -1326,8 +1431,9 @@ class MeshProxyConnection:
             payload = bytes([0x01])
             for addr in chunk:
                 payload += struct.pack(">H", addr & 0xFFFF)
-            pdu = await self._session.build_proxy_config_pdu(payload)
-            await self._send_proxy_pdu(pdu, pdu_type=0x02)
+            async with self._tx_lock:
+                pdu = await self._session.build_proxy_config_pdu(payload)
+                await self._send_proxy_pdu(pdu, pdu_type=0x02)
         _LOGGER.debug(
             "Proxy filter: added %d addresses: %s",
             len(addresses), ", ".join(f"0x{a:04X}" for a in addresses),

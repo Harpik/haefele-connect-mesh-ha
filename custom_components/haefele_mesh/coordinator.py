@@ -158,6 +158,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             self._send_devkey,
             self._spawn_background,
         )
+        self.remote_config.register_listener(self._on_remote_config_change)
         self._remote_listeners: list[Callable[[RemoteEvent], None]] = []
         self._quick_poll_task: asyncio.Task | None = None
         # Groups whose lights a quick poll still has to read (None = all).
@@ -233,10 +234,21 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         if not self.remote_config.is_ha_only(event.remote_unicast, event.module):
             self._schedule_quick_poll(event.group_address)
 
-    async def _send_devkey(self, dst: int, opcode: int, params: bytes) -> None:
+    async def _send_devkey(self, dst: int, opcode: int, params: bytes) -> bool:
         if self.proxy is None:
             raise ConnectionError("Mesh not set up")
-        await self.proxy.send_devkey(dst, opcode, params)
+        return await self.proxy.send_devkey(dst, opcode, params)
+
+    def _on_remote_config_change(self) -> None:
+        """A position became (or stopped being) "HA only": refresh the filter."""
+        if self.proxy is None:
+            return
+        addresses = self._filter_addresses()
+        self.proxy.set_filter_addresses(addresses)
+        if HA_ONLY_ADDRESS in addresses and self.proxy.is_connected:
+            self._spawn_background(
+                self._push_filter_address(HA_ONLY_ADDRESS), "haefele-ha-only-filter",
+            )
 
     def _schedule_quick_poll(self, group: int | None) -> None:
         """Read the lights of ``group`` soon (None: every light).
@@ -777,8 +789,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         ordered: list[int] = []
         if self.session is not None:
             ordered.append(self.session.src & 0xFFFF)
-        # Presses of positions set to "Home Assistant only".
-        if self.remotes_cfg:
+        # Presses of positions set to "Home Assistant only". Only when one
+        # is: a proxy may keep just 4 addresses in its accept list.
+        if self.remote_config.uses_ha_only_address():
             ordered.append(HA_ONLY_ADDRESS)
         for addr in [*sorted(groups), *sorted(unicasts)]:
             if addr not in ordered:

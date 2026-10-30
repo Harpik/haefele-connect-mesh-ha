@@ -15,6 +15,7 @@ from typing import Any
 
 from .remote import remote_device_identifier
 from .remote_config import (
+    MODE_DISABLED,
     MODE_HA_ONLY,
     OP_MODEL_PUBLICATION_SET,
     available_modes,
@@ -32,7 +33,8 @@ STATUS_TIMEOUT = 3.0
 # again; the rest waits for the next press.
 MAX_SILENT = 2
 
-SendDevkey = Callable[[int, int, bytes], Awaitable[None]]
+# Returns False when a segmented message never got through.
+SendDevkey = Callable[[int, int, bytes], Awaitable[bool | None]]
 Spawn = Callable[[Awaitable[None], str], Any]
 
 
@@ -85,9 +87,11 @@ class RemoteConfigurator:
 
     def mode(self, remote_cfg: dict, module: int) -> str:
         stored = self._positions.get(_position_key(remote_cfg, module))
-        if stored and stored.get("mode") in self.modes(remote_cfg, module):
+        modes = self.modes(remote_cfg, module)
+        if stored and stored.get("mode") in modes:
             return stored["mode"]
-        return default_mode(self._module(remote_cfg, module))
+        default = default_mode(self._module(remote_cfg, module))
+        return default if default in modes else modes[-1]
 
     def modes(self, remote_cfg: dict, module: int) -> list[str]:
         return available_modes(self._module(remote_cfg, module))
@@ -101,8 +105,26 @@ class RemoteConfigurator:
         return bool(stored.get("error"))
 
     def is_ha_only(self, unicast: int, module: int) -> bool:
+        """True once the remote confirmed the position as "HA only".
+
+        While the change is pending (or was refused) the position may
+        still switch lights, so their state must still be read.
+        """
         remote_cfg = self._remotes.get(unicast)
-        return remote_cfg is not None and self.mode(remote_cfg, module) == MODE_HA_ONLY
+        return (
+            remote_cfg is not None
+            and self.mode(remote_cfg, module) == MODE_HA_ONLY
+            and not self.is_pending(remote_cfg, module)
+            and not self.has_error(remote_cfg, module)
+        )
+
+    def uses_ha_only_address(self) -> bool:
+        """Whether any position is (or is becoming) "HA only"."""
+        return any(
+            self.mode(remote_cfg, module) == MODE_HA_ONLY
+            for remote_cfg in self._remotes.values()
+            for module in range(len(remote_cfg.get("modules") or []))
+        )
 
     def register_listener(self, callback: Callable[[], None]) -> Callable[[], None]:
         self._listeners.append(callback)
@@ -133,6 +155,14 @@ class RemoteConfigurator:
         """Record ``mode`` for a position; it is sent on the next press."""
         if mode not in self.modes(remote_cfg, module):
             raise ValueError(f"mode {mode!r} not available for this position")
+        if mode == MODE_DISABLED and not any(
+            self.mode(remote_cfg, m) != MODE_DISABLED
+            for m in range(len(remote_cfg.get("modules") or []))
+            if m != module
+        ):
+            # Only a press on a position that sends something wakes the
+            # remote up for us; with none left it could not be changed again.
+            raise ValueError("at least one position must stay enabled")
         clients = self._module(remote_cfg, module).get("clients") or []
         self._positions[_position_key(remote_cfg, module)] = {
             "mode": mode,
@@ -203,8 +233,16 @@ class RemoteConfigurator:
         self._notify()
 
     async def _apply(self, remote_cfg: dict) -> None:
+        # A mode changed while sending is picked up in another round.
+        for _ in range(3):
+            if not await self._apply_once(remote_cfg):
+                return
+
+    async def _apply_once(self, remote_cfg: dict) -> bool:
+        """Send what is pending once; True if a mode changed meanwhile."""
         unicast = remote_cfg["unicast"]
         silent = 0
+        replaced = False
         for module in range(len(remote_cfg.get("modules") or [])):
             key = _position_key(remote_cfg, module)
             position = self._positions.get(key)
@@ -215,6 +253,9 @@ class RemoteConfigurator:
                 for c in self._module(remote_cfg, module).get("clients") or []
             }
             for element, model in list(position["pending"]):
+                if self._positions.get(key) is not position:
+                    replaced = True
+                    break
                 client = clients.get((element, model))
                 if client is None:
                     position["pending"].remove([element, model])
@@ -230,7 +271,7 @@ class RemoteConfigurator:
                         )
                         await self._save()
                         self._notify()
-                        return
+                        return False
                     continue
                 silent = 0
                 position["pending"].remove([element, model])
@@ -242,6 +283,7 @@ class RemoteConfigurator:
                     position["error"] = True
                 await self._save()
                 self._notify()
+        return replaced
 
     async def _set_publication(
         self, unicast: int, element: int, model: int, publication: dict[str, int],
@@ -250,10 +292,12 @@ class RemoteConfigurator:
         waiter: asyncio.Future = loop.create_future()
         self._waiters[(element, model)] = waiter
         try:
-            await self._send(
+            delivered = await self._send(
                 unicast, OP_MODEL_PUBLICATION_SET,
                 encode_publication_set(element, model, publication),
             )
+            if delivered is False and not waiter.done():
+                return None
             return await asyncio.wait_for(waiter, STATUS_TIMEOUT)
         except TimeoutError:
             return None

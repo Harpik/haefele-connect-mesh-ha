@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
-from custom_components.haefele_mesh.gatt import MeshSession
+import pytest
+
+from custom_components.haefele_mesh import gatt as gatt_mod
+from custom_components.haefele_mesh.gatt import MeshProxyConnection, MeshSession
 from custom_components.haefele_mesh.transport import (
     Reassembler,
     encode_segment_ack,
@@ -51,10 +55,11 @@ def test_publication_set_is_segmented_and_reassembled_with_acks():
 
     first = remote.decode_network_pdu(pdus[0])
     assert first.message is None
-    assert first.ack_to_send is not None and first.ack_to_send[2] == 0b01
+    # No partial ack: it would only make the sender retransmit sooner.
+    assert first.ack_to_send is None
     second = remote.decode_network_pdu(pdus[1])
     assert second.message == (HA, REMOTE, 0x03, params)
-    assert second.ack_to_send == (HA, first.ack_to_send[1], 0b11)
+    assert second.ack_to_send[0] == HA and second.ack_to_send[2] == 0b11
 
 
 def test_segments_out_of_order_and_repeats_after_completion():
@@ -116,3 +121,110 @@ def test_incomplete_messages_expire():
     r.add(seg, now=20)  # the first copy expired; this one starts over
     last = parse_segment(REMOTE, HA, 0x101, bytes.fromhex("80040021") + bytes(4))
     assert r.add(last, now=21)[0] is not None
+
+
+def test_config_messages_between_other_nodes_are_not_decrypted():
+    ha, remote = _pair()
+    remote.device_keys[0x7FFF] = DEV_KEY
+    pdu = asyncio.run(remote.build_devkey_pdus(0x7FFF, 0x800E, b"\x07"))[0]
+    assert ha.decode_network_pdu(pdu).message is None
+
+
+# ---------------------------------------------------------------------------
+# Sending segmented messages: retransmission of what the receiver lacks
+# ---------------------------------------------------------------------------
+
+
+def _sender(monkeypatch, deliver):
+    """A proxy connection whose writes go to ``deliver(index, pdu)``."""
+    monkeypatch.setattr(gatt_mod, "SAR_ACK_TIMEOUT", 0.05)
+    ha, remote = _pair()
+    proxy = MeshProxyConnection(hass=SimpleNamespace(), session=ha, message_handler=None)
+
+    async def connected():
+        return True
+
+    sent: list[bytes] = []
+
+    async def write(pdu, pdu_type=0x00):
+        sent.append(pdu)
+        await deliver(len(sent) - 1, pdu, remote, proxy)
+
+    proxy.ensure_connected = connected
+    proxy._send_proxy_pdu = write
+    return proxy, remote, sent
+
+
+async def _ack_from_remote(remote, proxy, seq_zero, block):
+    pdu = await remote.build_segment_ack_pdu(HA, seq_zero, block)
+    proxy._handle_network_pdu(pdu)
+
+
+@pytest.mark.parametrize("lost", [0, 1])
+def test_lost_segment_is_resent_until_acknowledged(monkeypatch, lost):
+    received = []
+    seq_zero = []
+
+    async def deliver(index, pdu, remote, proxy):
+        if index == lost:
+            return  # lost on the way
+        result = remote.decode_network_pdu(pdu)
+        if result.message is not None:
+            received.append(result.message)
+        # The remote acknowledges the segments it holds.
+        block = 0b11 if result.message is not None else 0b11 & ~(1 << lost)
+        asyncio.get_running_loop().create_task(
+            _ack_from_remote(remote, proxy, seq_zero[0], block))
+
+    proxy, _, sent = _sender(monkeypatch, deliver)
+    _record_seq_zero(proxy, seq_zero)
+    params = bytes.fromhex("2700fffe0000ff00090110")
+    assert asyncio.run(proxy.send_devkey(REMOTE, 0x03, params)) is True
+    assert len(sent) == 3  # two segments, then only the lost one again
+    assert received == [(HA, REMOTE, 0x03, params)]
+
+
+def _record_seq_zero(proxy, seq_zero, then=None):
+    original = proxy._session.build_devkey_message
+
+    async def build(*args):
+        message = await original(*args)
+        seq_zero.append(message.seq_zero)
+        if then is not None:
+            asyncio.get_running_loop().create_task(then(message))
+        return message
+
+    proxy._session.build_devkey_message = build
+
+
+def test_unacknowledged_message_is_given_up(monkeypatch):
+    async def deliver(index, pdu, remote, proxy):
+        pass  # the remote is asleep
+
+    proxy, _, sent = _sender(monkeypatch, deliver)
+    params = bytes.fromhex("2700fffe0000ff00090110")
+    assert asyncio.run(proxy.send_devkey(REMOTE, 0x03, params)) is False
+    assert len(sent) == 2 * (1 + gatt_mod.SAR_RETRANSMISSIONS)
+
+
+def test_receiver_cancelling_stops_the_retransmissions(monkeypatch):
+    async def deliver(index, pdu, remote, proxy):
+        pass
+
+    proxy, remote, sent = _sender(monkeypatch, deliver)
+
+    async def cancel(message):
+        await _ack_from_remote(remote, proxy, message.seq_zero, 0)
+
+    _record_seq_zero(proxy, [], then=cancel)
+    waits = []
+    original_wait = proxy._wait_ack
+
+    async def counted_wait(*args):
+        waits.append(args)
+        return await original_wait(*args)
+
+    proxy._wait_ack = counted_wait
+    assert asyncio.run(proxy.send_devkey(REMOTE, 0x03, bytes(11))) is False
+    assert len(sent) == 2
+    assert len(waits) == 1  # no more waiting once the receiver gave up

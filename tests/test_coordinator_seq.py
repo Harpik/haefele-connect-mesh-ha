@@ -866,9 +866,17 @@ def _configurable_remote():
     return {**_REMOTE, "device_key": "00" * 16, "modules": modules}
 
 
-def test_remote_positions_listen_on_the_ha_only_address():
+def test_ha_only_address_is_listened_to_only_when_a_position_uses_it():
     c = _coordinator(remotes=[_configurable_remote()])
     asyncio.run(_setup(c))
+    # Not taking a slot of a proxy's 4-address accept list for nothing.
+    assert 0xFEFF not in FakeProxy.instances[0].filter_addresses
+
+    async def run():
+        await c.remote_config.async_set_mode(c.remotes_cfg[0], 3, "ha_only")
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
     assert FakeProxy.instances[0].filter_addresses[:2] == [0x00C8, 0xFEFF]
 
 
