@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Häfele remotes in Home Assistant.** Each remote in the `.connect` export
+  becomes a device with an event entity per position (named after the group
+  it controls) and device triggers for the automation editor: centre button
+  on/off, ring up/down (brightness max/min), ring right/left (colder/warmer)
+  and buttons A/B/C where the app assigned a scene. The remote's
+  retransmissions are de-duplicated by TID. Existing entries need a
+  **Reconfigure** with a fresh export to pick up their remotes.
+- A remote press triggers an immediate state read of the lights, so Home
+  Assistant reflects the change in about a second instead of up to 15 s.
+- Spanish translation for the remote's events and triggers.
+
 ## [0.4.7] — 2026-10-30
 
 ### Fixed

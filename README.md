@@ -104,9 +104,23 @@ Tested end-to-end with Häfele Meshbox Tunable White spots. The integration dete
 
 RGB support uses the standard BT Mesh **Light HSL Set Unacknowledged** opcode (`0x8277`). If your RGB fixture uses a vendor-specific opcode instead, colour changes won't apply — please open an issue with a diagnostics dump and we'll add a per-model override.
 
-Remotes, sensors and wall switches are recognised and deliberately skipped: they're battery-powered, don't act as proxies, and don't expose an entity on the HA side.
+### Häfele remotes
 
-Remotes, sensors and switches are parsed but **skipped** (they don't expose writable light models).
+Each Häfele remote in the `.connect` export becomes a device with one **event entity per position** (1–6), named after the group the position controls in the Häfele app. Every press fires an event, and the remote also gets **device triggers**, so in the automation editor you can pick *Device → your remote → "Position 1: ring up pressed"*.
+
+| Control (remote v2) | Event type |
+|---|---|
+| Centre button (on / off) | `turn_on` / `turn_off` |
+| Ring up / down | `brightness_max` / `brightness_min` |
+| Ring right / left | `color_temp_cold` / `color_temp_warm` |
+| Buttons A / B / C (only where the app assigned a scene) | `scene_a` / `scene_b` / `scene_c` (with the scene number) |
+
+The remote keeps doing what the Häfele app configured; Home Assistant only listens. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing: enable them in the app (assign a group), export again and run **Reconfigure**. Their entities are created disabled until then.
+
+After pressing a button, the integration reads the lights' state right away instead of waiting for the 15 s poll.
+
+Sensors and wall switches are still skipped.
+
 
 ## How it works
 

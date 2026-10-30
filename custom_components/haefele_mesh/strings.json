@@ -39,5 +39,58 @@
       "already_configured": "Häfele Connect Mesh is already configured.",
       "reconfigure_successful": "Configuration updated."
     }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "turn_on": "{subtype}: on pressed",
+      "turn_off": "{subtype}: off pressed",
+      "brightness_max": "{subtype}: ring up pressed (brightness max)",
+      "brightness_min": "{subtype}: ring down pressed (brightness min)",
+      "color_temp_cold": "{subtype}: ring right pressed (colder)",
+      "color_temp_warm": "{subtype}: ring left pressed (warmer)",
+      "saturation_max": "{subtype}: saturation max",
+      "saturation_min": "{subtype}: saturation min",
+      "hue_max": "{subtype}: hue max",
+      "hue_min": "{subtype}: hue min",
+      "scene_a": "{subtype}: button A pressed",
+      "scene_b": "{subtype}: button B pressed",
+      "scene_c": "{subtype}: button C pressed"
+    },
+    "trigger_subtype": {
+      "position_1": "Position 1",
+      "position_2": "Position 2",
+      "position_3": "Position 3",
+      "position_4": "Position 4",
+      "position_5": "Position 5",
+      "position_6": "Position 6",
+      "position_7": "Position 7",
+      "position_8": "Position 8",
+      "position_9": "Position 9"
+    }
+  },
+  "entity": {
+    "event": {
+      "remote_module": {
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "turn_on": "On",
+              "turn_off": "Off",
+              "brightness_max": "Brightness max (ring up)",
+              "brightness_min": "Brightness min (ring down)",
+              "color_temp_cold": "Colder (ring right)",
+              "color_temp_warm": "Warmer (ring left)",
+              "saturation_max": "Saturation max",
+              "saturation_min": "Saturation min",
+              "hue_max": "Hue max",
+              "hue_min": "Hue min",
+              "scene_a": "Button A",
+              "scene_b": "Button B",
+              "scene_c": "Button C"
+            }
+          }
+        }
+      }
+    }
   }
 }

@@ -690,3 +690,58 @@ def test_filter_addresses_put_src_then_groups_then_unicasts():
     c = _coordinator()
     asyncio.run(_setup(c))
     assert FakeProxy.instances[0].filter_addresses == [0x00C8, 0xC001, 0x0017, 0x002F, 0x003A]
+
+
+# ---------------------------------------------------------------------------
+# Remote presses
+# ---------------------------------------------------------------------------
+
+_REMOTE = {
+    "name": "Remote", "uuid": "r1", "unicast": 0x0100, "elements": 24,
+    "modules": [{"index": i, "enabled": True, "name": None, "scenes": []} for i in range(6)],
+}
+
+
+def test_remote_press_reaches_listeners_once_and_polls_the_lights(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = FakeProxy()
+    events = []
+    c.register_remote_listener(events.append)
+
+    async def run():
+        # The remote's press and its retransmission (same TID).
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert [(e.module, e.event_type) for e in events] == [(1, "turn_on")]
+    # One immediate state read of every light, not one per frame.
+    assert c.proxy.calls == [("ctl", 0x0017), ("onoff", 0x002F), ("onoff", 0x003A)]
+
+
+def test_light_status_is_not_taken_for_a_remote_press():
+    c = _coordinator(remotes=[_REMOTE])
+    events = []
+    c.register_remote_listener(events.append)
+    c._dispatch_status(0x002F, 0x8204, bytes.fromhex("01"))
+    assert events == []
+    assert c._quick_poll_task is None
+
+
+def test_unsubscribed_listener_gets_nothing():
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = FakeProxy()
+    events = []
+    unsub = c.register_remote_listener(events.append)
+    unsub()
+
+    async def run():
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        for t in list(c._background_tasks):
+            t.cancel()
+
+    asyncio.run(run())
+    assert events == []

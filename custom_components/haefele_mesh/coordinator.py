@@ -38,6 +38,7 @@ from .const import (
     UNICAST_MAX,
 )
 from .gatt import MeshProxyConnection, MeshSession
+from .remote import RemoteDecoder, RemoteEvent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +65,8 @@ class SeqExhaustedError(RuntimeError):
 # (wall remotes, Häfele app) doesn't reliably publish Status to groups
 # we subscribe to, so polling is the simplest way to keep HA in sync.
 STATE_POLL_INTERVAL = 15  # seconds
+# Delay between a remote press and the state read it triggers.
+QUICK_POLL_DELAY = 0.8  # seconds
 # Small gap between the Gets we send to different nodes to avoid
 # flooding the proxy link.
 STATE_POLL_PER_NODE_GAP = 0.2
@@ -136,6 +139,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.proxy: MeshProxyConnection | None = None
         self._nodes_cfg: list[dict] = config.get("nodes", [])
         self._poll_task: asyncio.Task | None = None
+        # Presses on Häfele remotes, routed to their event entities.
+        self.remotes_cfg: list[dict] = config.get("remotes") or []
+        self._remote_decoder = RemoteDecoder(self.remotes_cfg)
+        self._remote_listeners: list[Callable[[RemoteEvent], None]] = []
+        self._quick_poll_task: asyncio.Task | None = None
         # Per-node availability (True means the mesh is reachable *and* we
         # have no reason to believe the node specifically is offline; we
         # don't currently track per-node liveness beyond "mesh is up").
@@ -161,12 +169,54 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
         return _unsub
 
+    def register_remote_listener(
+        self, callback: Callable[[RemoteEvent], None]
+    ) -> Callable[[], None]:
+        """Call ``callback`` with every de-duplicated remote press."""
+        self._remote_listeners.append(callback)
+
+        def _unsub() -> None:
+            if callback in self._remote_listeners:
+                self._remote_listeners.remove(callback)
+
+        return _unsub
+
     def _dispatch_status(self, src_address: int, opcode: int, params: bytes) -> None:
         for cb in self._status_handlers.get(src_address, ()):
             try:
                 cb(opcode, params)
             except Exception:
                 _LOGGER.exception("Status handler failed for %04X", src_address)
+        if self._remote_decoder.owns(src_address):
+            self._dispatch_remote(src_address, opcode, params)
+
+    def _dispatch_remote(self, src_address: int, opcode: int, params: bytes) -> None:
+        event = self._remote_decoder.decode(src_address, opcode, params)
+        if event is None:
+            return
+        _LOGGER.debug("Remote %04X module %d: %s %s", event.remote_unicast,
+                      event.module + 1, event.event_type, event.attributes)
+        for cb in list(self._remote_listeners):
+            try:
+                cb(event)
+            except Exception:
+                _LOGGER.exception("Remote listener failed")
+        # The press changed the lights it controls: read their state now
+        # instead of waiting for the next periodic poll.
+        self._schedule_quick_poll()
+
+    def _schedule_quick_poll(self) -> None:
+        if self._quick_poll_task is not None and not self._quick_poll_task.done():
+            return
+        self._quick_poll_task = self._spawn_background(
+            self._quick_poll(), "haefele-quick-poll",
+        )
+
+    async def _quick_poll(self) -> None:
+        # Let the lights apply the command (and the remote's retransmission
+        # arrive) before asking for their state.
+        await asyncio.sleep(QUICK_POLL_DELAY)
+        await self._poll_all_nodes()
 
     # ------------------------------------------------------------------
     # SEQ management

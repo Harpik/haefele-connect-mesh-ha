@@ -378,4 +378,63 @@ def parse_connect_file(content: str) -> dict:
         "allocated_unicast_ranges": allocated_unicast_ranges,
         "reserved_unicasts": reserved_unicasts,
         "nodes": nodes,
+        "remotes": _parse_remotes(node_list, data.get("tos_groups")),
     }
+
+
+def _parse_remotes(node_list: Any, tos_groups: Any) -> list[dict[str, Any]]:
+    """Describe every Häfele remote: name, address range and its modules.
+
+    A remote has N selectable positions ("modules", 6 on the remote v2),
+    each with the same number of consecutive elements. Each module controls
+    one group from the app; ``tos_groups`` gives that group's name.
+    """
+    group_names: dict[str, str] = {}
+    if isinstance(tos_groups, list):
+        for g in tos_groups:
+            if isinstance(g, dict) and g.get("id"):
+                group_names[str(g["id"])] = str(g.get("name") or "").strip()
+
+    remotes: list[dict[str, Any]] = []
+    for node in node_list if isinstance(node_list, list) else []:
+        if not isinstance(node, dict):
+            continue
+        tos_node = node.get("tos_node") or {}
+        node_type = tos_node.get("type", "") if isinstance(tos_node, dict) else ""
+        if not (isinstance(node_type, str) and node_type.lower().startswith("com.haefele.remote")):
+            continue
+        unicast = _parse_unicast(node.get("unicastAddress"))
+        elements = node.get("elements")
+        element_count = len(elements) if isinstance(elements, list) else 0
+        element_count = max(element_count, int(tos_node.get("elementCount") or 0))
+        if unicast == 0 or element_count == 0:
+            continue
+        tos_devices = node.get("tos_devices") or []
+        dev = tos_devices[0] if isinstance(tos_devices, list) and tos_devices else {}
+        dev = dev if isinstance(dev, dict) else {}
+        modules_raw = dev.get("modules") if isinstance(dev.get("modules"), list) else []
+        modules: list[dict[str, Any]] = []
+        for pos, mod in enumerate(modules_raw):
+            if not isinstance(mod, dict):
+                continue
+            settings = mod.get("controlSettings") or {}
+            settings = settings if isinstance(settings, dict) else {}
+            ctrl_type = settings.get("type")
+            scenes = mod.get("sceneIdList") if isinstance(mod.get("sceneIdList"), list) else []
+            modules.append({
+                "index": pos,
+                "enabled": ctrl_type not in (None, "disabled"),
+                "name": group_names.get(str(settings.get("groupId")), "") or None,
+                "scenes": [s if isinstance(s, int) else 0 for s in scenes],
+            })
+        remotes.append({
+            "name": str(dev.get("name") or "").strip() or "Remote",
+            "uuid": str(node.get("UUID") or node.get("uuid") or ""),
+            "mac": tos_node.get("proxyBleAddress") or tos_node.get("provisionerBleAddress") or "",
+            "unicast": unicast,
+            "elements": element_count,
+            "type": node_type,
+            "firmware": tos_node.get("firmwareVersion", ""),
+            "modules": modules,
+        })
+    return remotes
