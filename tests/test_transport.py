@@ -17,8 +17,8 @@ from custom_components.haefele_mesh.transport import (
     seq_auth_for,
 )
 
-NET_KEY = "00112233445566778899aabbccddeeff"
-APP_KEY = "ffeeddccbbaa99887766554433221100"
+NET_KEY_HEX = "00112233445566778899aabbccddeeff"
+APP_KEY_HEX = "ffeeddccbbaa99887766554433221100"
 DEV_KEY = bytes(range(16))
 HA, REMOTE = 0x00C8, 0x0017
 
@@ -32,8 +32,8 @@ def _pair() -> tuple[MeshSession, MeshSession]:
     async def seq(_src: int) -> int:
         return next(seqs)
 
-    ha = MeshSession(NET_KEY, APP_KEY, HA, 1, seq)
-    remote = MeshSession(NET_KEY, APP_KEY, REMOTE, 1, seq)
+    ha = MeshSession(NET_KEY_HEX, APP_KEY_HEX, HA, 1, seq)
+    remote = MeshSession(NET_KEY_HEX, APP_KEY_HEX, REMOTE, 1, seq)
     # Both ends of a device-key exchange use the remote's device key.
     ha.device_keys[REMOTE] = DEV_KEY
     remote.device_keys[HA] = DEV_KEY
