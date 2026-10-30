@@ -128,6 +128,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Network Beacons). None until _load_seq runs.
         self._persisted_iv_index: int | None = None
         self._persisted_iv_confirmed = False
+        # Set once _load_seq has read the store. Until then the in-memory
+        # state is empty, and saving it would wipe the stored SEQ counters.
+        self._seq_loaded = False
 
         self.session: MeshSession | None = None
         self.proxy: MeshProxyConnection | None = None
@@ -219,6 +222,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # unconfirmed.
         self._persisted_iv_confirmed = iv is not None and iv_confirmed
         self._persisted_active_src = active
+        self._seq_loaded = True
 
     def _store_payload(
         self,
@@ -585,7 +589,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except Exception:  # noqa: BLE001
                 pass
         # Persist the latest IV Index (beacons may have moved it since the
-        # last block write).
+        # last block write). Skipped if setup failed before the store was
+        # read: the empty in-memory state would overwrite the stored SEQ
+        # counters and the nodes would drop every frame as a replay.
+        if not self._seq_loaded:
+            return
         try:
             await self._save_seq()
         except Exception:

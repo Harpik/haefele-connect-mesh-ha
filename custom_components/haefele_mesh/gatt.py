@@ -1006,6 +1006,15 @@ class MeshProxyConnection:
                     "ahead of ours (%d)", iv_index, IV_INDEX_MAX_JUMP, current,
                 )
                 return
+            # Normal -> In Progress only on a beacon for the next IV Index
+            # (§3.10.5). Beacons can be replayed, so an old "in progress"
+            # beacon for our current IV must not send us back to IV - 1.
+            if iv_update and not session.iv_update and iv_index == current:
+                _LOGGER.debug(
+                    "Ignoring IV Update flag on beacon for current IV Index %d",
+                    iv_index,
+                )
+                return
         # An IV Index that no beacon has confirmed yet (from the export, or
         # stored by a release that trusted unauthenticated beacons) may be
         # wrong in either direction: take the authenticated one as is.

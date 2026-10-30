@@ -306,3 +306,13 @@ def test_foreign_network_beacon_is_ignored():
     pdu = bytes([0x01, 0x00]) + other + (IV_INDEX + 1).to_bytes(4, "big") + auth
     _proxy(s)._parse_secure_network_beacon(pdu)
     assert s.iv_index == IV_INDEX
+
+
+def test_replayed_in_progress_beacon_for_current_iv_is_ignored():
+    # Normal -> In Progress needs IV Index + 1 (§3.10.5); a replayed old
+    # "in progress" beacon must not make us send with IV - 1 again.
+    s = _session()
+    s.iv_confirmed = True
+    _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX, flags=0x02))
+    assert s.iv_update is False
+    assert s.tx_iv_index == IV_INDEX

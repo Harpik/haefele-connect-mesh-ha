@@ -11,7 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Proxy filter messages were never accepted by the proxy.** Proxy
   Configuration messages were encrypted with the Network nonce instead of the
   Proxy nonce (Mesh Profile §3.8.5.4), so the proxy failed their NetMIC and
-  dropped them silently. That is why no Proxy Filter Status was ever seen.
+  dropped them silently. This is the likely reason no Proxy Filter Status
+  was ever seen (not yet confirmed on real hardware).
   Only our own SRC reached the filter (the proxy adds it automatically), so
   publications from the remote and the Häfele app never reached Home
   Assistant and state changes showed up only through the 15 s poll. Incoming
@@ -34,13 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spec requires; received messages are decrypted with the current or the
   previous IV Index according to their IVI bit. Before, the new IV Index was
   used for everything at once, so during an IV Update (at least 96 h) state
-  reports from the lights could not be decrypted.
+  reports from the lights could not be decrypted. An IV Update only starts on
+  a beacon for the next IV Index, so a replayed old beacon cannot send us
+  back to the previous one.
 - **A failed setup is retried.** Errors during setup (Bluetooth, storage,
   first refresh) now raise `ConfigEntryNotReady`, so Home Assistant retries
   with backoff. Entry data whose keys are not 128-bit hex is rejected up
   front with `ConfigEntryError` and not retried. Whatever the coordinator had
   started (poll loop, proxy link) is stopped first so a retry never leaves a
-  second one running.
+  second one running; if the SEQ store could not be read, it is left
+  untouched. No proxy in range is not an error: setup completes and the
+  entities stay unavailable until a proxy connects.
 
 ### Added
 

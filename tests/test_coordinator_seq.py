@@ -663,3 +663,23 @@ def test_iv_stored_by_older_release_is_not_confirmed():
     asyncio.run(_setup(c))
     assert c.session.iv_index == 7
     assert c.session.iv_confirmed is False
+
+
+def test_shutdown_after_failed_store_load_keeps_the_store(monkeypatch):
+    # __init__ shuts the coordinator down when setup fails; if the failure
+    # was reading the store, saving the empty state would wipe the counters.
+    stored = {"200": 500000, "_iv_index": 77, "_iv_confirmed": 1}
+    FakeStore.data["haefele_mesh_seq_E1"] = dict(stored)
+    c = _entry_coordinator("E1", seq_store="per_entry")
+
+    async def broken_load():
+        raise OSError("read error")
+
+    async def run():
+        monkeypatch.setattr(c._seq_store, "async_load", broken_load)
+        with pytest.raises(OSError):
+            await c.async_setup()
+        await c.async_shutdown()
+
+    asyncio.run(run())
+    assert FakeStore.data["haefele_mesh_seq_E1"] == stored
