@@ -619,3 +619,74 @@ def test_pdu_uses_src_from_before_seq_provider_rotates():
     pdu = asyncio.run(session.build_access_network_pdu(0x0017, 0x8201, b""))
     _ctl, seq, src, _plain = session._decode_network_header(pdu)
     assert (seq, src) == (42, 0x00C8)
+
+
+# ---------------------------------------------------------------------------
+# IV Index provenance (beacon jump limit only applies to a known IV)
+# ---------------------------------------------------------------------------
+
+def test_iv_from_connect_export_is_not_confirmed():
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 1
+    assert c.session.iv_confirmed is False
+
+
+def test_saved_export_iv_stays_unconfirmed_across_restarts():
+    # The export's IV is written to the store on the first start; a restart
+    # (or a ConfigEntryNotReady retry) must not promote it to "confirmed".
+    asyncio.run(_setup(_coordinator()))
+    assert FakeStore.data[STORE_KEY]["_iv_index"] == 1
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_confirmed is False
+
+
+def test_beacon_confirmed_iv_survives_a_restart():
+    async def first_run():
+        c = _coordinator()
+        await c.async_setup()
+        c.session.iv_index = 9
+        c.session.iv_confirmed = True  # as set by an authenticated beacon
+        await c.async_shutdown()
+
+    asyncio.run(first_run())
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 9
+    assert c.session.iv_confirmed is True
+
+
+def test_iv_stored_by_older_release_is_not_confirmed():
+    FakeStore.data[STORE_KEY] = {"200": 1000, "_iv_index": 7}
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 7
+    assert c.session.iv_confirmed is False
+
+
+def test_shutdown_after_failed_store_load_keeps_the_store(monkeypatch):
+    # __init__ shuts the coordinator down when setup fails; if the failure
+    # was reading the store, saving the empty state would wipe the counters.
+    stored = {"200": 500000, "_iv_index": 77, "_iv_confirmed": 1}
+    FakeStore.data["haefele_mesh_seq_E1"] = dict(stored)
+    c = _entry_coordinator("E1", seq_store="per_entry")
+
+    async def broken_load():
+        raise OSError("read error")
+
+    async def run():
+        monkeypatch.setattr(c._seq_store, "async_load", broken_load)
+        with pytest.raises(OSError):
+            await c.async_setup()
+        await c.async_shutdown()
+
+    asyncio.run(run())
+    assert FakeStore.data["haefele_mesh_seq_E1"] == stored
+
+
+def test_filter_addresses_put_src_then_groups_then_unicasts():
+    # A proxy that falls back to a small accept list keeps the first ones.
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert FakeProxy.instances[0].filter_addresses == [0x00C8, 0xC001, 0x0017, 0x002F, 0x003A]

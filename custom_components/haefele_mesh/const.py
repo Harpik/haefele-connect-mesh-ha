@@ -21,6 +21,15 @@ HEARTBEAT_INTERVAL = 60  # seconds
 
 # Mesh crypto
 IV_INDEX_DEFAULT = 1
+# Mesh Profile 1.0 §3.10.5: a known IV Index may move forward by at most 42.
+IV_INDEX_MAX_JUMP = 42
+# Mesh Profile 1.0 §3.4.4 (Network PDU format): max addresses in one Proxy "Add Addresses to
+# Filter" message (29-byte Network PDU, 64-bit NetMIC for CTL=1).
+PROXY_FILTER_MAX_ADDRESSES = 5
+# Seconds to wait for the Filter Status that confirms a Set Filter Type.
+FILTER_STATUS_TIMEOUT = 2.0
+FILTER_MODE_FORWARD_ALL = "forward_all"
+FILTER_MODE_ACCEPT_LIST = "accept_list"
 # Base address used for our BT Mesh SRC.
 #
 # Must NOT collide with SRCs used by any previous provisioner/gateway for the

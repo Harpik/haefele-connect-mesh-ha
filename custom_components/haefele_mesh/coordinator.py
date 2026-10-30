@@ -46,6 +46,10 @@ SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
 SEQ_STARTUP_JUMP = 200
 # Reserved keys inside the SEQ store (everything else is "<src>": seq).
 STORE_KEY_IV_INDEX = "_iv_index"
+# 1 once the stored IV Index was confirmed by an authenticated beacon. The IV
+# Index itself is saved from the first start, so its presence alone says
+# nothing about where it came from.
+STORE_KEY_IV_CONFIRMED = "_iv_confirmed"
 STORE_KEY_ACTIVE_SRC = "_active_src"
 
 
@@ -123,6 +127,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Persisted IV Index from last session (auto-updated by Secure
         # Network Beacons). None until _load_seq runs.
         self._persisted_iv_index: int | None = None
+        self._persisted_iv_confirmed = False
+        # Set once _load_seq has read the store. Until then the in-memory
+        # state is empty, and saving it would wipe the stored SEQ counters.
+        self._seq_loaded = False
 
         self.session: MeshSession | None = None
         self.proxy: MeshProxyConnection | None = None
@@ -178,9 +186,13 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 _LOGGER.info("Migrating SEQ state from the shared store")
         state: dict[int, int] = {}
         iv: int | None = None
+        iv_confirmed = False
         active: int | None = None
         if isinstance(raw, dict):
             for k, v in raw.items():
+                if k == STORE_KEY_IV_CONFIRMED:
+                    iv_confirmed = v is True or v == 1
+                    continue
                 if k == STORE_KEY_IV_INDEX:
                     try:
                         iv = int(v)
@@ -205,7 +217,12 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._seq_state = state
         self._seq_reserved = dict(state)
         self._persisted_iv_index = iv
+        # Stores from 0.4.6 and earlier have no flag: their IV may have come
+        # from the export or an unauthenticated beacon, so treat it as
+        # unconfirmed.
+        self._persisted_iv_confirmed = iv is not None and iv_confirmed
         self._persisted_active_src = active
+        self._seq_loaded = True
 
     def _store_payload(
         self,
@@ -221,8 +238,14 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         payload: dict[str, int] = {str(k): v for k, v in reserved.items()}
         if self.session is not None:
             payload[STORE_KEY_IV_INDEX] = int(self.session.iv_index)
+            iv_confirmed = bool(getattr(self.session, "iv_confirmed", False))
         elif self._persisted_iv_index is not None:
             payload[STORE_KEY_IV_INDEX] = int(self._persisted_iv_index)
+            iv_confirmed = self._persisted_iv_confirmed
+        else:
+            iv_confirmed = False
+        if iv_confirmed:
+            payload[STORE_KEY_IV_CONFIRMED] = 1
         if active_src is not None:
             payload[STORE_KEY_ACTIVE_SRC] = active_src
         return payload
@@ -508,6 +531,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             iv_index=iv_index,
             seq_provider=self.next_seq,
         )
+        # Only an IV Index that an authenticated beacon confirmed counts as
+        # known; one from the export can still be corrected by a big jump.
+        self.session.iv_confirmed = self._persisted_iv_confirmed
         # Rotate *before* the proxy exists if the stored SEQ is already past
         # the threshold (e.g. first start after upgrading), so the filter
         # list computed below already carries the fresh SRC.
@@ -563,7 +589,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except Exception:  # noqa: BLE001
                 pass
         # Persist the latest IV Index (beacons may have moved it since the
-        # last block write).
+        # last block write). Skipped if setup failed before the store was
+        # read: the empty in-memory state would overwrite the stored SEQ
+        # counters and the nodes would drop every frame as a replay.
+        if not self._seq_loaded:
+            return
         try:
             await self._save_seq()
         except Exception:
@@ -612,18 +642,27 @@ class HaefeleCoordinator(DataUpdateCoordinator):
           * every lamp unicast (replies overheard via relay)
           * every group configured on the lamps (so publications from
             the physical remote or the Häfele app come through)
+
+        Ordered by priority, because a proxy may keep only the first few
+        when it falls back to an accept list: our SRC, then groups, then
+        lamp unicasts (replies to our SRC already reach us).
         """
-        addrs: set[int] = set()
-        if self.session is not None:
-            addrs.add(self.session.src & 0xFFFF)
+        groups: set[int] = set()
+        unicasts: set[int] = set()
         for n in self._nodes_cfg:
             unicast = n.get("unicast")
             if isinstance(unicast, int):
-                addrs.add(unicast & 0xFFFF)
+                unicasts.add(unicast & 0xFFFF)
             for g in n.get("groups", []) or []:
                 if isinstance(g, int):
-                    addrs.add(g & 0xFFFF)
-        return sorted(addrs)
+                    groups.add(g & 0xFFFF)
+        ordered: list[int] = []
+        if self.session is not None:
+            ordered.append(self.session.src & 0xFFFF)
+        for addr in [*sorted(groups), *sorted(unicasts)]:
+            if addr not in ordered:
+                ordered.append(addr)
+        return ordered
 
     def is_available(self, node_id: str) -> bool:
         return self.availability.get(node_id, False)

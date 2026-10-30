@@ -44,6 +44,25 @@ def s1(m: bytes) -> bytes:
     return aes_cmac(b"\x00" * 16, m)
 
 
+def k1(n: bytes, salt: bytes, p: bytes) -> bytes:
+    """Mesh Profile spec 3.8.2.5: k1(N, SALT, P) = AES-CMAC_T(P), T = AES-CMAC_SALT(N)."""
+    t = aes_cmac(salt, n)
+    return aes_cmac(t, p)
+
+
+def beacon_key(net_key: bytes) -> bytes:
+    """Mesh Profile spec 3.8.6.3.4: BeaconKey = k1(NetKey, s1("nkbk"), "id128" || 0x01)."""
+    return k1(net_key, s1(b"nkbk"), b"id128\x01")
+
+
+def secure_beacon_auth(
+    key: bytes, flags: int, network_id: bytes, iv_index: int,
+) -> bytes:
+    """Mesh Profile spec 3.9.3.1: 8-byte Authentication Value of a Secure Network Beacon."""
+    msg = bytes([flags & 0xFF]) + network_id + iv_index.to_bytes(4, "big")
+    return aes_cmac(key, msg)[:8]
+
+
 def k2(n: bytes, p: bytes) -> tuple[int, bytes, bytes]:
     """Mesh Profile spec 3.8.2.6: derive (NID, EncryptionKey, PrivacyKey) from a NetKey."""
     salt = s1(b"smk2")

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 
 from .const import DOMAIN, LEGACY_SRC_ADDRESSES, SRC_ADDRESS_BASE
 from .coordinator import HaefeleCoordinator
@@ -47,20 +50,49 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Häfele Connect Mesh from a config entry."""
+    # Bad entry data cannot fix itself: fail for good instead of retrying.
+    problem = _entry_data_problem(entry.data)
+    if problem is not None:
+        raise ConfigEntryError(f"Invalid Häfele Mesh configuration: {problem}")
+
     coordinator = HaefeleCoordinator(hass, dict(entry.data), entry_id=entry.entry_id)
 
+    # Anything else that fails during setup (Bluetooth, storage, the first
+    # refresh) raises ConfigEntryNotReady so Home Assistant retries it with
+    # backoff. Whatever the coordinator already started (poll loop, proxy
+    # link) is torn down first; otherwise every retry would leave one running.
     try:
         await coordinator.async_setup()
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.error("Failed to set up Häfele Mesh coordinator: %s", err)
-        return False
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        await coordinator.async_shutdown()
+        if isinstance(err, (ConfigEntryNotReady, ConfigEntryError)):
+            raise
+        _LOGGER.debug("Häfele Mesh setup failed, will retry", exc_info=True)
+        raise ConfigEntryNotReady(
+            f"Failed to set up Häfele Mesh coordinator: {err}"
+        ) from err
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-
-    await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
+
+def _entry_data_problem(data: Mapping[str, Any]) -> str | None:
+    """Describe what is wrong with the stored entry data, or None if usable."""
+    for key in ("network_key", "app_key"):
+        # Same parsing as MeshSession, plus the 128-bit length mesh keys have.
+        value = data.get(key)
+        try:
+            valid = isinstance(value, str) and len(bytes.fromhex(value)) == 16
+        except ValueError:
+            valid = False
+        if not valid:
+            return f"{key} is missing or not a 128-bit hex key"
+    if not isinstance(data.get("nodes", []), list):
+        return "nodes is not a list"
+    return None
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

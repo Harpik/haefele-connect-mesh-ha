@@ -6,8 +6,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Proxy filter messages were never accepted by the proxy.** Proxy
+  Configuration messages were encrypted with the Network nonce instead of the
+  Proxy nonce (Mesh Profile §3.8.5.4), so the proxy failed their NetMIC and
+  dropped them silently, and no Proxy Filter Status was ever seen. Confirmed
+  on hardware: with the Proxy nonce a Häfele proxy answers every one.
+  Only our own SRC reached the filter (the proxy adds it automatically), so
+  publications from the remote and the Häfele app never reached Home
+  Assistant and state changes showed up only through the 15 s poll. Incoming
+  Proxy Configuration messages are now decrypted with the Proxy nonce too.
+- **The proxy now forwards all mesh traffic.** Häfele proxies keep at most
+  4 addresses in their filter list (seen on hardware), too few for every
+  group the remote publishes to. The filter is now set to an empty reject
+  list, which forwards everything; if a proxy does not confirm that, an
+  accept list is used as before, with our SRC first, then groups, then
+  lamps. Address lists are sent in messages of at most 5 addresses: one "Add
+  Addresses to Filter" message is a single 29-byte Network PDU. Waiting for
+  that confirmation adds up to 2 s to a connect when the proxy stays silent.
+  Diagnostics show the mode in use as `filter_mode` (`forward_all` or
+  `accept_list`).
+- **Secure Network Beacons are authenticated before their IV Index is used.**
+  The Network ID and IV Index travel in clear, so anyone in BLE range could
+  forge a beacon and move our IV Index, making the lights drop every frame we
+  send. Beacons are now checked against the BeaconKey. Once a beacon has
+  confirmed the IV Index it never moves backwards and moves forward by at
+  most 42 (Mesh Profile §3.10.5; the 96 h / 192 h timing limits are not
+  enforced). An IV Index that only comes from the `.connect` export, or from
+  a store written by 0.4.6 or earlier, is not treated as known: the first
+  authenticated beacon replaces it, up or down. The store records whether a
+  beacon confirmed it.
+- **IV Update procedure handled.** While a beacon announces an IV Update
+  in progress, messages are still sent with the previous IV Index, as the
+  spec requires; received messages are decrypted with the current or the
+  previous IV Index according to their IVI bit. Before, the new IV Index was
+  used for everything at once, so during an IV Update (at least 96 h) state
+  reports from the lights could not be decrypted. An IV Update only starts on
+  a beacon for the next IV Index, so a replayed old beacon cannot send us
+  back to the previous one.
+- **A failed setup is retried.** Errors during setup (Bluetooth, storage,
+  first refresh) now raise `ConfigEntryNotReady`, so Home Assistant retries
+  with backoff. Entry data whose keys are not 128-bit hex is rejected up
+  front with `ConfigEntryError` and not retried. Whatever the coordinator had
+  started (poll loop, proxy link) is stopped first so a retry never leaves a
+  second one running; if the SEQ store could not be read, it is left
+  untouched. No proxy in range is not an error: setup completes and the
+  entities stay unavailable until a proxy connects.
+
 ### Added
 
+- Diagnostics show the last Proxy Filter Status (`last_filter_status`),
+  whether the IV Index was confirmed by a beacon (`iv_confirmed_by_beacon`)
+  and whether an IV Update is in progress (`iv_update_in_progress`).
 - PayPal donation link: a GitHub **Sponsor** button (`.github/FUNDING.yml`)
   and a badge plus "Support the project" section in the README. Docs only.
 
