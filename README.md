@@ -104,9 +104,41 @@ Tested end-to-end with Häfele Meshbox Tunable White spots. The integration dete
 
 RGB support uses the standard BT Mesh **Light HSL Set Unacknowledged** opcode (`0x8277`). If your RGB fixture uses a vendor-specific opcode instead, colour changes won't apply — please open an issue with a diagnostics dump and we'll add a per-model override.
 
-Remotes, sensors and wall switches are recognised and deliberately skipped: they're battery-powered, don't act as proxies, and don't expose an entity on the HA side.
+### Häfele remotes
 
-Remotes, sensors and switches are parsed but **skipped** (they don't expose writable light models).
+Each Häfele remote in the `.connect` export becomes a device with one **event entity per position** (1–6), named after the group the position controls in the Häfele app. Every press fires an event, and the remote also gets **device triggers**, so in the automation editor you can pick *Device → your remote → "Position 1: ring up pressed"*.
+
+| Control (remote v2) | Event type |
+|---|---|
+| Centre button, short / long press | `turn_on` / `turn_off` |
+| Ring up / down | `brightness_max` / `brightness_min` |
+| Ring right / left | `color_temp_cold` / `color_temp_warm` |
+| Buttons A / B / C (only where the app assigned a scene) | `scene_a` / `scene_b` / `scene_c` (with the scene number) |
+
+Unless you change a position's mode (below), the remote keeps doing what the Häfele app configured. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing: their entities exist but never fire until you enable the position in the app (assign a group), export again and run **Reconfigure**. Device triggers work even if you disable a position's entity. If a remote disappears from the export (for example after re-pairing it in the app, which gives it a new identity), delete its old device from the device page.
+
+#### Setting what a position does
+
+Each position also gets a **mode** select (in the remote's device page, under *Configuration*):
+
+| Mode | What the position does |
+|---|---|
+| **Häfele app** | What the app configured (only offered where the app linked the position). |
+| **Home Assistant only** | Every control publishes to an address no light listens to (`0xFEFF`). Nothing reacts by itself; the presses still reach Home Assistant, so you decide in automations what each button does. |
+| **Disabled** | The position sends nothing. |
+
+The remote runs on batteries and sleeps between presses, so a change is **pending** (attribute `pending: true`, hourglass icon) until you press a button on the remote, on any position that is not disabled (a disabled position sends nothing, so Home Assistant can't tell the remote is awake). The remote stays awake a few seconds after the last press; Home Assistant sends the change in that time and keeps it pending, control by control, until the remote confirms it. If it is still pending, press again: several presses in a row keep the remote awake, so a whole position usually takes 3 to 6 presses. The last position that is not disabled can't be disabled from Home Assistant, or no press could ever reach the remote again. The remote's device key is needed for this: entries created before this feature need one **Reconfigure** with the export, after which the selects appear.
+
+The Häfele app does not know about these changes: it keeps showing a position set to *Home Assistant only* as disabled, and editing the remote in the app may overwrite them. Set the mode again from Home Assistant if that happens.
+
+The ring's left and right sides send the same message whether the app sets them to colour temperature or to colour (only the target group changes), so the *ring left* / *ring right* triggers fire in both modes. The event type is reported as `color_temp_warm` / `color_temp_cold` in either case.
+
+After a press, the integration reads the state of the lights in the pressed position's group right away (about a second, plus 0.2 s per light), instead of waiting for the 15 s poll. These reads never overlap the regular poll.
+
+Tests for this part run against the real Home Assistant package in `tests_ha/` (CI job `test-ha`).
+
+Sensors and wall switches are still skipped.
+
 
 ## How it works
 

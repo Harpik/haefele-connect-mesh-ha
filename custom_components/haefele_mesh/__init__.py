@@ -9,13 +9,20 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 
 from .const import DOMAIN, LEGACY_SRC_ADDRESSES, SRC_ADDRESS_BASE
 from .coordinator import HaefeleCoordinator
+from .remote import (
+    REMOTE_BUS_EVENT,
+    RemoteEvent,
+    bus_event_data,
+    remote_device_identifier,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = ["light"]
+PLATFORMS = ["light", "event", "select"]
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -74,9 +81,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from err
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.async_on_unload(
+        coordinator.register_remote_listener(_remote_bus_forwarder(hass, coordinator))
+    )
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True
+
+
+def _remote_bus_forwarder(hass: HomeAssistant, coordinator: HaefeleCoordinator):
+    """Fire every remote press on the bus for device triggers.
+
+    Done here rather than in the event entity so triggers keep working
+    when the user disables a position's entity.
+    """
+
+    def _forward(event: RemoteEvent) -> None:
+        remote = next(
+            (r for r in coordinator.remotes_cfg if r.get("unicast") == event.remote_unicast),
+            None,
+        )
+        if remote is None:
+            return
+        device = dr.async_get(hass).async_get_device(
+            identifiers={remote_device_identifier(remote)},
+        )
+        if device is not None:
+            hass.bus.async_fire(REMOTE_BUS_EVENT, bus_event_data(device.id, event))
+
+    return _forward
 
 
 def _entry_data_problem(data: Mapping[str, Any]) -> str | None:
@@ -93,6 +126,24 @@ def _entry_data_problem(data: Mapping[str, Any]) -> str | None:
     if not isinstance(data.get("nodes", []), list):
         return "nodes is not a list"
     return None
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device: dr.DeviceEntry,
+) -> bool:
+    """Allow deleting a remote that is no longer in the export.
+
+    A remote reset and re-paired in the Häfele app gets a new UUID, so after
+    a Reconfigure its old device would otherwise stay forever.
+    """
+    ours = {i for i in device.identifiers if i[0] == DOMAIN}
+    if not ours or not all(i[1].startswith("remote_") for i in ours):
+        return False
+    coordinator: HaefeleCoordinator | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:
+        return False
+    current = {remote_device_identifier(r) for r in coordinator.remotes_cfg}
+    return not ours & current
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

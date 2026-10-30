@@ -127,11 +127,17 @@ class FakeProxy:
     async def add_filter_addresses(self, addresses):
         self.pushed_filters.append(list(addresses))
 
+    async def refresh_filter(self):
+        self.calls.append(("refresh_filter", list(self.filter_addresses)))
+
     async def get_onoff(self, dst):
         self.calls.append(("onoff", dst))
 
     async def get_ctl(self, dst):
         self.calls.append(("ctl", dst))
+
+    async def send_devkey(self, dst, opcode, params):
+        self.calls.append(("devkey", dst, opcode, params))
 
 
 @pytest.fixture(autouse=True)
@@ -690,3 +696,253 @@ def test_filter_addresses_put_src_then_groups_then_unicasts():
     c = _coordinator()
     asyncio.run(_setup(c))
     assert FakeProxy.instances[0].filter_addresses == [0x00C8, 0xC001, 0x0017, 0x002F, 0x003A]
+
+
+# ---------------------------------------------------------------------------
+# Remote presses
+# ---------------------------------------------------------------------------
+
+_REMOTE = {
+    "name": "Remote", "uuid": "r1", "unicast": 0x0100, "elements": 24,
+    "modules": [{"index": i, "enabled": True, "name": None, "scenes": []} for i in range(6)],
+}
+
+
+def _connected_proxy() -> FakeProxy:
+    proxy = FakeProxy()
+    proxy.is_connected = True
+    return proxy
+
+
+def test_remote_press_reaches_listeners_once_and_polls_the_lights(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = _connected_proxy()
+    events = []
+    c.register_remote_listener(events.append)
+
+    async def run():
+        # The remote's press and its retransmission (same TID).
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert [(e.module, e.event_type) for e in events] == [(1, "turn_on")]
+    # One immediate state read of every light, not one per frame.
+    assert c.proxy.calls == [("ctl", 0x0017), ("onoff", 0x002F), ("onoff", 0x003A)]
+
+
+def test_light_status_is_not_taken_for_a_remote_press():
+    c = _coordinator(remotes=[_REMOTE])
+    events = []
+    c.register_remote_listener(events.append)
+    c._dispatch_status(0x002F, 0x8204, bytes.fromhex("01"))
+    assert events == []
+    assert c._quick_poll_task is None
+
+
+def test_unsubscribed_listener_gets_nothing():
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = _connected_proxy()
+    events = []
+    unsub = c.register_remote_listener(events.append)
+    unsub()
+
+    async def run():
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        for t in list(c._background_tasks):
+            t.cancel()
+
+    asyncio.run(run())
+    assert events == []
+
+
+def _remote_with_group(group):
+    modules = [{"index": i, "enabled": True, "name": None, "scenes": [],
+                "group_address": group if i == 0 else None} for i in range(6)]
+    return {**_REMOTE, "modules": modules}
+
+
+def test_quick_poll_reads_only_the_lights_of_the_pressed_group(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_remote_with_group(0xC001)])
+    c.proxy = _connected_proxy()
+
+    async def run():
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == [("ctl", 0x0017)]  # only the light in group C001
+
+
+def test_press_during_a_quick_poll_is_read_in_another_pass(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_remote_with_group(0xC001)])
+    c.proxy = _connected_proxy()
+    original = c.proxy.get_ctl
+
+    async def get_ctl_and_press_again(dst):
+        await original(dst)
+        if len(c.proxy.calls) == 1:  # a second press while the first poll runs
+            c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0002"))
+
+    c.proxy.get_ctl = get_ctl_and_press_again
+
+    async def run():
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == [("ctl", 0x0017), ("ctl", 0x0017)]
+
+
+def test_quick_poll_waits_for_a_running_periodic_poll(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_remote_with_group(0xC001)])
+    c.proxy = _connected_proxy()
+
+    async def run():
+        await c._poll_lock.acquire()  # a periodic poll is in progress
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert c.proxy.calls == []
+        c._poll_lock.release()
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == [("ctl", 0x0017)]
+
+
+def test_press_during_shutdown_starts_no_poll(monkeypatch):
+    # Frames keep arriving until the proxy is disconnected. A quick poll
+    # started then would outlive shutdown and reconnect the proxy.
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = _connected_proxy()
+
+    async def press_while_disconnecting():
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        await asyncio.sleep(0)
+
+    c.proxy.disconnect = press_while_disconnecting
+
+    async def run():
+        await c.async_shutdown()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert c._quick_poll_task is None
+    assert not c._background_tasks
+    assert c.proxy.calls == []
+
+
+def test_quick_poll_sends_nothing_while_the_link_is_down(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = FakeProxy()  # not connected
+
+    async def run():
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Remote position modes
+# ---------------------------------------------------------------------------
+
+def _configurable_remote():
+    clients = [{"element": 0x010C, "model": 0x1001, "publish": None}]
+    modules = [{"index": i, "enabled": i == 0, "name": None, "scenes": [],
+                "group_address": 0xC001 if i == 0 else None,
+                "clients": clients if i == 3 else []} for i in range(6)]
+    return {**_REMOTE, "device_key": "00" * 16, "modules": modules}
+
+
+def test_ha_only_address_is_listened_to_only_when_a_position_uses_it():
+    c = _coordinator(remotes=[_configurable_remote()])
+    asyncio.run(_setup(c))
+    # Not taking a slot of a proxy's 4-address accept list for nothing.
+    assert 0xFEFF not in FakeProxy.instances[0].filter_addresses
+
+    async def run():
+        await c.remote_config.async_set_mode(c.remotes_cfg[0], 3, "ha_only")
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert FakeProxy.instances[0].filter_addresses[:2] == [0x00C8, 0xFEFF]
+
+
+def test_live_filter_is_rebuilt_only_when_ha_only_starts_or_stops():
+    c = _coordinator(remotes=[_configurable_remote()])
+    c.proxy = _connected_proxy()
+    remote = c.remotes_cfg[0]
+
+    async def run():
+        await c.remote_config.async_set_mode(remote, 3, "ha_only")
+        # Every confirmed Set notifies again: no new filter traffic.
+        for _ in range(8):
+            c._on_remote_config_change()
+        await asyncio.gather(*c._background_tasks)
+        # Back off "HA only" (the only position this remote can configure).
+        c.remote_config._positions["remote_r1:3"] = {"mode": "disabled", "pending": []}
+        c._on_remote_config_change()
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    refreshes = [call[1] for call in c.proxy.calls if call[0] == "refresh_filter"]
+    # The whole list each time, so an accept list that is full already
+    # takes 0xFEFF in priority order, and drops it again afterwards.
+    assert len(refreshes) == 2
+    assert refreshes[0][:2] == [0xFEFF, 0xC001]  # no session: no SRC first
+    assert 0xFEFF not in refreshes[1]
+    assert c.proxy.pushed_filters == []
+
+
+def test_press_sends_pending_configuration_and_status_confirms_it():
+    c = _coordinator(remotes=[_configurable_remote()])
+    c.proxy = _connected_proxy()
+    remote = c.remotes_cfg[0]
+
+    async def run():
+        await c.remote_config.async_set_mode(remote, 3, "ha_only")
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0105"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        sent = [call for call in c.proxy.calls if call[0] == "devkey"]
+        assert len(sent) == 1 and sent[0][1:3] == (0x0100, 0x03)
+        # The remote's answer comes from its primary element and is no press.
+        events = []
+        c.register_remote_listener(events.append)
+        c._dispatch_status(0x0100, 0x8019, bytes([0]) + sent[0][3])
+        await asyncio.gather(*c._background_tasks)
+        assert events == []
+
+    asyncio.run(run())
+    assert not c.remote_config.is_pending(remote, 3)
+
+
+def test_press_on_a_ha_only_position_reads_no_light(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    c = _coordinator(remotes=[_configurable_remote()])
+    c.proxy = _connected_proxy()
+    remote = c.remotes_cfg[0]
+    c.remote_config._positions["remote_r1:3"] = {"mode": "ha_only", "pending": []}
+
+    async def run():
+        c._dispatch_status(0x010C, 0x8203, bytes.fromhex("0106"))  # position 4
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == []
+    assert c.remote_config.mode(remote, 3) == "ha_only"

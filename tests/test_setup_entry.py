@@ -35,7 +35,13 @@ class _FakeCoordinator:
 
     def __init__(self, hass, data, entry_id):
         self.shutdown_calls = 0
+        self.remotes_cfg = []
+        self.remote_listeners = []
         _FakeCoordinator.instances.append(self)
+
+    def register_remote_listener(self, callback):
+        self.remote_listeners.append(callback)
+        return lambda: self.remote_listeners.remove(callback)
 
     async def async_setup(self):
         if _FakeCoordinator.fail_setup is not None:
@@ -97,8 +103,10 @@ def _hass_and_entry(data: dict | None = None):
         data={},
         config_entries=types.SimpleNamespace(async_forward_entry_setups=_forward),
     )
+    unloads: list = []
     entry = types.SimpleNamespace(
         entry_id="abc", data=VALID_DATA if data is None else data,
+        async_on_unload=unloads.append, unloads=unloads,
     )
     return hass, entry, forwarded
 
@@ -131,7 +139,13 @@ def test_successful_setup_registers_and_forwards(integration):
     (coordinator,) = _FakeCoordinator.instances
     assert coordinator.shutdown_calls == 0
     assert hass.data[integration.DOMAIN]["abc"] is coordinator
-    assert forwarded == [(entry, ("light",))]
+    assert forwarded == [(entry, ("light", "event", "select"))]
+    # Remote presses are forwarded to the bus for device triggers, and the
+    # listener is removed when the entry unloads.
+    assert len(coordinator.remote_listeners) == 1
+    (unsub,) = entry.unloads
+    unsub()
+    assert coordinator.remote_listeners == []
 
 
 @pytest.mark.parametrize(

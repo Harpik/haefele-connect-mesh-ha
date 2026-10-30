@@ -21,6 +21,18 @@ jobs:
       - run: pip install -r requirements_test.txt
       - run: pytest -v tests/
 
+  # The HA-facing code (event entity, device triggers, bus forwarder)
+  # against the real Home Assistant package, which tests/ stubs out.
+  test-ha:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - run: pip install homeassistant bleak-retry-connector pytest
+      - run: pytest -v tests_ha/
+
   ruff:
     runs-on: ubuntu-latest
     steps:

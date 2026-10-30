@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Häfele remotes in Home Assistant.** Each remote in the `.connect` export
+  becomes a device with an event entity per position (named after the group
+  it controls) and device triggers for the automation editor: centre button
+  on/off, ring up/down (brightness max/min), ring right/left (colder/warmer)
+  and buttons A/B/C where the app assigned a scene. The remote's
+  retransmissions are de-duplicated by TID. Existing entries need a
+  **Reconfigure** with a fresh export to pick up their remotes.
+- **Remote positions configurable from Home Assistant.** A mode select per
+  position: *Häfele app* (what the app configured), *Home Assistant only*
+  (the position controls no light and only drives automations) or
+  *Disabled*. The remote sleeps between presses, so a change is sent on the
+  next press and stays pending until the remote confirms each control. Needs
+  the remote's device key: existing entries need one Reconfigure.
+- Bluetooth Mesh segmented messages: sending them, reassembling the ones
+  addressed to us and acknowledging their segments, and Configuration
+  messages encrypted with a node's device key.
+- A remote press triggers an immediate state read of the lights in the
+  pressed position's group, so Home Assistant reflects the change in about a
+  second (plus 0.2 s per light) instead of up to 15 s. It never overlaps the
+  regular poll, and presses during a read are queued, not dropped.
+- Device triggers keep working when a position's entity is disabled. Every
+  position gets an enabled entity, including positions disabled in the app
+  (they simply never fire until you enable them there and re-import).
+- A remote that is no longer in the export (for example re-paired in the
+  app) can be deleted from its device page.
+- English and Spanish names for the remote's entities, events and triggers
+  (translated entity names need Home Assistant 2024.2 or newer).
+- `tests_ha/`: tests of the event entity, device triggers and bus forwarder
+  against the real Home Assistant package, run by a new `test-ha` CI job.
+
 ## [0.4.7] — 2026-10-30
 
 ### Fixed

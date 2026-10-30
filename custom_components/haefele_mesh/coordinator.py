@@ -38,11 +38,16 @@ from .const import (
     UNICAST_MAX,
 )
 from .gatt import MeshProxyConnection, MeshSession
+from .remote import RemoteDecoder, RemoteEvent
+from .remote_config import HA_ONLY_ADDRESS, OP_MODEL_PUBLICATION_STATUS
+from .remote_configurator import RemoteConfigurator
 
 _LOGGER = logging.getLogger(__name__)
 
 SEQ_STORAGE_VERSION = 1
 SEQ_STORAGE_KEY = f"{DOMAIN}_seq"
+REMOTE_STORAGE_VERSION = 1
+REMOTE_STORAGE_KEY = f"{DOMAIN}_remote_positions"
 SEQ_STARTUP_JUMP = 200
 # Reserved keys inside the SEQ store (everything else is "<src>": seq).
 STORE_KEY_IV_INDEX = "_iv_index"
@@ -64,6 +69,8 @@ class SeqExhaustedError(RuntimeError):
 # (wall remotes, Häfele app) doesn't reliably publish Status to groups
 # we subscribe to, so polling is the simplest way to keep HA in sync.
 STATE_POLL_INTERVAL = 15  # seconds
+# Delay between a remote press and the state read it triggers.
+QUICK_POLL_DELAY = 0.8  # seconds
 # Small gap between the Gets we send to different nodes to avoid
 # flooding the proxy link.
 STATE_POLL_PER_NODE_GAP = 0.2
@@ -124,6 +131,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Fire-and-forget tasks we own; kept referenced (the event loop only
         # holds weak references) and cancelled on shutdown.
         self._background_tasks: set[asyncio.Task] = set()
+        # Set when shutdown starts; no new background work after that.
+        self._closing = False
         # Persisted IV Index from last session (auto-updated by Secure
         # Network Beacons). None until _load_seq runs.
         self._persisted_iv_index: int | None = None
@@ -136,6 +145,28 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.proxy: MeshProxyConnection | None = None
         self._nodes_cfg: list[dict] = config.get("nodes", [])
         self._poll_task: asyncio.Task | None = None
+        # Presses on Häfele remotes, routed to their event entities.
+        self.remotes_cfg: list[dict] = config.get("remotes") or []
+        self._remote_decoder = RemoteDecoder(self.remotes_cfg)
+        # Modes of remote positions set from Home Assistant.
+        self.remote_config = RemoteConfigurator(
+            self.remotes_cfg,
+            Store(
+                hass, REMOTE_STORAGE_VERSION,
+                f"{REMOTE_STORAGE_KEY}_{entry_id}" if entry_id else REMOTE_STORAGE_KEY,
+            ),
+            self._send_devkey,
+            self._spawn_background,
+        )
+        self.remote_config.register_listener(self._on_remote_config_change)
+        # Whether 0xFEFF is in the filter list we keep for the proxy.
+        self._ha_only_filtered = False
+        self._remote_listeners: list[Callable[[RemoteEvent], None]] = []
+        self._quick_poll_task: asyncio.Task | None = None
+        # Groups whose lights a quick poll still has to read (None = all).
+        self._quick_poll_groups: set[int | None] = set()
+        # One poll at a time on the shared proxy link, periodic or quick.
+        self._poll_lock = asyncio.Lock()
         # Per-node availability (True means the mesh is reachable *and* we
         # have no reason to believe the node specifically is offline; we
         # don't currently track per-node liveness beyond "mesh is up").
@@ -161,12 +192,113 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
         return _unsub
 
+    def register_remote_listener(
+        self, callback: Callable[[RemoteEvent], None]
+    ) -> Callable[[], None]:
+        """Call ``callback`` with every de-duplicated remote press."""
+        self._remote_listeners.append(callback)
+
+        def _unsub() -> None:
+            if callback in self._remote_listeners:
+                self._remote_listeners.remove(callback)
+
+        return _unsub
+
     def _dispatch_status(self, src_address: int, opcode: int, params: bytes) -> None:
         for cb in self._status_handlers.get(src_address, ()):
             try:
                 cb(opcode, params)
             except Exception:
                 _LOGGER.exception("Status handler failed for %04X", src_address)
+        if self._remote_decoder.owns(src_address):
+            if opcode == OP_MODEL_PUBLICATION_STATUS:
+                self.remote_config.on_publication_status(src_address, params)
+                return
+            self._dispatch_remote(src_address, opcode, params)
+
+    def _dispatch_remote(self, src_address: int, opcode: int, params: bytes) -> None:
+        event = self._remote_decoder.decode(src_address, opcode, params)
+        if event is None:
+            return
+        # The remote is awake right after a press: send what is pending.
+        if not self._closing:
+            self.remote_config.on_remote_activity(event.remote_unicast)
+        _LOGGER.debug("Remote %04X module %d: %s %s", event.remote_unicast,
+                      event.module + 1, event.event_type, event.attributes)
+        for cb in list(self._remote_listeners):
+            try:
+                cb(event)
+            except Exception:
+                _LOGGER.exception("Remote listener failed")
+        # The press changed the lights it controls: read their state now
+        # instead of waiting for the next periodic poll. A position set to
+        # "Home Assistant only" changes no light.
+        if not self.remote_config.is_ha_only(event.remote_unicast, event.module):
+            self._schedule_quick_poll(event.group_address)
+
+    async def _send_devkey(self, dst: int, opcode: int, params: bytes) -> bool:
+        if self.proxy is None:
+            raise ConnectionError("Mesh not set up")
+        return await self.proxy.send_devkey(dst, opcode, params)
+
+    def _on_remote_config_change(self) -> None:
+        """Refresh the filter when 0xFEFF joins or leaves it.
+
+        Called after every change of a remote position, so only act when
+        whether any position is "HA only" actually changed. The proxy's
+        list is rebuilt, not just added to: an accept list holds only a
+        few addresses and is usually full already.
+        """
+        uses = self.remote_config.uses_ha_only_address()
+        if uses == self._ha_only_filtered:
+            return
+        self._ha_only_filtered = uses
+        if self.proxy is None:
+            return
+        self.proxy.set_filter_addresses(self._filter_addresses())
+        if self.proxy.is_connected:
+            self._spawn_background(
+                self._refresh_proxy_filter(), "haefele-ha-only-filter",
+            )
+
+    async def _refresh_proxy_filter(self) -> None:
+        if self.proxy is None:
+            return
+        try:
+            await self.proxy.refresh_filter()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Could not update the proxy filter (%s); it will be set on "
+                "the next reconnect", err,
+            )
+
+    def _schedule_quick_poll(self, group: int | None) -> None:
+        """Read the lights of ``group`` soon (None: every light).
+
+        Presses that arrive while a quick poll is running are queued and
+        read in another pass, never dropped.
+        """
+        if self._closing:
+            return
+        self._quick_poll_groups.add(group)
+        if self._quick_poll_task is not None and not self._quick_poll_task.done():
+            return
+        self._quick_poll_task = self._spawn_background(
+            self._quick_poll(), "haefele-quick-poll",
+        )
+
+    async def _quick_poll(self) -> None:
+        while self._quick_poll_groups:
+            # Let the lights apply the command (and the remote's
+            # retransmission arrive) before asking for their state.
+            await asyncio.sleep(QUICK_POLL_DELAY)
+            groups, self._quick_poll_groups = self._quick_poll_groups, set()
+            # Like the periodic poll: no link, no Gets. Each one would run a
+            # full reconnect while holding the poll lock; the periodic poll
+            # catches up once the link is back.
+            if self.proxy is None or not self.proxy.is_connected:
+                continue
+            await self._poll_all_nodes(None if None in groups else groups)
 
     # ------------------------------------------------------------------
     # SEQ management
@@ -453,8 +585,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 "haefele-src-rotation-filter",
             )
 
-    def _spawn_background(self, coro, name: str) -> asyncio.Task:
-        """Start a task we keep a reference to and cancel on shutdown."""
+    def _spawn_background(self, coro, name: str) -> asyncio.Task | None:
+        """Start a task we keep a reference to and cancel on shutdown.
+
+        Returns None once shutdown has started: a task created then could
+        outlive it and reconnect the proxy.
+        """
+        if self._closing:
+            coro.close()
+            return None
         create = getattr(self.hass, "async_create_background_task", None)
         if callable(create):
             task = create(coro, name)
@@ -463,6 +602,14 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    async def _cancel_background_tasks(self) -> None:
+        while self._background_tasks:
+            tasks = list(self._background_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.difference_update(tasks)
 
     async def _push_filter_address(self, address: int) -> None:
         if self.proxy is None:
@@ -481,6 +628,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     async def async_setup(self) -> None:
         await self._load_seq()
+        await self.remote_config.async_load()
+        self._ha_only_filtered = self.remote_config.uses_ha_only_address()
         # Jump SEQ forward on startup for every known SRC. With block
         # persistence the stored value is already a ceiling; the jump is
         # kept for stores written by older releases (exact last SEQ).
@@ -534,6 +683,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Only an IV Index that an authenticated beacon confirmed counts as
         # known; one from the export can still be corrected by a big jump.
         self.session.iv_confirmed = self._persisted_iv_confirmed
+        for remote in self.remotes_cfg:
+            if remote.get("device_key"):
+                self.session.device_keys[remote["unicast"]] = bytes.fromhex(
+                    remote["device_key"]
+                )
         # Rotate *before* the proxy exists if the stored SEQ is already past
         # the threshold (e.g. first start after upgrading), so the filter
         # list computed below already carries the fresh SRC.
@@ -571,6 +725,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             )
 
     async def async_shutdown(self) -> None:
+        # Frames keep arriving until proxy.disconnect() stops the rx pump; a
+        # remote press in that window must not start new work.
+        self._closing = True
         if self._poll_task is not None and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -578,11 +735,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._poll_task = None
-        for task in list(self._background_tasks):
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        self._background_tasks.clear()
+        await self._cancel_background_tasks()
         if self.proxy is not None:
             try:
                 await self.proxy.disconnect()
@@ -659,6 +812,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         ordered: list[int] = []
         if self.session is not None:
             ordered.append(self.session.src & 0xFFFF)
+        # Presses of positions set to "Home Assistant only". Only when one
+        # is: a proxy may keep just 4 addresses in its accept list.
+        if self.remote_config.uses_ha_only_address():
+            ordered.append(HA_ONLY_ADDRESS)
         for addr in [*sorted(groups), *sorted(unicasts)]:
             if addr not in ordered:
                 ordered.append(addr)
@@ -691,7 +848,12 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except Exception:
                 _LOGGER.exception("State poll loop crashed, continuing")
 
-    async def _poll_all_nodes(self) -> None:
+    async def _poll_all_nodes(self, groups: set[int] | None = None) -> None:
+        """Poll every light, or only those subscribed to one of ``groups``."""
+        async with self._poll_lock:
+            await self._poll_nodes_locked(groups)
+
+    async def _poll_nodes_locked(self, groups: set[int] | None) -> None:
         """Send exactly one state Get per node.
 
         Every Get costs one SEQ, so we only ask for the status the light
@@ -706,6 +868,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         for node_cfg in self._nodes_cfg:
             unicast = node_cfg.get("unicast")
             if not unicast or self.proxy is None:
+                continue
+            if groups is not None and not groups & set(node_cfg.get("groups") or []):
                 continue
             try:
                 if _polls_ctl(node_cfg):
