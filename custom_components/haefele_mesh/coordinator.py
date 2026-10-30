@@ -127,6 +127,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # Fire-and-forget tasks we own; kept referenced (the event loop only
         # holds weak references) and cancelled on shutdown.
         self._background_tasks: set[asyncio.Task] = set()
+        # Set when shutdown starts; no new background work after that.
+        self._closing = False
         # Persisted IV Index from last session (auto-updated by Secure
         # Network Beacons). None until _load_seq runs.
         self._persisted_iv_index: int | None = None
@@ -215,6 +217,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         Presses that arrive while a quick poll is running are queued and
         read in another pass, never dropped.
         """
+        if self._closing:
+            return
         self._quick_poll_groups.add(group)
         if self._quick_poll_task is not None and not self._quick_poll_task.done():
             return
@@ -228,6 +232,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             # retransmission arrive) before asking for their state.
             await asyncio.sleep(QUICK_POLL_DELAY)
             groups, self._quick_poll_groups = self._quick_poll_groups, set()
+            # Like the periodic poll: no link, no Gets. Each one would run a
+            # full reconnect while holding the poll lock; the periodic poll
+            # catches up once the link is back.
+            if self.proxy is None or not self.proxy.is_connected:
+                continue
             await self._poll_all_nodes(None if None in groups else groups)
 
     # ------------------------------------------------------------------
@@ -515,8 +524,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 "haefele-src-rotation-filter",
             )
 
-    def _spawn_background(self, coro, name: str) -> asyncio.Task:
-        """Start a task we keep a reference to and cancel on shutdown."""
+    def _spawn_background(self, coro, name: str) -> asyncio.Task | None:
+        """Start a task we keep a reference to and cancel on shutdown.
+
+        Returns None once shutdown has started: a task created then could
+        outlive it and reconnect the proxy.
+        """
+        if self._closing:
+            coro.close()
+            return None
         create = getattr(self.hass, "async_create_background_task", None)
         if callable(create):
             task = create(coro, name)
@@ -525,6 +541,14 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    async def _cancel_background_tasks(self) -> None:
+        while self._background_tasks:
+            tasks = list(self._background_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.difference_update(tasks)
 
     async def _push_filter_address(self, address: int) -> None:
         if self.proxy is None:
@@ -633,6 +657,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             )
 
     async def async_shutdown(self) -> None:
+        # Frames keep arriving until proxy.disconnect() stops the rx pump; a
+        # remote press in that window must not start new work.
+        self._closing = True
         if self._poll_task is not None and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -640,11 +667,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._poll_task = None
-        for task in list(self._background_tasks):
-            task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        self._background_tasks.clear()
+        await self._cancel_background_tasks()
         if self.proxy is not None:
             try:
                 await self.proxy.disconnect()

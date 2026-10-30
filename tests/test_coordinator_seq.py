@@ -702,11 +702,17 @@ _REMOTE = {
 }
 
 
+def _connected_proxy() -> FakeProxy:
+    proxy = FakeProxy()
+    proxy.is_connected = True
+    return proxy
+
+
 def test_remote_press_reaches_listeners_once_and_polls_the_lights(monkeypatch):
     monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
     monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
     c = _coordinator(remotes=[_REMOTE])
-    c.proxy = FakeProxy()
+    c.proxy = _connected_proxy()
     events = []
     c.register_remote_listener(events.append)
 
@@ -733,7 +739,7 @@ def test_light_status_is_not_taken_for_a_remote_press():
 
 def test_unsubscribed_listener_gets_nothing():
     c = _coordinator(remotes=[_REMOTE])
-    c.proxy = FakeProxy()
+    c.proxy = _connected_proxy()
     events = []
     unsub = c.register_remote_listener(events.append)
     unsub()
@@ -757,7 +763,7 @@ def test_quick_poll_reads_only_the_lights_of_the_pressed_group(monkeypatch):
     monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
     monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
     c = _coordinator(remotes=[_remote_with_group(0xC001)])
-    c.proxy = FakeProxy()
+    c.proxy = _connected_proxy()
 
     async def run():
         c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
@@ -771,7 +777,7 @@ def test_press_during_a_quick_poll_is_read_in_another_pass(monkeypatch):
     monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
     monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
     c = _coordinator(remotes=[_remote_with_group(0xC001)])
-    c.proxy = FakeProxy()
+    c.proxy = _connected_proxy()
     original = c.proxy.get_ctl
 
     async def get_ctl_and_press_again(dst):
@@ -793,7 +799,7 @@ def test_quick_poll_waits_for_a_running_periodic_poll(monkeypatch):
     monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
     monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
     c = _coordinator(remotes=[_remote_with_group(0xC001)])
-    c.proxy = FakeProxy()
+    c.proxy = _connected_proxy()
 
     async def run():
         await c._poll_lock.acquire()  # a periodic poll is in progress
@@ -806,3 +812,40 @@ def test_quick_poll_waits_for_a_running_periodic_poll(monkeypatch):
 
     asyncio.run(run())
     assert c.proxy.calls == [("ctl", 0x0017)]
+
+
+def test_press_during_shutdown_starts_no_poll(monkeypatch):
+    # Frames keep arriving until the proxy is disconnected. A quick poll
+    # started then would outlive shutdown and reconnect the proxy.
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = _connected_proxy()
+
+    async def press_while_disconnecting():
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        await asyncio.sleep(0)
+
+    c.proxy.disconnect = press_while_disconnecting
+
+    async def run():
+        await c.async_shutdown()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert c._quick_poll_task is None
+    assert not c._background_tasks
+    assert c.proxy.calls == []
+
+
+def test_quick_poll_sends_nothing_while_the_link_is_down(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    c = _coordinator(remotes=[_REMOTE])
+    c.proxy = FakeProxy()  # not connected
+
+    async def run():
+        c._dispatch_status(0x0104, 0x8203, bytes.fromhex("011e"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == []

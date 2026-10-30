@@ -1,8 +1,8 @@
 """The Home Assistant facing side of remotes, against the real HA package.
 
 Covers what the stubbed suite in tests/ cannot: the event entity, the
-device-trigger schema and plumbing, the bus forwarder and the registry
-re-enable, wired together through the shared payload keys.
+device-trigger schema and plumbing, the bus forwarder and device removal,
+wired together through the shared payload keys.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ ha_const = pytest.importorskip("homeassistant.const")
 if not hasattr(ha_const, "MAJOR_VERSION"):
     pytest.skip("real Home Assistant not installed", allow_module_level=True)
 
-from homeassistant.helpers import entity_registry as er  # noqa: E402
 
 import custom_components.haefele_mesh as integration  # noqa: E402
 from custom_components.haefele_mesh import device_trigger, event  # noqa: E402
@@ -70,7 +69,9 @@ def test_entity_identity_and_defaults():
     assert first.unique_id == "remote_94876076-1e92-440f-b6ad-e681a260d1f7_module_1"
     assert first.event_types == EVENT_TYPES
     assert first.entity_registry_enabled_default is True
-    assert fourth.entity_registry_enabled_default is False
+    # A position disabled in the app just never fires: no need to disable
+    # it (re-enabling later would make HA reload the entry once more).
+    assert fourth.entity_registry_enabled_default is True
     assert first.device_info["identifiers"] == {remote_device_identifier(REMOTE)}
     assert first.translation_key == "remote_module_group"
     assert first.translation_placeholders == {"position": "1", "group": "Luz desayunos"}
@@ -93,28 +94,21 @@ def test_entity_records_only_its_own_presses():
     assert coord.listeners == []
 
 
-def test_position_enabled_in_the_app_is_re_enabled(monkeypatch):
-    entries = {
-        "event.pos1": SimpleNamespace(disabled_by=er.RegistryEntryDisabler.INTEGRATION),
-        "event.pos2": SimpleNamespace(disabled_by=er.RegistryEntryDisabler.USER),
-        "event.pos4": SimpleNamespace(disabled_by=er.RegistryEntryDisabler.INTEGRATION),
-    }
-    by_uid = {
-        event.module_unique_id(REMOTE, 0): "event.pos1",
-        event.module_unique_id(REMOTE, 1): "event.pos2",
-        event.module_unique_id(REMOTE, 3): "event.pos4",
-    }
-    updated = []
-    fake = SimpleNamespace(
-        async_get_entity_id=lambda domain, platform, uid: by_uid.get(uid),
-        async_get=entries.get,
-        async_update_entity=lambda eid, **kw: updated.append((eid, kw)),
-    )
-    monkeypatch.setattr(event.er, "async_get", lambda hass: fake)
-    event._enable_positions_turned_on_in_app(None, [REMOTE])
-    # Enabled in the app + disabled by us -> enabled. User disable kept.
-    # Position 4 is still disabled in the app -> left disabled.
-    assert updated == [("event.pos1", {"disabled_by": None})]
+def test_only_remotes_gone_from_the_export_can_be_deleted():
+    coord = FakeCoordinator()
+    hass = SimpleNamespace(data={"haefele_mesh": {"e1": coord}})
+    entry = SimpleNamespace(entry_id="e1")
+
+    def device(*identifiers):
+        return SimpleNamespace(identifiers=set(identifiers))
+
+    def removable(dev):
+        return asyncio.run(integration.async_remove_config_entry_device(hass, entry, dev))
+
+    assert removable(device(("haefele_mesh", "remote_old-uuid"))) is True
+    assert removable(device(remote_device_identifier(REMOTE))) is False
+    assert removable(device(("haefele_mesh", "aabbccddeeff"))) is False  # a light
+    assert removable(device(("other", "remote_x"))) is False
 
 
 # ---------------------------------------------------------------------------

@@ -115,7 +115,9 @@ Each Häfele remote in the `.connect` export becomes a device with one **event e
 | Ring right / left | `color_temp_cold` / `color_temp_warm` |
 | Buttons A / B / C (only where the app assigned a scene) | `scene_a` / `scene_b` / `scene_c` (with the scene number) |
 
-The remote keeps doing what the Häfele app configured; Home Assistant only listens. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing and their entities are created disabled. Enable the position in the app (assign a group), export again and run **Reconfigure**: the entity is then enabled automatically, unless you disabled it yourself. Device triggers work even if you disable a position's entity.
+The remote keeps doing what the Häfele app configured; Home Assistant only listens. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing: their entities exist but never fire until you enable the position in the app (assign a group), export again and run **Reconfigure**. Device triggers work even if you disable a position's entity. If a remote disappears from the export (for example after re-pairing it in the app, which gives it a new identity), delete its old device from the device page.
+
+The ring's left and right sides send the same message whether the app sets them to colour temperature or to colour (only the target group changes), so the *ring left* / *ring right* triggers fire in both modes. The event type is reported as `color_temp_warm` / `color_temp_cold` in either case.
 
 After a press, the integration reads the state of the lights in the pressed position's group right away (about a second, plus 0.2 s per light), instead of waiting for the 15 s poll. These reads never overlap the regular poll.
 

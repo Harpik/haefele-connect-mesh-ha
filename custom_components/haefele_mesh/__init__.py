@@ -128,6 +128,24 @@ def _entry_data_problem(data: Mapping[str, Any]) -> str | None:
     return None
 
 
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: ConfigEntry, device: dr.DeviceEntry,
+) -> bool:
+    """Allow deleting a remote that is no longer in the export.
+
+    A remote reset and re-paired in the Häfele app gets a new UUID, so after
+    a Reconfigure its old device would otherwise stay forever.
+    """
+    ours = {i for i in device.identifiers if i[0] == DOMAIN}
+    if not ours or not all(i[1].startswith("remote_") for i in ours):
+        return False
+    coordinator: HaefeleCoordinator | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    if coordinator is None:
+        return False
+    current = {remote_device_identifier(r) for r in coordinator.remotes_cfg}
+    return not ours & current
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Häfele Connect Mesh config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
