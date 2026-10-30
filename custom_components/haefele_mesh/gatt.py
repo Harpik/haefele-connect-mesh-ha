@@ -38,11 +38,11 @@ from homeassistant.core import HomeAssistant
 
 from .access_codec import decode_opcode, encode_opcode
 from .const import (
+    FILTER_STATUS_TIMEOUT,
     IV_INDEX_MAX_JUMP,
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
     MESH_PROXY_SERVICE_UUID,
-    FILTER_STATUS_TIMEOUT,
     PROXY_FILTER_MAX_ADDRESSES,
 )
 from .mesh_crypto import (
