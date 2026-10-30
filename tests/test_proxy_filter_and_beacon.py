@@ -189,8 +189,10 @@ def _beacon(s: MeshSession, iv_index: int, flags: int = 0x00, auth: bytes | None
 def test_authenticated_beacon_moves_iv_forward():
     s = _session()
     s.iv_confirmed = True
-    _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX + 1, flags=0x02))
+    _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX + 1))
     assert s.iv_index == IV_INDEX + 1
+    assert s.iv_update is False
+    assert s.tx_iv_index == IV_INDEX + 1
 
 
 def test_forged_beacon_is_ignored():
@@ -206,10 +208,71 @@ def test_beacon_without_auth_value_is_ignored():
     assert s.iv_index == IV_INDEX
 
 
-def test_authenticated_beacon_never_moves_iv_backwards():
+def test_confirmed_iv_never_moves_backwards():
     s = _session()
+    s.iv_confirmed = True
     _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX - 1))
     assert s.iv_index == IV_INDEX
+
+
+def test_unconfirmed_iv_that_is_too_high_is_corrected_downwards():
+    # e.g. a 0.4.6 store whose IV a forged, unauthenticated beacon pushed up
+    s = _session(iv_index=5000)
+    _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX))
+    assert s.iv_index == IV_INDEX
+    assert s.iv_confirmed is True
+
+
+# ---------------------------------------------------------------------------
+# IV Update procedure (Mesh Profile §3.10.5)
+# ---------------------------------------------------------------------------
+
+
+def test_iv_update_in_progress_keeps_transmitting_with_previous_iv():
+    s = _session()
+    s.iv_confirmed = True
+    _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX + 1, flags=0x02))
+    assert s.iv_index == IV_INDEX + 1
+    assert s.iv_update is True
+    assert s.tx_iv_index == IV_INDEX
+    pdu = asyncio.run(s.build_access_network_pdu(0xC00F, 0x8201, b""))
+    assert pdu[0] >> 7 == IV_INDEX & 1  # IVI bit of the IV actually used
+    # A node that has not seen the update yet decrypts it end to end
+    # (network and application nonces both use the previous IV).
+    node = _session(iv_index=IV_INDEX)
+    assert node.decode_access_pdu(pdu) == (SRC, 0xC00F, 0x8201, b"")
+
+
+def test_iv_update_completes_with_same_iv_and_flag_cleared():
+    s = _session()
+    s.iv_confirmed = True
+    proxy = _proxy(s)
+    proxy._parse_secure_network_beacon(_beacon(s, IV_INDEX + 1, flags=0x02))
+    proxy._parse_secure_network_beacon(_beacon(s, IV_INDEX + 1))
+    assert s.iv_update is False
+    assert s.tx_iv_index == IV_INDEX + 1
+
+
+def _frame_from_node(iv_index: int) -> bytes:
+    """An access PDU a node sends with the given IV Index."""
+    sender = _session(iv_index=iv_index)
+    sender.src = 0x0017
+    return asyncio.run(sender.build_access_network_pdu(SRC, 0x8204, b"\x01"))
+
+
+def test_receive_picks_iv_by_ivi_bit():
+    s = _session(iv_index=IV_INDEX + 1)
+    # A node still on the previous IV (other IVI bit) and one on the current.
+    assert s.decode_access_pdu(_frame_from_node(IV_INDEX))[0] == 0x0017
+    assert s.decode_access_pdu(_frame_from_node(IV_INDEX + 1))[0] == 0x0017
+
+
+def test_receive_during_iv_update_accepts_old_and_new_iv():
+    s = _session()
+    s.iv_confirmed = True
+    _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX + 1, flags=0x02))
+    assert s.decode_access_pdu(_frame_from_node(IV_INDEX)) is not None
+    assert s.decode_access_pdu(_frame_from_node(IV_INDEX + 1)) is not None
 
 
 def test_confirmed_iv_rejects_jumps_beyond_42():

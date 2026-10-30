@@ -80,7 +80,14 @@ def integration(monkeypatch):
     return module
 
 
-def _hass_and_entry():
+VALID_DATA = {
+    "network_key": "00112233445566778899AABBCCDDEEFF",
+    "app_key": "FFEEDDCCBBAA99887766554433221100",
+    "nodes": [],
+}
+
+
+def _hass_and_entry(data: dict | None = None):
     forwarded: list[object] = []
 
     async def _forward(entry, platforms):
@@ -90,7 +97,9 @@ def _hass_and_entry():
         data={},
         config_entries=types.SimpleNamespace(async_forward_entry_setups=_forward),
     )
-    entry = types.SimpleNamespace(entry_id="abc", data={})
+    entry = types.SimpleNamespace(
+        entry_id="abc", data=VALID_DATA if data is None else data,
+    )
     return hass, entry, forwarded
 
 
@@ -125,14 +134,36 @@ def test_successful_setup_registers_and_forwards(integration):
     assert forwarded == [(entry, ("light",))]
 
 
-def test_invalid_entry_data_is_a_permanent_error(integration):
-    _FakeCoordinator.fail_setup = ValueError("non-hexadecimal number found")
-    hass, entry, forwarded = _hass_and_entry()
-    with pytest.raises(_ConfigEntryError, match="non-hexadecimal"):
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"network_key": "not hex at all"}, "network_key"),
+        ({"app_key": "0011"}, "app_key"),  # valid hex, wrong length
+        ({"app_key": None}, "app_key"),
+        ({"nodes": "x"}, "nodes"),
+    ],
+)
+def test_invalid_entry_data_is_a_permanent_error(integration, override, match):
+    hass, entry, forwarded = _hass_and_entry({**VALID_DATA, **override})
+    with pytest.raises(_ConfigEntryError, match=match):
         asyncio.run(integration.async_setup_entry(hass, entry))
-    (coordinator,) = _FakeCoordinator.instances
-    assert coordinator.shutdown_calls == 1
+    assert _FakeCoordinator.instances == []  # nothing was started
     assert forwarded == []
+
+
+def test_keys_with_spaces_are_accepted_like_bytes_fromhex_does(integration):
+    data = {**VALID_DATA, "network_key": "00112233 44556677 8899AABB CCDDEEFF"}
+    hass, entry, _forwarded = _hass_and_entry(data)
+    assert asyncio.run(integration.async_setup_entry(hass, entry)) is True
+
+
+def test_value_error_at_runtime_is_retried_not_permanent(integration):
+    # e.g. raised from inside the Bluetooth stack while connecting
+    _FakeCoordinator.fail_setup = ValueError("bad advertisement")
+    hass, entry, _forwarded = _hass_and_entry()
+    with pytest.raises(_ConfigEntryNotReady, match="bad advertisement"):
+        asyncio.run(integration.async_setup_entry(hass, entry))
+    assert _FakeCoordinator.instances[0].shutdown_calls == 1
 
 
 def test_config_entry_error_from_coordinator_is_not_downgraded(integration):

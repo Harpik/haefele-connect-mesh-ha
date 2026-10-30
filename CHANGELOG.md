@@ -22,22 +22,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Secure Network Beacons are authenticated before their IV Index is used.**
   The Network ID and IV Index travel in clear, so anyone in BLE range could
   forge a beacon and move our IV Index, making the lights drop every frame we
-  send. Beacons are now checked against the BeaconKey, the IV Index never
-  moves backwards, and once it is known it moves forward by at most 42
-  (Mesh Profile §3.10.5). An IV Index that only comes from the `.connect`
-  export (or from a store written by 0.4.6 or earlier) is not treated as
-  known, so the first authenticated beacon can still correct it by any
-  amount; the store now records whether a beacon confirmed it.
-- **A failed setup is retried.** Transient errors during setup now raise
-  `ConfigEntryNotReady`, so Home Assistant retries with backoff; invalid entry
-  data raises `ConfigEntryError` and is not retried. Whatever the coordinator
-  had started (poll loop, proxy link) is stopped first so a retry never leaves
-  a second one running.
+  send. Beacons are now checked against the BeaconKey. Once a beacon has
+  confirmed the IV Index it never moves backwards and moves forward by at
+  most 42 (Mesh Profile §3.10.5; the 96 h / 192 h timing limits are not
+  enforced). An IV Index that only comes from the `.connect` export, or from
+  a store written by 0.4.6 or earlier, is not treated as known: the first
+  authenticated beacon replaces it, up or down. The store records whether a
+  beacon confirmed it.
+- **IV Update procedure handled.** While a beacon announces an IV Update
+  in progress, messages are still sent with the previous IV Index, as the
+  spec requires; received messages are decrypted with the current or the
+  previous IV Index according to their IVI bit. Before, the new IV Index was
+  used for everything at once, so during an IV Update (at least 96 h) state
+  reports from the lights could not be decrypted.
+- **A failed setup is retried.** Errors during setup (Bluetooth, storage,
+  first refresh) now raise `ConfigEntryNotReady`, so Home Assistant retries
+  with backoff. Entry data whose keys are not 128-bit hex is rejected up
+  front with `ConfigEntryError` and not retried. Whatever the coordinator had
+  started (poll loop, proxy link) is stopped first so a retry never leaves a
+  second one running.
 
 ### Added
 
-- Diagnostics show the last Proxy Filter Status (`last_filter_status`) and
-  whether the IV Index was confirmed by a beacon (`iv_confirmed_by_beacon`).
+- Diagnostics show the last Proxy Filter Status (`last_filter_status`),
+  whether the IV Index was confirmed by a beacon (`iv_confirmed_by_beacon`)
+  and whether an IV Update is in progress (`iv_update_in_progress`).
 - PayPal donation link: a GitHub **Sponsor** button (`.github/FUNDING.yml`)
   and a badge plus "Support the project" section in the README. Docs only.
 

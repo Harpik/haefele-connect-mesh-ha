@@ -105,8 +105,28 @@ class MeshSession:
         # earlier one) rather than from the .connect export. Until then a
         # larger-than-normal IV jump is accepted so a stale export still works.
         self.iv_confirmed = False
+        # IV Update in Progress (Secure Network Beacon flag). While set we
+        # still transmit with iv_index - 1 (Mesh Profile 1.0 §3.10.5).
+        self.iv_update = False
         # Derived from AppKey: 6-bit AID
         self.aid = k4(self._app_key)
+
+    @property
+    def tx_iv_index(self) -> int:
+        """IV Index used to transmit: one less during an IV Update."""
+        if self.iv_update and self.iv_index > 0:
+            return self.iv_index - 1
+        return self.iv_index
+
+    def rx_iv_index(self, ivi: int) -> int:
+        """IV Index of a received PDU, chosen by its IVI bit (§3.4.6.3).
+
+        Nodes accept the current IV Index and the one before it; the IVI bit
+        (least significant bit of the sender's IV Index) tells them apart.
+        """
+        if (self.iv_index & 1) == (ivi & 1) or self.iv_index == 0:
+            return self.iv_index
+        return self.iv_index - 1
 
     # ------------------------------------------------------------------
     # Outbound — application (access) messages
@@ -128,7 +148,7 @@ class MeshSession:
             bytes([0x01, 0x00])
             + seq.to_bytes(3, "big")
             + struct.pack(">HH", src, dst)
-            + struct.pack(">I", self.iv_index)
+            + struct.pack(">I", self.tx_iv_index)
         )
         upper_transport = aes_ccm_encrypt(self._app_key, app_nonce, access_pdu, tag_length=4)
         # Lower Transport: SEG=0, AKF=1, AID
@@ -154,7 +174,7 @@ class MeshSession:
         )
 
     def _net_nonce(
-        self, ctl_ttl: int, seq: int, src: int, proxy: bool = False,
+        self, ctl_ttl: int, seq: int, src: int, iv_index: int, proxy: bool = False,
     ) -> bytes:
         """Network nonce (type 0x00) or Proxy nonce (type 0x03).
 
@@ -172,7 +192,7 @@ class MeshSession:
             + seq.to_bytes(3, "big")
             + struct.pack(">H", src)
             + bytes([0x00, 0x00])
-            + struct.pack(">I", self.iv_index)
+            + struct.pack(">I", iv_index)
         )
 
     def _wrap_network_pdu(
@@ -182,11 +202,14 @@ class MeshSession:
         """Encrypt + obfuscate a network-layer plaintext into a Network PDU."""
         if src is None:
             src = self.src
-        net_nonce = self._net_nonce((ctl << 7) | (ttl & 0x7F), seq, src, proxy=proxy)
+        iv_index = self.tx_iv_index
+        net_nonce = self._net_nonce(
+            (ctl << 7) | (ttl & 0x7F), seq, src, iv_index, proxy=proxy,
+        )
         tag_length = 8 if ctl else 4
         encrypted = aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=tag_length)
 
-        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self.iv_index) + encrypted[:7]
+        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", iv_index) + encrypted[:7]
         pecb = aes_ecb(self._priv_key, privacy_plaintext)
         cleartext_header = (
             bytes([(ctl << 7) | (ttl & 0x7F)])
@@ -195,7 +218,7 @@ class MeshSession:
         )
         obfuscated = bytes(a ^ b for a, b in zip(cleartext_header, pecb[:6]))
 
-        ivi_nid = ((self.iv_index & 1) << 7) | (self.nid & 0x7F)
+        ivi_nid = ((iv_index & 1) << 7) | (self.nid & 0x7F)
         return bytes([ivi_nid]) + obfuscated + encrypted
 
     # ------------------------------------------------------------------
@@ -245,7 +268,7 @@ class MeshSession:
             bytes([0x01, 0x00])
             + seq.to_bytes(3, "big")
             + struct.pack(">HH", src, dst)
-            + struct.pack(">I", self.iv_index)
+            + struct.pack(">I", self.rx_iv_index(pdu[0] >> 7))
         )
         try:
             access_pdu = aes_ccm_decrypt(self._app_key, app_nonce, upper, tag_length=4)
@@ -288,7 +311,8 @@ class MeshSession:
 
         obfuscated = pdu[1:7]
         encrypted = pdu[7:]
-        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", self.iv_index) + encrypted[:7]
+        iv_index = self.rx_iv_index(ivi_nid >> 7)
+        privacy_plaintext = b"\x00" * 5 + struct.pack(">I", iv_index) + encrypted[:7]
         pecb = aes_ecb(self._priv_key, privacy_plaintext)
         clear_hdr = bytes(a ^ b for a, b in zip(obfuscated, pecb[:6]))
         ctl_ttl = clear_hdr[0]
@@ -304,7 +328,7 @@ class MeshSession:
             _LOGGER.debug("Net ciphertext too short (src=%04X)", src)
             return None
 
-        net_nonce = self._net_nonce(ctl_ttl, seq, src, proxy=proxy)
+        net_nonce = self._net_nonce(ctl_ttl, seq, src, iv_index, proxy=proxy)
         try:
             plaintext = aes_ccm_decrypt(
                 self._enc_key, net_nonce, encrypted, tag_length=net_mic_len
@@ -932,11 +956,13 @@ class MeshProxyConnection:
 
         The Network ID and IV Index travel in clear, so anyone in BLE range
         can forge them; only the authentication value proves the sender
-        holds our NetKey. The IV Index is adopted only when the beacon is
-        ours, authenticates, and moves the IV forward (§3.10.5: never
-        backwards, at most +42 once the IV is known). This lets inbound
-        Status messages decrypt after an IV Update procedure has advanced
-        the network since the config file was exported.
+        holds our NetKey. The IV Index and the IV Update flag are adopted
+        only when the beacon is ours and authenticates. Once the IV Index is
+        known it never moves backwards and moves forward by at most 42
+        (§3.10.5); before that (export or legacy store) any authenticated
+        value is taken. This lets inbound Status messages decrypt after an
+        IV Update procedure has advanced the network since the config file
+        was exported.
         """
         if len(pdu) < 22 or pdu[0] != 0x01:
             _LOGGER.debug("Non-secure beacon or truncated: %s", pdu.hex())
@@ -963,28 +989,39 @@ class MeshProxyConnection:
                 "authentication (iv=%d); ignoring", iv_index,
             )
             return
-        current = self._session.iv_index
-        if iv_index == current:
-            self._session.iv_confirmed = True
-            return
-        if iv_index < current:
-            _LOGGER.debug(
-                "Ignoring authenticated beacon with older IV Index %d (ours %d)",
-                iv_index, current,
-            )
-            return
-        if self._session.iv_confirmed and iv_index > current + IV_INDEX_MAX_JUMP:
+        session = self._session
+        iv_update = bool(flags & 0x02)
+        current = session.iv_index
+        if session.iv_confirmed:
+            # A known IV Index only moves forward, by at most 42 (§3.10.5).
+            if iv_index < current:
+                _LOGGER.debug(
+                    "Ignoring authenticated beacon with older IV Index %d (ours %d)",
+                    iv_index, current,
+                )
+                return
+            if iv_index > current + IV_INDEX_MAX_JUMP:
+                _LOGGER.warning(
+                    "Ignoring authenticated beacon: IV Index %d is more than %d "
+                    "ahead of ours (%d)", iv_index, IV_INDEX_MAX_JUMP, current,
+                )
+                return
+        # An IV Index that no beacon has confirmed yet (from the export, or
+        # stored by a release that trusted unauthenticated beacons) may be
+        # wrong in either direction: take the authenticated one as is.
+        if iv_index != current:
             _LOGGER.warning(
-                "Ignoring authenticated beacon: IV Index %d is more than %d "
-                "ahead of ours (%d)", iv_index, IV_INDEX_MAX_JUMP, current,
+                "Updating IV Index %d -> %d based on Secure Network Beacon",
+                current, iv_index,
             )
-            return
-        _LOGGER.warning(
-            "Updating IV Index %d -> %d based on Secure Network Beacon",
-            current, iv_index,
-        )
-        self._session.iv_index = iv_index
-        self._session.iv_confirmed = True
+        if iv_update != session.iv_update:
+            _LOGGER.info(
+                "IV Update %s (IV Index %d)",
+                "in progress" if iv_update else "complete", iv_index,
+            )
+        session.iv_index = iv_index
+        session.iv_update = iv_update
+        session.iv_confirmed = True
 
     def _handle_proxy_config(self, pdu: bytes) -> None:
         decoded = self._session.decode_proxy_config(pdu)

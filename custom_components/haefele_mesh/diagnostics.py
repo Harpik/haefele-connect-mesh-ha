@@ -171,6 +171,7 @@ def _coordinator_snapshot(coordinator: HaefeleCoordinator) -> dict[str, Any]:
             "src_address": f"0x{session.src:04X}",
             "iv_index": session.iv_index,
             "iv_confirmed_by_beacon": getattr(session, "iv_confirmed", None),
+            "iv_update_in_progress": getattr(session, "iv_update", None),
             "nid": f"0x{session.nid:02X}",
             "aid": f"0x{session.aid:02X}",
         }

@@ -142,9 +142,12 @@ def test_access_pdu_foreign_appkey_rejected():
 
 def test_access_pdu_iv_mismatch_rejected():
     """IV Index drift → MIC check fails; decoder returns None instead of
-    silently accepting a wrong-era frame (replay-adjacent risk)."""
+    silently accepting a wrong-era frame (replay-adjacent risk).
+
+    A frame one IV behind is legitimate (§3.10.5, picked by the IVI bit);
+    two behind has the same IVI bit as ours and must fail."""
     sender = _make_session(iv_index=1)
-    receiver = _make_session(iv_index=2)
+    receiver = _make_session(iv_index=3)
     pdu = asyncio.run(sender.build_access_network_pdu(0x003A, 0x8202, b"\x01\x00\x00"))
     assert receiver.decode_access_pdu(pdu) is None
 
