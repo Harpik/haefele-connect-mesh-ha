@@ -134,6 +134,7 @@ def _capture_filter_messages(addresses: list[int]) -> tuple[MeshSession, list[by
         sent.append(pdu)
 
     proxy._send_proxy_pdu = _send
+    proxy.filter_mode = "accept_list"
     asyncio.run(proxy.add_filter_addresses(addresses))
     return s, sent
 
@@ -350,7 +351,7 @@ def test_filter_setup_prefers_forward_all(monkeypatch):
     _s, proxy, sent = _scripted_proxy(-1, monkeypatch)  # echoes the type asked
     asyncio.run(proxy._setup_proxy_filter())
     assert sent == [(0x00, b"\x01")]  # Set Filter Type = reject list, nothing else
-    assert proxy._forward_all is True
+    assert proxy.filter_mode == "forward_all"
     assert proxy.last_filter_status == (0x01, 0)
     # A later SRC rotation must not add itself to the reject list (= block it).
     asyncio.run(proxy.add_filter_addresses([0x7EFF]))
@@ -360,7 +361,7 @@ def test_filter_setup_prefers_forward_all(monkeypatch):
 def test_filter_setup_falls_back_to_accept_list_when_reject_is_refused(monkeypatch):
     _s, proxy, sent = _scripted_proxy(0x00, monkeypatch)  # stays accept list
     asyncio.run(proxy._setup_proxy_filter())
-    assert proxy._forward_all is False
+    assert proxy.filter_mode == "accept_list"
     assert sent[0] == (0x00, b"\x01")
     assert sent[1] == (0x00, b"\x00")
     added = b"".join(p for op, p in sent[2:] if op == 0x01)
@@ -372,5 +373,170 @@ def test_filter_setup_falls_back_to_accept_list_when_reject_is_refused(monkeypat
 def test_filter_setup_falls_back_when_proxy_is_silent(monkeypatch):
     _s, proxy, sent = _scripted_proxy(None, monkeypatch)
     asyncio.run(proxy._setup_proxy_filter())
-    assert proxy._forward_all is False
+    assert proxy.filter_mode == "accept_list"
     assert [op for op, _p in sent] == [0x00, 0x00, 0x01, 0x01]
+
+
+def _controlled_proxy(monkeypatch):
+    """A proxy whose Filter Status replies are delivered by the test."""
+    import custom_components.haefele_mesh.gatt as gatt_mod
+
+    monkeypatch.setattr(gatt_mod, "FILTER_STATUS_TIMEOUT", 0.5)
+    s = _session()
+    proxy = _proxy(s)
+    proxy.set_filter_addresses([SRC, 0xC00F])
+    sent: list[tuple[int, bytes]] = []
+
+    async def _send(pdu: bytes, pdu_type: int = 0x00) -> None:
+        sent.append(s.decode_proxy_config(pdu))
+
+    async def reply(filter_type: int, size: int = 0) -> None:
+        status = bytes([0x03, filter_type]) + size.to_bytes(2, "big")
+        proxy._handle_proxy_config(await s.build_proxy_config_pdu(status))
+
+    proxy._send_proxy_pdu = _send
+    return proxy, sent, reply
+
+
+async def _wait_for_set_filter_type(sent):
+    for _ in range(100):
+        if sent and sent[-1][0] == 0x00:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("setup never sent Set Filter Type")
+
+
+def test_src_push_while_waiting_for_status_is_not_sent(monkeypatch):
+    # An Add sent while the proxy may already run the reject list would
+    # block our new SRC, and its Filter Status would pass for our reply.
+    proxy, sent, reply = _controlled_proxy(monkeypatch)
+
+    async def run():
+        setup = asyncio.create_task(proxy._setup_proxy_filter())
+        await _wait_for_set_filter_type(sent)
+        await proxy.add_filter_addresses([0x7EFF])
+        assert sent == [(0x00, b"\x01")]
+        await reply(0x01)
+        await setup
+
+    asyncio.run(run())
+    assert sent == [(0x00, b"\x01")]
+    assert proxy.filter_mode == "forward_all"
+
+
+def test_src_rotated_while_waiting_is_added_by_the_fallback(monkeypatch):
+    proxy, sent, reply = _controlled_proxy(monkeypatch)
+
+    async def run():
+        setup = asyncio.create_task(proxy._setup_proxy_filter())
+        await _wait_for_set_filter_type(sent)
+        # What the coordinator does on rotation: record, then push.
+        proxy.set_filter_addresses([0x7EFF, SRC, 0xC00F])
+        await proxy.add_filter_addresses([0x7EFF])
+        await reply(0x00)  # proxy stays on an accept list
+        await setup
+
+    asyncio.run(run())
+    assert sent == [(0x00, b"\x01"), (0x00, b"\x00"), (0x01, bytes.fromhex("7eff00c8c00f"))]
+    assert proxy.filter_mode == "accept_list"
+
+
+def test_second_setup_does_not_reuse_the_previous_mode(monkeypatch):
+    # First link fell back to an accept list; on the next link a push
+    # during the status wait must not go out as an Add.
+    proxy, sent, reply = _controlled_proxy(monkeypatch)
+
+    async def run():
+        setup = asyncio.create_task(proxy._setup_proxy_filter())
+        await _wait_for_set_filter_type(sent)
+        await reply(0x00)
+        await setup
+        assert proxy.filter_mode == "accept_list"
+        sent.clear()
+        setup = asyncio.create_task(proxy._setup_proxy_filter())
+        await _wait_for_set_filter_type(sent)
+        await proxy.add_filter_addresses([0x7EFF])
+        await reply(0x01)
+        await setup
+
+    asyncio.run(run())
+    assert sent == [(0x00, b"\x01")]
+    assert proxy.filter_mode == "forward_all"
+
+
+def test_non_empty_reject_list_is_not_forward_all(monkeypatch):
+    proxy, sent, reply = _controlled_proxy(monkeypatch)
+
+    async def run():
+        setup = asyncio.create_task(proxy._setup_proxy_filter())
+        await _wait_for_set_filter_type(sent)
+        await reply(0x01, size=1)
+        await setup
+
+    asyncio.run(run())
+    assert proxy.filter_mode == "accept_list"
+    assert [op for op, _p in sent] == [0x00, 0x00, 0x01]
+
+
+@pytest.mark.parametrize("drop", ["callback", "teardown", "disconnect"])
+def test_filter_mode_is_cleared_when_the_link_drops(drop):
+    # A new link starts on an empty accept list (§6.7): whatever we set on
+    # the old one no longer applies.
+    proxy = _proxy(_session())
+    proxy.filter_mode = "forward_all"
+    if drop == "callback":
+        proxy._user_disconnecting = True  # no auto-reconnect task
+        proxy._on_disconnected(None)
+    elif drop == "teardown":
+        asyncio.run(proxy._teardown_active())
+    else:
+        asyncio.run(proxy.disconnect())
+    assert proxy.filter_mode is None
+
+
+class _FakeClient:
+    is_connected = True
+
+    def __init__(self, proxy, beacon: bool = True):
+        self._proxy = proxy
+        self._beacon = beacon
+        self.services = SimpleNamespace(get_characteristic=lambda uuid: uuid)
+
+    async def start_notify(self, _char, _cb):
+        if self._beacon:
+            async def _beacon_soon():
+                await asyncio.sleep(0.01)
+                self._proxy._beacon_event.set()
+
+            asyncio.get_running_loop().create_task(_beacon_soon())
+
+    async def disconnect(self):
+        self.is_connected = False
+
+
+@pytest.mark.parametrize("setup_fails", [False, True])
+def test_connect_runs_filter_setup_after_the_beacon(monkeypatch, setup_fails):
+    import custom_components.haefele_mesh.gatt as gatt_mod
+
+    proxy = _proxy(_session())
+    calls: list[bool] = []
+
+    async def _establish(*_args, **_kwargs):
+        return _FakeClient(proxy)
+
+    async def _setup():
+        calls.append(proxy._beacon_event.is_set())
+        if setup_fails:
+            raise ConnectionError("write failed")
+
+    monkeypatch.setattr(gatt_mod, "establish_connection", _establish)
+    proxy._setup_proxy_filter = _setup
+
+    async def run():
+        device = SimpleNamespace(address="aa:bb:cc:dd:ee:ff")
+        ok = await proxy._try_connect_device(device, "Proxy", timeout=1.0)
+        await proxy.disconnect()
+        return ok
+
+    assert asyncio.run(run()) is True  # a failed setup does not drop the link
+    assert calls == [True]

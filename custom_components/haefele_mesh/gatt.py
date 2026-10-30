@@ -38,6 +38,8 @@ from homeassistant.core import HomeAssistant
 
 from .access_codec import decode_opcode, encode_opcode
 from .const import (
+    FILTER_MODE_ACCEPT_LIST,
+    FILTER_MODE_FORWARD_ALL,
     FILTER_STATUS_TIMEOUT,
     IV_INDEX_MAX_JUMP,
     MESH_PROXY_DATA_IN_UUID,
@@ -393,15 +395,18 @@ class MeshProxyConnection:
         # Last Proxy Filter Status seen: (filter_type, list_size), or None.
         # Exposed in diagnostics to confirm the proxy accepted our filter.
         self.last_filter_status: tuple[int, int] | None = None
-        # True while the proxy runs an empty reject list (forwards everything).
-        self._forward_all = False
+        # Filter we configured on the current link: FILTER_MODE_FORWARD_ALL
+        # (empty reject list), FILTER_MODE_ACCEPT_LIST, or None while not
+        # connected or while setup is still waiting for the Filter Status.
+        # Addresses are only pushed to the proxy in accept-list mode.
+        self.filter_mode: str | None = None
         # Signalled on the first Secure Network Beacon (proxy PDU type=0x01).
-        # Used as the real 'is this a functional proxy?' test — the Filter
-        # Status ACK isn't reliable (Häfele firmware doesn't send it).
+        # Used as the 'is this a functional proxy?' test: nodes with the
+        # Proxy feature disabled accept GATT but never send one.
         self._beacon_event: asyncio.Event = asyncio.Event()
         # Track candidates ordered by last success so we retry smart.
         self._candidates: list[tuple[str, str]] = []
-        # Addresses to explicitly accept-list on the proxy after connect.
+        # Addresses for the accept-list fallback, in priority order.
         self._filter_addresses: list[int] = []
         # Set True while a user-initiated disconnect is in flight so the
         # bleak disconnected callback doesn't trigger an auto-reconnect.
@@ -424,7 +429,7 @@ class MeshProxyConnection:
         self._candidates = [(m.upper(), n) for m, n in candidates]
 
     def set_filter_addresses(self, addresses: list[int]) -> None:
-        """Set the addresses to accept-list on every new proxy connection."""
+        """Set the addresses to accept-list when the proxy needs an accept list."""
         self._filter_addresses = list(addresses)
 
     @property
@@ -772,6 +777,7 @@ class MeshProxyConnection:
     async def _teardown_active(self) -> None:
         """Drop whichever client we just attempted, without touching rx_task's
         pump (it's shared across reconnect attempts)."""
+        self.filter_mode = None
         # Teardown of a failed/unusable candidate is a user-initiated
         # disconnect from the auto-reconnect perspective — we don't want
         # it to trigger another reconnect cycle through _on_disconnected.
@@ -792,6 +798,8 @@ class MeshProxyConnection:
 
     def _on_disconnected(self, _client) -> None:
         _LOGGER.debug("BLE disconnected from proxy %s", self._active_name)
+        # A new link starts on an empty accept list (Mesh Profile §6.7).
+        self.filter_mode = None
         # Skip auto-reconnect when the disconnect was user-initiated
         # (explicit disconnect() call, teardown of a failed candidate,
         # or integration unload).
@@ -845,6 +853,7 @@ class MeshProxyConnection:
 
     async def disconnect(self) -> None:
         self._user_disconnecting = True
+        self.filter_mode = None
         if self._reconnect_task is not None and not self._reconnect_task.done():
             self._reconnect_task.cancel()
             try:
@@ -1086,8 +1095,13 @@ class MeshProxyConnection:
         list (verified on hardware), too few for an accept list of every
         group. If the proxy does not confirm the reject list, fall back to an
         accept list with our addresses in priority order.
+
+        While this waits for the Filter Status, filter_mode is None and
+        add_filter_addresses only relies on the recorded list: an Add sent
+        to a proxy that already switched to a reject list would block the
+        address, and its reply could be mistaken for our confirmation.
         """
-        self._forward_all = False
+        self.filter_mode = None
         self.last_filter_status = None
         self._filter_status_event.clear()
         await self._configure_proxy_filter(reject_list=True)
@@ -1098,15 +1112,16 @@ class MeshProxyConnection:
         except TimeoutError:
             pass
         status = self.last_filter_status
-        if status is not None and status[0] == 0x01:
-            self._forward_all = True
+        if status == (0x01, 0):  # empty reject list
+            self.filter_mode = FILTER_MODE_FORWARD_ALL
             _LOGGER.debug("Proxy confirmed reject list: forwarding all traffic")
             return
         _LOGGER.debug(
-            "Proxy did not confirm a reject list (status=%s); using an accept list",
-            status,
+            "Proxy did not confirm an empty reject list (status=%s); "
+            "using an accept list", status,
         )
         await self._configure_proxy_filter(reject_list=False)
+        self.filter_mode = FILTER_MODE_ACCEPT_LIST
         if self._filter_addresses:
             await self.add_filter_addresses(self._filter_addresses)
 
@@ -1123,17 +1138,15 @@ class MeshProxyConnection:
     async def add_filter_addresses(self, addresses: list[int]) -> None:
         """Add addresses to the proxy filter (opcode 0x01).
 
-        Häfele firmware silently ignores 'Set Filter Type' (no Filter
-        Status reply), so we can't rely on reject-list mode. Instead we
-        switch the filter to accept-list and explicitly add the DSTs we
-        care about: our own SRC (for unicast replies), every lamp
-        unicast (for reply overhear), and every known group (for
-        publications from the physical remote / app).
+        Only sent while the proxy runs our accept list. With an empty
+        reject list everything is forwarded already, and adding to a reject
+        list would block the address. While setup is still running the
+        address only needs to be in _filter_addresses (set_filter_addresses):
+        the accept-list fallback adds the whole list.
         """
         if not addresses:
             return
-        if self._forward_all:
-            # Adding to a reject list would block these addresses.
+        if self.filter_mode != FILTER_MODE_ACCEPT_LIST:
             return
         # Opcode 0x01 = Add Addresses To Filter, then N big-endian 16-bit
         # addresses. A Proxy Configuration message is a single unsegmented

@@ -28,6 +28,8 @@ IV_INDEX_MAX_JUMP = 42
 PROXY_FILTER_MAX_ADDRESSES = 5
 # Seconds to wait for the Filter Status that confirms a Set Filter Type.
 FILTER_STATUS_TIMEOUT = 2.0
+FILTER_MODE_FORWARD_ALL = "forward_all"
+FILTER_MODE_ACCEPT_LIST = "accept_list"
 # Base address used for our BT Mesh SRC.
 #
 # Must NOT collide with SRCs used by any previous provisioner/gateway for the

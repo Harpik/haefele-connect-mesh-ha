@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   list, which forwards everything; if a proxy does not confirm that, an
   accept list is used as before, with our SRC first, then groups, then
   lamps. Address lists are sent in messages of at most 5 addresses: one "Add
-  Addresses to Filter" message is a single 29-byte Network PDU.
+  Addresses to Filter" message is a single 29-byte Network PDU. Waiting for
+  that confirmation adds up to 2 s to a connect when the proxy stays silent.
+  Diagnostics show the mode in use as `filter_mode` (`forward_all` or
+  `accept_list`).
 - **Secure Network Beacons are authenticated before their IV Index is used.**
   The Network ID and IV Index travel in clear, so anyone in BLE range could
   forge a beacon and move our IV Index, making the lights drop every frame we

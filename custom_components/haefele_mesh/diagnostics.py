@@ -144,6 +144,7 @@ def _coordinator_snapshot(coordinator: HaefeleCoordinator) -> dict[str, Any]:
         "candidates_order": [],
         "filter_addresses": [],
         "last_filter_status": None,
+        "filter_mode": None,
     }
     if proxy is not None:
         proxy_state["is_connected"] = proxy.is_connected
@@ -157,6 +158,8 @@ def _coordinator_snapshot(coordinator: HaefeleCoordinator) -> dict[str, Any]:
         proxy_state["filter_addresses"] = [
             f"0x{a:04X}" for a in (proxy._filter_addresses or [])  # noqa: SLF001
         ]
+        # forward_all, accept_list, or None (not connected or setup running).
+        proxy_state["filter_mode"] = getattr(proxy, "filter_mode", None)
         # Proof the proxy accepted our filter messages (None = no reply yet).
         status = getattr(proxy, "last_filter_status", None)
         if status is not None:
