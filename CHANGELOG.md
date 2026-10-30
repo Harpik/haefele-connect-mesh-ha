@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PayPal donation link: a GitHub **Sponsor** button (`.github/FUNDING.yml`)
+  and a badge plus "Support the project" section in the README. Docs only.
+
 ### Changed
 
 - **Maintenance only, no runtime behaviour change.** CI now tests on

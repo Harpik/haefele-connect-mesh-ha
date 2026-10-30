@@ -3,6 +3,7 @@
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 [![Tests](https://github.com/Harpik/haefele-connect-mesh-ha/actions/workflows/tests.yml/badge.svg)](https://github.com/Harpik/haefele-connect-mesh-ha/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://paypal.me/harpik3d)
 
 Control your **Häfele Connect Mesh** Bluetooth Mesh lights directly from Home Assistant over BLE — **no cloud, no Häfele gateway hardware, no MQTT broker required**.
 
@@ -181,6 +182,14 @@ CI runs `pytest` on Python 3.11, 3.13 and 3.14 (with stubbed HA and the latest t
 - [ ] **Options flow** — tweak heartbeat interval, GATT timeouts, reconnect back-off, etc. without re-adding the integration
 - [ ] **`haefele_mesh.scan_probe` service** — active BLE sonar from Developer Tools without needing the proxy to be connected
 - [ ] **ESPHome Bluetooth Proxy (`active: true`) compatibility audit** — code should already work via `bleak` but wants a documented happy-path + README note
+
+## Support the project
+
+This integration is a hobby project, developed and tested on real hardware in my spare time. If it saves you a Häfele gateway or simply makes your kitchen lights smarter, you can buy me a coffee:
+
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://paypal.me/harpik3d)
+
+Donations are entirely optional. Bug reports, tested device models and pull requests help just as much.
 
 ## Acknowledgements
 
