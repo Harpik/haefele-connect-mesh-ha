@@ -159,6 +159,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             self._spawn_background,
         )
         self.remote_config.register_listener(self._on_remote_config_change)
+        # Whether 0xFEFF is in the filter list we keep for the proxy.
+        self._ha_only_filtered = False
         self._remote_listeners: list[Callable[[RemoteEvent], None]] = []
         self._quick_poll_task: asyncio.Task | None = None
         # Groups whose lights a quick poll still has to read (None = all).
@@ -240,14 +242,34 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         return await self.proxy.send_devkey(dst, opcode, params)
 
     def _on_remote_config_change(self) -> None:
-        """A position became (or stopped being) "HA only": refresh the filter."""
+        """Refresh the filter when 0xFEFF joins or leaves it.
+
+        Called after every change of a remote position, so only act when
+        whether any position is "HA only" actually changed. The proxy's
+        list is rebuilt, not just added to: an accept list holds only a
+        few addresses and is usually full already.
+        """
+        uses = self.remote_config.uses_ha_only_address()
+        if uses == self._ha_only_filtered:
+            return
+        self._ha_only_filtered = uses
         if self.proxy is None:
             return
-        addresses = self._filter_addresses()
-        self.proxy.set_filter_addresses(addresses)
-        if HA_ONLY_ADDRESS in addresses and self.proxy.is_connected:
+        self.proxy.set_filter_addresses(self._filter_addresses())
+        if self.proxy.is_connected:
             self._spawn_background(
-                self._push_filter_address(HA_ONLY_ADDRESS), "haefele-ha-only-filter",
+                self._refresh_proxy_filter(), "haefele-ha-only-filter",
+            )
+
+    async def _refresh_proxy_filter(self) -> None:
+        if self.proxy is None:
+            return
+        try:
+            await self.proxy.refresh_filter()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Could not update the proxy filter (%s); it will be set on "
+                "the next reconnect", err,
             )
 
     def _schedule_quick_poll(self, group: int | None) -> None:
@@ -607,6 +629,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
     async def async_setup(self) -> None:
         await self._load_seq()
         await self.remote_config.async_load()
+        self._ha_only_filtered = self.remote_config.uses_ha_only_address()
         # Jump SEQ forward on startup for every known SRC. With block
         # persistence the stored value is already a ceiling; the jump is
         # kept for stores written by older releases (exact last SEQ).

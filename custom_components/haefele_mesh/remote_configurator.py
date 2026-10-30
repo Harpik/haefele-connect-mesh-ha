@@ -44,6 +44,11 @@ def _position_key(remote_cfg: dict, module: int) -> str:
     return f"{remote_device_identifier(remote_cfg)[1]}:{module}"
 
 
+def _discard(position: dict, element: int, model: int) -> None:
+    if [element, model] in position["pending"]:
+        position["pending"].remove([element, model])
+
+
 class RemoteConfigurator:
     """Modes of every remote position, and the job that applies them."""
 
@@ -62,7 +67,8 @@ class RemoteConfigurator:
         #  "error": bool}}
         self._positions: dict[str, dict[str, Any]] = {}
         self._jobs: dict[int, Any] = {}
-        self._waiters: dict[tuple[int, int], asyncio.Future] = {}
+        # {(element, model): (future, publication address that was Set)}
+        self._waiters: dict[tuple[int, int], tuple[asyncio.Future, int]] = {}
         self._listeners: list[Callable[[], None]] = []
 
     async def async_load(self) -> None:
@@ -200,8 +206,14 @@ class RemoteConfigurator:
             "Remote %04X publication status %d element %04X model %04X -> %04X",
             src, status["status"], status["element"], status["model"], status["address"],
         )
-        waiter = self._waiters.get((status["element"], status["model"]))
-        if waiter is not None and not waiter.done():
+        waiter, expected = self._waiters.get(
+            (status["element"], status["model"]), (None, None),
+        )
+        # A success for another address answers an earlier Set, not this one.
+        if (
+            waiter is not None and not waiter.done()
+            and (status["status"] != 0 or status["address"] == expected)
+        ):
             waiter.set_result(status)
             return
         # A late answer (its Set already timed out) still confirms the model.
@@ -245,6 +257,11 @@ class RemoteConfigurator:
         unicast = remote_cfg["unicast"]
         silent = 0
         replaced = False
+        keys = [
+            _position_key(remote_cfg, module)
+            for module in range(len(remote_cfg.get("modules") or []))
+        ]
+        started = {key: self._positions.get(key) for key in keys}
         for module in range(len(remote_cfg.get("modules") or [])):
             key = _position_key(remote_cfg, module)
             position = self._positions.get(key)
@@ -260,7 +277,7 @@ class RemoteConfigurator:
                     break
                 client = clients.get((element, model))
                 if client is None:
-                    position["pending"].remove([element, model])
+                    _discard(position, element, model)
                     continue
                 publication = publication_for(position["mode"], client)
                 status = await self._set_publication(unicast, element, model, publication)
@@ -279,7 +296,8 @@ class RemoteConfigurator:
                 # Let our Segment Ack for that Status go out (and the remote
                 # take it) before the next Set lands on top of it.
                 await asyncio.sleep(SETTLE_DELAY)
-                position["pending"].remove([element, model])
+                # A late or repeated Status may have confirmed it meanwhile.
+                _discard(position, element, model)
                 if status["status"] != 0 or status["address"] != publication["address"]:
                     _LOGGER.error(
                         "Remote %04X refused publication of model %04X on element "
@@ -288,14 +306,20 @@ class RemoteConfigurator:
                     position["error"] = True
                 await self._save()
                 self._notify()
-        return replaced
+        # Also a mode changed during the last Set of a position, or for one
+        # already sent: the remote is still awake, so send it now.
+        return replaced or any(
+            self._positions.get(key) is not position
+            and (self._positions.get(key) or {}).get("pending")
+            for key, position in started.items()
+        )
 
     async def _set_publication(
         self, unicast: int, element: int, model: int, publication: dict[str, int],
     ) -> dict[str, int] | None:
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future = loop.create_future()
-        self._waiters[(element, model)] = waiter
+        self._waiters[(element, model)] = (waiter, publication["address"])
         try:
             delivered = await self._send(
                 unicast, OP_MODEL_PUBLICATION_SET,

@@ -540,3 +540,22 @@ def test_connect_runs_filter_setup_after_the_beacon(monkeypatch, setup_fails):
 
     assert asyncio.run(run()) is True  # a failed setup does not drop the link
     assert calls == [True]
+
+
+@pytest.mark.parametrize("mode", ["accept_list", "forward_all", None])
+def test_refresh_replaces_the_accept_list_in_priority_order(monkeypatch, mode):
+    _s, proxy, sent = _scripted_proxy(0x00, monkeypatch)
+    proxy.filter_mode = mode
+    proxy.set_filter_addresses([SRC, 0xFEFF, 0xC00F, 0xC00B, 0xC017])
+    asyncio.run(proxy.refresh_filter())
+    if mode != "accept_list":
+        # Everything is forwarded already, or setup adds the list itself.
+        assert sent == []
+        return
+    # Set Filter Type empties the proxy's list (it keeps only a few), then
+    # the whole list again, highest priority first.
+    assert sent[0] == (0x00, b"\x00")
+    added = b"".join(p for op, p in sent[1:] if op == 0x01)
+    assert [int.from_bytes(added[i:i + 2], "big") for i in range(0, len(added), 2)] == [
+        SRC, 0xFEFF, 0xC00F, 0xC00B, 0xC017,
+    ]

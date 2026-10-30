@@ -321,3 +321,81 @@ def test_position_whose_app_setup_could_not_be_read_is_not_unknown():
         client["publish"] = None  # e.g. a virtual address
     c, _, _ = _configurator(FakeRemote(), remote=remote)
     assert c.mode(remote, 0) in c.modes(remote, 0)
+
+
+def test_mode_changed_during_the_last_set_is_sent_in_the_same_wake():
+    fake = FakeRemote()
+    c, remote, tasks = _configurator(fake)
+    original = fake.send
+
+    async def send(dst, opcode, params):
+        await original(dst, opcode, params)
+        if len(fake.sets) == 8:  # the last Set of position 3
+            await c.async_set_mode(remote, 3, MODE_DISABLED)
+
+    c._send = send
+
+    async def run():
+        await c.async_set_mode(remote, 3, MODE_HA_ONLY)
+        c.on_remote_activity(0x0017)
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    assert not c.is_pending(remote, 3)
+    assert len(fake.sets) == 16
+    assert all(p[2:4] == b"\x00\x00" for p in fake.sets[-8:])
+
+
+def test_late_status_of_an_earlier_set_does_not_answer_the_new_one(monkeypatch):
+    monkeypatch.setattr(rc_mod, "STATUS_TIMEOUT", 0.05)
+    fake = FakeRemote(answers=0)
+    c, remote, tasks = _configurator(fake)
+
+    async def run():
+        # First press: the "HA only" Sets go unanswered.
+        await c.async_set_mode(remote, 3, MODE_HA_ONLY)
+        c.on_remote_activity(0x0017)
+        await asyncio.gather(*tasks)
+        old = fake.sets[0]
+        # Changed to disabled. On the next press the Status of the old Set
+        # arrives right after the new Set of the same model went out.
+        await c.async_set_mode(remote, 3, MODE_DISABLED)
+        fake.answers = None
+        original = fake.send
+
+        async def send(dst, opcode, params):
+            if params[:2] == old[:2] and params[-2:] == old[-2:]:
+                c.on_publication_status(0x0017, bytes([0]) + old)
+            await original(dst, opcode, params)
+
+        c._send = send
+        c.on_remote_activity(0x0017)
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    assert not c.has_error(remote, 3)
+    assert not c.is_pending(remote, 3)
+
+
+def test_repeated_status_while_settling_does_not_break_the_job(monkeypatch):
+    monkeypatch.setattr(rc_mod, "SETTLE_DELAY", 0.05)
+
+    class Twice(FakeRemote):
+        async def send(self, dst, opcode, params):
+            await super().send(dst, opcode, params)
+            asyncio.get_running_loop().call_later(
+                0.01, self.configurator.on_publication_status, 0x0017,
+                bytes([0]) + params,
+            )
+
+    fake = Twice()
+    c, remote, tasks = _configurator(fake)
+
+    async def run():
+        await c.async_set_mode(remote, 3, MODE_HA_ONLY)
+        c.on_remote_activity(0x0017)
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert not any(isinstance(r, Exception) for r in asyncio.run(run()))
+    assert not c.is_pending(remote, 3)
+    assert not c.has_error(remote, 3)

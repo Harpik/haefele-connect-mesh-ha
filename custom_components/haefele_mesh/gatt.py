@@ -109,6 +109,8 @@ class OutgoingMessage:
     segments: list[bytes]
     # First transmission.
     pdus: list[bytes]
+    # IV Index the message was encrypted with; retransmissions keep it.
+    iv_index: int = 0
 
 
 @dataclass
@@ -225,28 +227,37 @@ class MeshSession:
         """
         dev_key = self.device_keys[dst]
         src = self.src
+        iv_index = self.tx_iv_index
         access_pdu = encode_opcode(opcode) + params
         # The first SEQ is the message's SeqAuth: nonce, and SeqZero.
         seq_auth = await self._seq_provider(src)
         upper = aes_ccm_encrypt(
-            dev_key, self._upper_nonce(0x02, 0, seq_auth, src, dst, self.tx_iv_index),
+            dev_key, self._upper_nonce(0x02, 0, seq_auth, src, dst, iv_index),
             access_pdu, tag_length=4,
         )
         if len(access_pdu) <= MAX_UNSEGMENTED_ACCESS:
             plain = struct.pack(">H", dst) + bytes([0x00]) + upper
             return OutgoingMessage(
                 dst=dst, src=src, seq_zero=None, segments=[plain],
-                pdus=[self._wrap_network_pdu(plain, ctl=0, ttl=DEFAULT_TTL, seq=seq_auth, src=src)],
+                pdus=[self._wrap_network_pdu(
+                    plain, ctl=0, ttl=DEFAULT_TTL, seq=seq_auth, src=src, iv_index=iv_index,
+                )],
+                iv_index=iv_index,
             )
         chunks = split_upper_transport(upper)
         headers = segment_headers(0, 0, 0, seq_auth, len(chunks))
         segments = [struct.pack(">H", dst) + h + c for h, c in zip(headers, chunks)]
-        pdus = [self._wrap_network_pdu(segments[0], ctl=0, ttl=DEFAULT_TTL, seq=seq_auth, src=src)]
+        pdus = [self._wrap_network_pdu(
+            segments[0], ctl=0, ttl=DEFAULT_TTL, seq=seq_auth, src=src, iv_index=iv_index,
+        )]
         for plain in segments[1:]:
             seq = await self._seq_provider(src)
-            pdus.append(self._wrap_network_pdu(plain, ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src))
+            pdus.append(self._wrap_network_pdu(
+                plain, ctl=0, ttl=DEFAULT_TTL, seq=seq, src=src, iv_index=iv_index,
+            ))
         return OutgoingMessage(
             dst=dst, src=src, seq_zero=seq_auth & 0x1FFF, segments=segments, pdus=pdus,
+            iv_index=iv_index,
         )
 
     async def build_devkey_pdus(
@@ -256,10 +267,15 @@ class MeshSession:
         return (await self.build_devkey_message(dst, opcode, params)).pdus
 
     async def rewrap_segment(self, message: OutgoingMessage, index: int) -> bytes:
-        """Segment ``index`` of ``message`` again, with a fresh SEQ (§3.5.3.3)."""
+        """Segment ``index`` of ``message`` again, with a fresh SEQ (§3.5.3.3).
+
+        Same IV Index as the first transmission: the upper transport was
+        encrypted with it, and an IV Update in between must not change it.
+        """
         seq = await self._seq_provider(message.src)
         return self._wrap_network_pdu(
             message.segments[index], ctl=0, ttl=DEFAULT_TTL, seq=seq, src=message.src,
+            iv_index=message.iv_index,
         )
 
     async def build_segment_ack_pdu(
@@ -323,12 +339,13 @@ class MeshSession:
 
     def _wrap_network_pdu(
         self, plaintext: bytes, ctl: int, ttl: int, seq: int,
-        src: int | None = None, proxy: bool = False,
+        src: int | None = None, proxy: bool = False, iv_index: int | None = None,
     ) -> bytes:
         """Encrypt + obfuscate a network-layer plaintext into a Network PDU."""
         if src is None:
             src = self.src
-        iv_index = self.tx_iv_index
+        if iv_index is None:
+            iv_index = self.tx_iv_index
         net_nonce = self._net_nonce(
             (ctl << 7) | (ttl & 0x7F), seq, src, iv_index, proxy=proxy,
         )
@@ -562,6 +579,8 @@ class MeshProxyConnection:
         self._send_lock = asyncio.Lock()
         # Signalled whenever a Proxy Filter Status is received.
         self._filter_status_event: asyncio.Event = asyncio.Event()
+        # One refresh_filter at a time, so two lists never interleave.
+        self._filter_refresh_lock = asyncio.Lock()
         # Last Proxy Filter Status seen: (filter_type, list_size), or None.
         # Exposed in diagnostics to confirm the proxy accepted our filter.
         self.last_filter_status: tuple[int, int] | None = None
@@ -1121,9 +1140,11 @@ class MeshProxyConnection:
         if result.ack_to_send is not None:
             self._spawn_ack(*result.ack_to_send)
         ack = result.ack
-        if ack is not None and ack.dst == self._session.src:
-            key = (ack.src, ack.seq_zero)
-            self._acks[key] = self._acks.get(key, 0) | ack.block_ack
+        # Only acks for a message we are still sending: one arriving after
+        # it finished would stay and, once SeqZero wraps, answer a new one.
+        key = None if ack is None else (ack.src, ack.seq_zero)
+        if ack is not None and ack.dst == self._session.src and key in self._acks:
+            self._acks[key] = self._acks[key] | ack.block_ack
             if ack.block_ack == 0:
                 self._acks[key] = -1  # the receiver cancelled the message
             self._ack_event.set()
@@ -1286,18 +1307,23 @@ class MeshProxyConnection:
         """
         if not await self.ensure_connected():
             raise ConnectionError("No mesh proxy available")
-        async with self._tx_lock:
-            message = await self._session.build_devkey_message(dst, opcode, params)
-            for pdu in message.pdus:
-                await self._send_proxy_pdu(pdu, pdu_type=0x00)
-        _LOGGER.debug(
-            "TX devkey dst=%04X op=%#06x in %d PDU(s)", dst, opcode, len(message.pdus),
-        )
-        if message.seq_zero is None:
-            return True
-        key = (dst, message.seq_zero)
-        full = (1 << len(message.segments)) - 1
+        key = None
         try:
+            async with self._tx_lock:
+                message = await self._session.build_devkey_message(dst, opcode, params)
+                if message.seq_zero is not None:
+                    # Before sending, so its acks are recorded; a fresh entry
+                    # also drops one left by an older message with this SeqZero.
+                    key = (dst, message.seq_zero)
+                    self._acks[key] = 0
+                for pdu in message.pdus:
+                    await self._send_proxy_pdu(pdu, pdu_type=0x00)
+            _LOGGER.debug(
+                "TX devkey dst=%04X op=%#06x in %d PDU(s)", dst, opcode, len(message.pdus),
+            )
+            if key is None:
+                return True
+            full = (1 << len(message.segments)) - 1
             for attempt in range(SAR_RETRANSMISSIONS + 1):
                 block = await self._wait_ack(key, full, SAR_ACK_TIMEOUT)
                 if block == full:
@@ -1315,7 +1341,8 @@ class MeshProxyConnection:
                         await self._send_proxy_pdu(pdu, pdu_type=0x00)
             return False
         finally:
-            self._acks.pop(key, None)
+            if key is not None:
+                self._acks.pop(key, None)
 
     async def _wait_ack(self, key: tuple[int, int], full: int, timeout: float) -> int:
         """Latest BlockAck for ``key`` once complete, or when ``timeout`` ends."""
@@ -1408,6 +1435,20 @@ class MeshProxyConnection:
             "Proxy filter set to %s",
             "reject-empty (forward all)" if reject_list else "accept-empty",
         )
+
+    async def refresh_filter(self) -> None:
+        """Replace the proxy's accept list with the recorded addresses.
+
+        Set Filter Type empties the list, then the whole list goes in
+        priority order, so a proxy that keeps only a few keeps the first
+        ones. Nothing to do when everything is forwarded; while setup still
+        runs, its accept-list fallback adds the current list itself.
+        """
+        async with self._filter_refresh_lock:
+            if self.filter_mode != FILTER_MODE_ACCEPT_LIST:
+                return
+            await self._configure_proxy_filter(reject_list=False)
+            await self.add_filter_addresses(self._filter_addresses)
 
     async def add_filter_addresses(self, addresses: list[int]) -> None:
         """Add addresses to the proxy filter (opcode 0x01).

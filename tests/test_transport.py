@@ -228,3 +228,132 @@ def test_receiver_cancelling_stops_the_retransmissions(monkeypatch):
     assert asyncio.run(proxy.send_devkey(REMOTE, 0x03, bytes(11))) is False
     assert len(sent) == 2
     assert len(waits) == 1  # no more waiting once the receiver gave up
+
+
+def _segment_of(session, pdu, iv_index=1):
+    """(SEQ, segment) of a segmented Network PDU, read like a receiver does."""
+    import struct
+
+    from custom_components.haefele_mesh.mesh_crypto import aes_ccm_decrypt, aes_ecb
+
+    encrypted = pdu[7:]
+    pecb = aes_ecb(
+        session._priv_key, b"\x00" * 5 + struct.pack(">I", iv_index) + encrypted[:7],
+    )
+    hdr = bytes(a ^ b for a, b in zip(pdu[1:7], pecb[:6]))
+    seq, src = int.from_bytes(hdr[1:4], "big"), int.from_bytes(hdr[4:6], "big")
+    nonce = session._net_nonce(hdr[0], seq, src, iv_index)
+    plain = aes_ccm_decrypt(session._enc_key, nonce, encrypted, tag_length=4)
+    return seq, parse_segment(src, int.from_bytes(plain[:2], "big"), seq, plain[2:])
+
+
+def test_resent_segment_has_a_new_seq_and_the_same_seq_zero(monkeypatch):
+    seq_zero = []
+
+    async def deliver(index, pdu, remote, proxy):
+        if index == 0:
+            return  # the first segment is lost
+        block = 0b10 if index == 1 else 0b11
+        asyncio.get_running_loop().create_task(
+            _ack_from_remote(remote, proxy, seq_zero[0], block))
+
+    proxy, remote, sent = _sender(monkeypatch, deliver)
+    _record_seq_zero(proxy, seq_zero)
+    params = bytes.fromhex("2700fffe0000ff00090110")
+    assert asyncio.run(proxy.send_devkey(REMOTE, 0x03, params)) is True
+    decoded = [_segment_of(remote, pdu) for pdu in sent]
+    seqs = [seq for seq, _seg in decoded]
+    # A node drops a SEQ it saw already (replay protection).
+    assert seqs == sorted(set(seqs))
+    assert [seg.seg_o for _seq, seg in decoded] == [0, 1, 0]
+    assert {seg.seq_zero for _seq, seg in decoded} == {seq_zero[0]}
+
+
+def test_resent_segment_keeps_the_iv_index_of_the_message(monkeypatch):
+    seq_zero = []
+    received = []
+
+    async def deliver(index, pdu, remote, proxy):
+        if index == 0:
+            # An IV Update completes before the lost segment is resent.
+            proxy._session.iv_index += 1
+            return
+        result = remote.decode_network_pdu(pdu)
+        if result.message is not None:
+            received.append(result.message)
+        block = 0b11 if result.message is not None else 0b10
+        asyncio.get_running_loop().create_task(
+            _ack_from_remote(remote, proxy, seq_zero[0], block))
+
+    proxy, _, sent = _sender(monkeypatch, deliver)
+    _record_seq_zero(proxy, seq_zero)
+    params = bytes.fromhex("2700fffe0000ff00090110")
+    assert asyncio.run(proxy.send_devkey(REMOTE, 0x03, params)) is True
+    # The IVI bit of every segment is the one the message was encrypted with.
+    assert {pdu[0] >> 7 for pdu in sent} == {1}
+    assert received == [(HA, REMOTE, 0x03, params)]
+
+
+def test_ack_left_by_an_earlier_message_does_not_count(monkeypatch):
+    async def deliver(index, pdu, remote, proxy):
+        pass  # the remote is asleep: nothing gets through
+
+    proxy, remote, sent = _sender(monkeypatch, deliver)
+    params = bytes.fromhex("2700fffe0000ff00090110")
+
+    async def run():
+        first = await proxy._session.build_devkey_message(REMOTE, 0x03, params)
+        # A late full ack for that message, after it was finished with.
+        await _ack_from_remote(remote, proxy, first.seq_zero, 0b11)
+        assert proxy._acks == {}
+        # 8192 SEQs later a new message has the same SeqZero.
+        original = proxy._session.build_devkey_message
+
+        async def same_seq_zero(*args):
+            message = await original(*args)
+            message.seq_zero = first.seq_zero
+            return message
+
+        proxy._session.build_devkey_message = same_seq_zero
+        return await proxy.send_devkey(REMOTE, 0x03, params)
+
+    assert asyncio.run(run()) is False
+    assert len(sent) == 2 * (1 + gatt_mod.SAR_RETRANSMISSIONS)
+
+
+def test_seqs_go_out_in_order_when_messages_are_sent_together(monkeypatch):
+    async def deliver(index, pdu, remote, proxy):
+        await asyncio.sleep(0)  # the GATT write yields, like a real one
+
+    proxy, remote, sent = _sender(monkeypatch, deliver)
+    proxy._client = SimpleNamespace(is_connected=True)  # for the ack
+    params = bytes.fromhex("2700fffe0000ff00090110")
+
+    async def run():
+        await asyncio.gather(
+            proxy.send_access(REMOTE, 0x8201, b""),
+            proxy.send_devkey(REMOTE, 0x03, params),
+            proxy._send_ack(REMOTE, 0x0100, 0b11),
+            proxy.send_access(REMOTE, 0x8201, b""),
+            proxy.send_devkey(REMOTE, 0x03, params),
+        )
+
+    asyncio.run(run())
+    seqs = [
+        int.from_bytes(
+            bytes(a ^ b for a, b in zip(pdu[1:7], _pecb(remote, pdu)))[1:4], "big",
+        )
+        for pdu in sent
+    ]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+
+
+def _pecb(session, pdu):
+    import struct
+
+    from custom_components.haefele_mesh.mesh_crypto import aes_ecb
+
+    return aes_ecb(
+        session._priv_key, b"\x00" * 5 + struct.pack(">I", 1) + pdu[7:14],
+    )[:6]

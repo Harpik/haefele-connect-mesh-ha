@@ -127,6 +127,9 @@ class FakeProxy:
     async def add_filter_addresses(self, addresses):
         self.pushed_filters.append(list(addresses))
 
+    async def refresh_filter(self):
+        self.calls.append(("refresh_filter", list(self.filter_addresses)))
+
     async def get_onoff(self, dst):
         self.calls.append(("onoff", dst))
 
@@ -878,6 +881,32 @@ def test_ha_only_address_is_listened_to_only_when_a_position_uses_it():
 
     asyncio.run(run())
     assert FakeProxy.instances[0].filter_addresses[:2] == [0x00C8, 0xFEFF]
+
+
+def test_live_filter_is_rebuilt_only_when_ha_only_starts_or_stops():
+    c = _coordinator(remotes=[_configurable_remote()])
+    c.proxy = _connected_proxy()
+    remote = c.remotes_cfg[0]
+
+    async def run():
+        await c.remote_config.async_set_mode(remote, 3, "ha_only")
+        # Every confirmed Set notifies again: no new filter traffic.
+        for _ in range(8):
+            c._on_remote_config_change()
+        await asyncio.gather(*c._background_tasks)
+        # Back off "HA only" (the only position this remote can configure).
+        c.remote_config._positions["remote_r1:3"] = {"mode": "disabled", "pending": []}
+        c._on_remote_config_change()
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    refreshes = [call[1] for call in c.proxy.calls if call[0] == "refresh_filter"]
+    # The whole list each time, so an accept list that is full already
+    # takes 0xFEFF in priority order, and drops it again afterwards.
+    assert len(refreshes) == 2
+    assert refreshes[0][:2] == [0xFEFF, 0xC001]  # no session: no SRC first
+    assert 0xFEFF not in refreshes[1]
+    assert c.proxy.pushed_filters == []
 
 
 def test_press_sends_pending_configuration_and_status_confirms_it():
