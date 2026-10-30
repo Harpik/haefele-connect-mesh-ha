@@ -619,3 +619,22 @@ def test_pdu_uses_src_from_before_seq_provider_rotates():
     pdu = asyncio.run(session.build_access_network_pdu(0x0017, 0x8201, b""))
     _ctl, seq, src, _plain = session._decode_network_header(pdu)
     assert (seq, src) == (42, 0x00C8)
+
+
+# ---------------------------------------------------------------------------
+# IV Index provenance (beacon jump limit only applies to a known IV)
+# ---------------------------------------------------------------------------
+
+def test_persisted_iv_counts_as_confirmed():
+    FakeStore.data[STORE_KEY] = {"200": 1000, "_iv_index": 7}
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 7
+    assert c.session.iv_confirmed is True
+
+
+def test_iv_from_connect_export_is_not_confirmed():
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 1
+    assert c.session.iv_confirmed is False

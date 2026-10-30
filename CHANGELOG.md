@@ -6,8 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Proxy filter messages were never accepted by the proxy.** Proxy
+  Configuration messages were encrypted with the Network nonce instead of the
+  Proxy nonce (Mesh Profile §3.8.5.4), so the proxy failed their NetMIC and
+  dropped them silently. That is why no Proxy Filter Status was ever seen.
+  Only our own SRC reached the filter (the proxy adds it automatically), so
+  publications from the remote and the Häfele app never reached Home
+  Assistant and state changes showed up only through the 15 s poll. Incoming
+  Proxy Configuration messages are now decrypted with the Proxy nonce too.
+- **Filter list split into messages of at most 5 addresses.** One "Add
+  Addresses to Filter" message is a single 29-byte Network PDU; a longer list
+  (13 addresses on a typical kitchen) would not fit.
+- **Secure Network Beacons are authenticated before their IV Index is used.**
+  The Network ID and IV Index travel in clear, so anyone in BLE range could
+  forge a beacon and move our IV Index, making the lights drop every frame we
+  send. Beacons are now checked against the BeaconKey, the IV Index never
+  moves backwards, and once it is known it moves forward by at most 42
+  (Mesh Profile §3.10.5). A stale IV Index from the `.connect` export is
+  still corrected by the first authenticated beacon.
+- **A failed setup is retried.** Errors during setup now raise
+  `ConfigEntryNotReady`, so Home Assistant retries with backoff, and whatever
+  the coordinator had started (poll loop, proxy link) is stopped first so a
+  retry never leaves a second one running.
+
 ### Added
 
+- Diagnostics show the last Proxy Filter Status (`last_filter_status`) and
+  whether the IV Index was confirmed by a beacon (`iv_confirmed_by_beacon`).
 - PayPal donation link: a GitHub **Sponsor** button (`.github/FUNDING.yml`)
   and a badge plus "Support the project" section in the README. Docs only.
 

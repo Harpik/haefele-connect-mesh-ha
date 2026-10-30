@@ -6,6 +6,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN, LEGACY_SRC_ADDRESSES, SRC_ADDRESS_BASE
 from .coordinator import HaefeleCoordinator
@@ -49,15 +50,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Häfele Connect Mesh from a config entry."""
     coordinator = HaefeleCoordinator(hass, dict(entry.data), entry_id=entry.entry_id)
 
+    # A failed setup raises ConfigEntryNotReady so Home Assistant retries it
+    # with backoff, instead of leaving the entry in a permanent error state.
+    # Whatever the coordinator already started (poll loop, proxy link) is
+    # torn down first; otherwise every retry would leave one running.
     try:
         await coordinator.async_setup()
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.error("Failed to set up Häfele Mesh coordinator: %s", err)
-        return False
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        _LOGGER.debug("Häfele Mesh setup failed", exc_info=True)
+        await coordinator.async_shutdown()
+        if isinstance(err, ConfigEntryNotReady):
+            raise
+        raise ConfigEntryNotReady(
+            f"Failed to set up Häfele Mesh coordinator: {err}"
+        ) from err
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-
-    await coordinator.async_config_entry_first_refresh()
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     return True

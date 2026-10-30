@@ -508,6 +508,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             iv_index=iv_index,
             seq_provider=self.next_seq,
         )
+        # A persisted IV Index was learned from an authenticated beacon.
+        self.session.iv_confirmed = self._persisted_iv_index is not None
         # Rotate *before* the proxy exists if the stored SEQ is already past
         # the threshold (e.g. first start after upgrading), so the filter
         # list computed below already carries the fresh SRC.

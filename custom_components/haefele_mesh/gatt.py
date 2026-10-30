@@ -23,6 +23,7 @@ broke on nodes that accept GATT but aren't functional proxies (e.g.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import struct
 from collections.abc import Awaitable, Callable
@@ -37,11 +38,22 @@ from homeassistant.core import HomeAssistant
 
 from .access_codec import decode_opcode, encode_opcode
 from .const import (
+    IV_INDEX_MAX_JUMP,
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
     MESH_PROXY_SERVICE_UUID,
+    PROXY_FILTER_MAX_ADDRESSES,
 )
-from .mesh_crypto import aes_ccm_decrypt, aes_ccm_encrypt, aes_ecb, k2, k3, k4
+from .mesh_crypto import (
+    aes_ccm_decrypt,
+    aes_ccm_encrypt,
+    aes_ecb,
+    beacon_key,
+    k2,
+    k3,
+    k4,
+    secure_beacon_auth,
+)
 
 # Mesh Proxy advertisement service-data "Identification Type" byte values
 # (Mesh Profile spec 7.2.2.2). We currently match Network ID only — it's
@@ -87,6 +99,12 @@ class MeshSession:
         # Derived from NetKey: 8-byte Network ID (used to recognise Secure
         # Network Beacons from our own mesh).
         self.network_id = k3(self._net_key)
+        # Derived from NetKey: BeaconKey, authenticates Secure Network Beacons.
+        self.beacon_key = beacon_key(self._net_key)
+        # True once the IV Index comes from a beacon (now or persisted from an
+        # earlier one) rather than from the .connect export. Until then a
+        # larger-than-normal IV jump is accepted so a stale export still works.
+        self.iv_confirmed = False
         # Derived from AppKey: 6-bit AID
         self.aid = k4(self._app_key)
 
@@ -131,22 +149,40 @@ class MeshSession:
         seq = await self._seq_provider(src)
         ctl, ttl = 1, 0
         plaintext = struct.pack(">H", 0x0000) + message  # DST = 0x0000
-        return self._wrap_network_pdu(plaintext, ctl=ctl, ttl=ttl, seq=seq, src=src)
+        return self._wrap_network_pdu(
+            plaintext, ctl=ctl, ttl=ttl, seq=seq, src=src, proxy=True,
+        )
 
-    def _wrap_network_pdu(
-        self, plaintext: bytes, ctl: int, ttl: int, seq: int,
-        src: int | None = None,
+    def _net_nonce(
+        self, ctl_ttl: int, seq: int, src: int, proxy: bool = False,
     ) -> bytes:
-        """Encrypt + obfuscate a network-layer plaintext into a Network PDU."""
-        if src is None:
-            src = self.src
-        net_nonce = (
-            bytes([0x00, (ctl << 7) | (ttl & 0x7F)])
+        """Network nonce (type 0x00) or Proxy nonce (type 0x03).
+
+        Mesh Profile 1.0 §3.8.5.1 / §3.8.5.4: Proxy Configuration
+        messages use the Proxy nonce, whose second octet is a zero pad
+        instead of CTL|TTL. Using the Network nonce for them makes the
+        proxy fail the NetMIC and drop the message without a reply.
+        """
+        if proxy:
+            head = bytes([0x03, 0x00])
+        else:
+            head = bytes([0x00, ctl_ttl & 0xFF])
+        return (
+            head
             + seq.to_bytes(3, "big")
             + struct.pack(">H", src)
             + bytes([0x00, 0x00])
             + struct.pack(">I", self.iv_index)
         )
+
+    def _wrap_network_pdu(
+        self, plaintext: bytes, ctl: int, ttl: int, seq: int,
+        src: int | None = None, proxy: bool = False,
+    ) -> bytes:
+        """Encrypt + obfuscate a network-layer plaintext into a Network PDU."""
+        if src is None:
+            src = self.src
+        net_nonce = self._net_nonce((ctl << 7) | (ttl & 0x7F), seq, src, proxy=proxy)
         tag_length = 8 if ctl else 4
         encrypted = aes_ccm_encrypt(self._enc_key, net_nonce, plaintext, tag_length=tag_length)
 
@@ -226,7 +262,7 @@ class MeshSession:
 
     def decode_proxy_config(self, pdu: bytes) -> tuple[int, bytes] | None:
         """Decrypt an inbound Proxy Configuration PDU, return (opcode, params)."""
-        header = self._decode_network_header(pdu, expected_ctl=1)
+        header = self._decode_network_header(pdu, expected_ctl=1, proxy=True)
         if header is None:
             return None
         _ctl, _seq, _src, plaintext = header
@@ -237,7 +273,7 @@ class MeshSession:
         return opcode, plaintext[3:]
 
     def _decode_network_header(
-        self, pdu: bytes, expected_ctl: int | None = None
+        self, pdu: bytes, expected_ctl: int | None = None, proxy: bool = False,
     ) -> tuple[int, int, int, bytes] | None:
         """Strip obfuscation + net encryption. Returns (ctl, seq, src, plaintext)."""
         if len(pdu) < 10:
@@ -268,13 +304,7 @@ class MeshSession:
             _LOGGER.debug("Net ciphertext too short (src=%04X)", src)
             return None
 
-        net_nonce = (
-            bytes([0x00, ctl_ttl])
-            + seq.to_bytes(3, "big")
-            + struct.pack(">H", src)
-            + bytes([0x00, 0x00])
-            + struct.pack(">I", self.iv_index)
-        )
+        net_nonce = self._net_nonce(ctl_ttl, seq, src, proxy=proxy)
         try:
             plaintext = aes_ccm_decrypt(
                 self._enc_key, net_nonce, encrypted, tag_length=net_mic_len
@@ -335,6 +365,9 @@ class MeshProxyConnection:
         self._send_lock = asyncio.Lock()
         # Signalled whenever a Proxy Filter Status is received.
         self._filter_status_event: asyncio.Event = asyncio.Event()
+        # Last Proxy Filter Status seen: (filter_type, list_size), or None.
+        # Exposed in diagnostics to confirm the proxy accepted our filter.
+        self.last_filter_status: tuple[int, int] | None = None
         # Signalled on the first Secure Network Beacon (proxy PDU type=0x01).
         # Used as the real 'is this a functional proxy?' test — the Filter
         # Status ACK isn't reliable (Häfele firmware doesn't send it).
@@ -895,17 +928,17 @@ class MeshProxyConnection:
           [1]    flags (bit0=key refresh, bit1=IV update)
           [2:10] network ID (8 bytes)
           [10:14] IV Index (big-endian 32-bit)
-          [14:22] authentication value (8 bytes; skipped, we don't
-                  verify BeaconKey auth here)
+          [14:22] authentication value (8 bytes, AES-CMAC with BeaconKey)
 
-        If the beacon comes from our own network (matching network ID
-        derived from our NetKey via k3) AND its IV Index differs from
-        our current one, update the session IV Index. This is the
-        heuristic that lets inbound Status messages decrypt after an
-        IV Update procedure has advanced the network since the config
-        file was exported.
+        The Network ID and IV Index travel in clear, so anyone in BLE range
+        can forge them; only the authentication value proves the sender
+        holds our NetKey. The IV Index is adopted only when the beacon is
+        ours, authenticates, and moves the IV forward (§3.10.5: never
+        backwards, at most +42 once the IV is known). This lets inbound
+        Status messages decrypt after an IV Update procedure has advanced
+        the network since the config file was exported.
         """
-        if len(pdu) < 14 or pdu[0] != 0x01:
+        if len(pdu) < 22 or pdu[0] != 0x01:
             _LOGGER.debug("Non-secure beacon or truncated: %s", pdu.hex())
             return
         flags = pdu[1]
@@ -919,12 +952,39 @@ class MeshProxyConnection:
             flags, net_id.hex(), iv_index,
             "yes" if is_ours else "no", self._session.iv_index,
         )
-        if is_ours and iv_index != self._session.iv_index:
-            _LOGGER.warning(
-                "Updating IV Index %d -> %d based on Secure Network Beacon",
-                self._session.iv_index, iv_index,
+        if not is_ours:
+            return
+        expected = secure_beacon_auth(
+            self._session.beacon_key, flags, net_id, iv_index,
+        )
+        if not hmac.compare_digest(expected, bytes(pdu[14:22])):
+            _LOGGER.debug(
+                "Secure Network Beacon with our Network ID failed "
+                "authentication (iv=%d); ignoring", iv_index,
             )
-            self._session.iv_index = iv_index
+            return
+        current = self._session.iv_index
+        if iv_index == current:
+            self._session.iv_confirmed = True
+            return
+        if iv_index < current:
+            _LOGGER.debug(
+                "Ignoring authenticated beacon with older IV Index %d (ours %d)",
+                iv_index, current,
+            )
+            return
+        if self._session.iv_confirmed and iv_index > current + IV_INDEX_MAX_JUMP:
+            _LOGGER.warning(
+                "Ignoring authenticated beacon: IV Index %d is more than %d "
+                "ahead of ours (%d)", iv_index, IV_INDEX_MAX_JUMP, current,
+            )
+            return
+        _LOGGER.warning(
+            "Updating IV Index %d -> %d based on Secure Network Beacon",
+            current, iv_index,
+        )
+        self._session.iv_index = iv_index
+        self._session.iv_confirmed = True
 
     def _handle_proxy_config(self, pdu: bytes) -> None:
         decoded = self._session.decode_proxy_config(pdu)
@@ -937,6 +997,7 @@ class MeshProxyConnection:
             _LOGGER.debug(
                 "Proxy Filter Status: type=0x%02X size=%d", filter_type, list_size,
             )
+            self.last_filter_status = (filter_type, list_size)
             self._filter_status_event.set()
         else:
             _LOGGER.debug(
@@ -995,12 +1056,17 @@ class MeshProxyConnection:
         """
         if not addresses:
             return
-        # Opcode 0x01 = Add Addresses To Filter, then N big-endian 16-bit addresses.
-        payload = bytes([0x01])
-        for addr in addresses:
-            payload += struct.pack(">H", addr & 0xFFFF)
-        pdu = await self._session.build_proxy_config_pdu(payload)
-        await self._send_proxy_pdu(pdu, pdu_type=0x02)
+        # Opcode 0x01 = Add Addresses To Filter, then N big-endian 16-bit
+        # addresses. A Proxy Configuration message is a single unsegmented
+        # Network PDU, so it holds at most 5 addresses; a longer one is
+        # dropped by the proxy. Send one message per chunk.
+        for start in range(0, len(addresses), PROXY_FILTER_MAX_ADDRESSES):
+            chunk = addresses[start:start + PROXY_FILTER_MAX_ADDRESSES]
+            payload = bytes([0x01])
+            for addr in chunk:
+                payload += struct.pack(">H", addr & 0xFFFF)
+            pdu = await self._session.build_proxy_config_pdu(payload)
+            await self._send_proxy_pdu(pdu, pdu_type=0x02)
         _LOGGER.debug(
             "Proxy filter: added %d addresses: %s",
             len(addresses), ", ".join(f"0x{a:04X}" for a in addresses),

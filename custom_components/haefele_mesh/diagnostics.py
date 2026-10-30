@@ -143,6 +143,7 @@ def _coordinator_snapshot(coordinator: HaefeleCoordinator) -> dict[str, Any]:
         "active_name": None,
         "candidates_order": [],
         "filter_addresses": [],
+        "last_filter_status": None,
     }
     if proxy is not None:
         proxy_state["is_connected"] = proxy.is_connected
@@ -156,12 +157,20 @@ def _coordinator_snapshot(coordinator: HaefeleCoordinator) -> dict[str, Any]:
         proxy_state["filter_addresses"] = [
             f"0x{a:04X}" for a in (proxy._filter_addresses or [])  # noqa: SLF001
         ]
+        # Proof the proxy accepted our filter messages (None = no reply yet).
+        status = getattr(proxy, "last_filter_status", None)
+        if status is not None:
+            proxy_state["last_filter_status"] = {
+                "filter_type": "accept_list" if status[0] == 0 else "reject_list",
+                "list_size": status[1],
+            }
 
     session_state: dict[str, Any] = {}
     if session is not None:
         session_state = {
             "src_address": f"0x{session.src:04X}",
             "iv_index": session.iv_index,
+            "iv_confirmed_by_beacon": getattr(session, "iv_confirmed", None),
             "nid": f"0x{session.nid:02X}",
             "aid": f"0x{session.aid:02X}",
         }
