@@ -15,9 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and buttons A/B/C where the app assigned a scene. The remote's
   retransmissions are de-duplicated by TID. Existing entries need a
   **Reconfigure** with a fresh export to pick up their remotes.
-- A remote press triggers an immediate state read of the lights, so Home
-  Assistant reflects the change in about a second instead of up to 15 s.
-- Spanish translation for the remote's events and triggers.
+- A remote press triggers an immediate state read of the lights in the
+  pressed position's group, so Home Assistant reflects the change in about a
+  second (plus 0.2 s per light) instead of up to 15 s. It never overlaps the
+  regular poll, and presses during a read are queued, not dropped.
+- Device triggers keep working when a position's entity is disabled.
+  Entities of positions that were disabled in the app are enabled again
+  automatically once the position is enabled and the export re-imported.
+- English and Spanish names for the remote's entities, events and triggers
+  (translated entity names need Home Assistant 2024.2 or newer).
+- `tests_ha/`: tests of the event entity, device triggers and bus forwarder
+  against the real Home Assistant package, run by a new `test-ha` CI job.
 
 ## [0.4.7] — 2026-10-30
 

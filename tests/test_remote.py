@@ -12,6 +12,7 @@ from pathlib import Path
 from custom_components.haefele_mesh.connect_parser import parse_connect_file
 from custom_components.haefele_mesh.remote import (
     DEDUP_WINDOW,
+    EVENT_TYPES,
     RemoteDecoder,
     module_count,
 )
@@ -54,9 +55,9 @@ def _parsed_with_remote() -> dict:
     doc = json.loads((FIXTURES / "minimal.connect.json").read_text())
     doc["nodes"].append(_remote_node())
     doc["tos_groups"] = [
-        {"id": GROUP_DESAYUNOS, "name": "Luz desayunos"},
-        {"id": GROUP_FUEGOS, "name": "Luz fuegos"},
-        {"id": GROUP_TODAS, "name": "Todas cocina"},
+        {"id": GROUP_DESAYUNOS, "name": "Luz desayunos", "multicastAddress": 0xC00F},
+        {"id": GROUP_FUEGOS, "name": "Luz fuegos", "multicastAddress": 0xC00B},
+        {"id": GROUP_TODAS, "name": "Todas cocina", "multicastAddress": 0xC017},
     ]
     return parse_connect_file(json.dumps(doc))
 
@@ -90,9 +91,11 @@ def test_export_without_remotes_has_an_empty_list():
     assert parsed["remotes"] == []
 
 
-def test_module_count_falls_back_to_element_count():
+def test_module_count_covers_every_element():
     assert module_count({"elements": 24, "modules": []}) == 6
-    assert module_count({"elements": 24, "modules": [{}, {}]}) == 2
+    # An export listing fewer positions than its elements still gets all six.
+    assert module_count({"elements": 24, "modules": [{}, {}]}) == 6
+    assert module_count({"elements": 4, "modules": [{}, {}]}) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +171,47 @@ def test_status_and_truncated_messages_are_not_presses():
     assert d.decode(0x0017, 0x8204, bytes.fromhex("01"), now=0) is None  # OnOff Status
     assert d.decode(0x0017, 0x8203, bytes.fromhex("01"), now=0) is None  # no TID
     assert d.decode(0x0017, 0x8207, bytes.fromhex("ff7f"), now=0) is None
+
+
+def test_press_on_a_position_the_export_omits_is_still_decoded():
+    remote = {"unicast": 0x0100, "elements": 24, "modules": [{"enabled": True}]}
+    d = RemoteDecoder([remote])
+    event = d.decode(0x0114, 0x8203, bytes.fromhex("0101"), now=0)
+    assert (event.module, event.event_type) == (5, "turn_on")
+
+
+def test_event_carries_the_group_of_the_pressed_position():
+    d = _decoder()
+    assert d.decode(0x001B, 0x8203, bytes.fromhex("0120"), now=0).group_address == 0xC00B
+
+
+def test_odd_remote_fields_never_reject_the_import():
+    doc = json.loads((FIXTURES / "minimal.connect.json").read_text())
+    node = _remote_node()
+    node["tos_node"]["elementCount"] = "abc"
+    node["tos_node"]["firmwareVersion"] = 605
+    node["tos_node"]["proxyBleAddress"] = ["x"]
+    node["tos_devices"][0]["modules"][0] = "not a dict"
+    broken = _remote_node()
+    broken["unicastAddress"] = "zz"
+    doc["nodes"] += [node, broken]
+    doc["tos_groups"] = [{"id": GROUP_FUEGOS, "name": "Luz fuegos", "multicastAddress": "nope"}]
+    parsed = parse_connect_file(json.dumps(doc))
+    assert len(parsed["nodes"]) == 2  # the lights are still imported
+    (remote,) = parsed["remotes"]
+    assert remote["elements"] == 24
+    assert remote["firmware"] == "" and remote["mac"] == ""
+    assert remote["modules"][0]["name"] == "Luz fuegos"
+    assert remote["modules"][0]["group_address"] is None
+
+
+def test_translations_cover_every_event_type():
+    base = Path(__file__).parent.parent / "custom_components" / "haefele_mesh"
+    for name in ("strings.json", "translations/en.json", "translations/es.json"):
+        data = json.loads((base / name).read_text(encoding="utf-8"))
+        triggers = data["device_automation"]["trigger_type"]
+        for key in ("remote_module", "remote_module_group"):
+            states = data["entity"]["event"][key]["state_attributes"]["event_type"]["state"]
+            assert set(states) == set(EVENT_TYPES), (name, key)
+        assert set(triggers) == set(EVENT_TYPES), name
+        assert "position_24" in data["device_automation"]["trigger_subtype"], name

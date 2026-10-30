@@ -24,12 +24,50 @@
       "position_6": "Posición 6",
       "position_7": "Posición 7",
       "position_8": "Posición 8",
-      "position_9": "Posición 9"
+      "position_9": "Posición 9",
+      "position_10": "Posición 10",
+      "position_11": "Posición 11",
+      "position_12": "Posición 12",
+      "position_13": "Posición 13",
+      "position_14": "Posición 14",
+      "position_15": "Posición 15",
+      "position_16": "Posición 16",
+      "position_17": "Posición 17",
+      "position_18": "Posición 18",
+      "position_19": "Posición 19",
+      "position_20": "Posición 20",
+      "position_21": "Posición 21",
+      "position_22": "Posición 22",
+      "position_23": "Posición 23",
+      "position_24": "Posición 24"
     }
   },
   "entity": {
     "event": {
       "remote_module": {
+        "name": "Posición {position}",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "turn_on": "Encender",
+              "turn_off": "Apagar",
+              "brightness_max": "Intensidad máxima (anillo arriba)",
+              "brightness_min": "Intensidad mínima (anillo abajo)",
+              "color_temp_cold": "Más fría (anillo derecha)",
+              "color_temp_warm": "Más cálida (anillo izquierda)",
+              "saturation_max": "Saturación máxima",
+              "saturation_min": "Saturación mínima",
+              "hue_max": "Tono máximo",
+              "hue_min": "Tono mínimo",
+              "scene_a": "Botón A",
+              "scene_b": "Botón B",
+              "scene_c": "Botón C"
+            }
+          }
+        }
+      },
+      "remote_module_group": {
+        "name": "Posición {position} ({group})",
         "state_attributes": {
           "event_type": {
             "state": {

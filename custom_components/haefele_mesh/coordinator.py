@@ -144,6 +144,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self._remote_decoder = RemoteDecoder(self.remotes_cfg)
         self._remote_listeners: list[Callable[[RemoteEvent], None]] = []
         self._quick_poll_task: asyncio.Task | None = None
+        # Groups whose lights a quick poll still has to read (None = all).
+        self._quick_poll_groups: set[int | None] = set()
+        # One poll at a time on the shared proxy link, periodic or quick.
+        self._poll_lock = asyncio.Lock()
         # Per-node availability (True means the mesh is reachable *and* we
         # have no reason to believe the node specifically is offline; we
         # don't currently track per-node liveness beyond "mesh is up").
@@ -203,9 +207,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 _LOGGER.exception("Remote listener failed")
         # The press changed the lights it controls: read their state now
         # instead of waiting for the next periodic poll.
-        self._schedule_quick_poll()
+        self._schedule_quick_poll(event.group_address)
 
-    def _schedule_quick_poll(self) -> None:
+    def _schedule_quick_poll(self, group: int | None) -> None:
+        """Read the lights of ``group`` soon (None: every light).
+
+        Presses that arrive while a quick poll is running are queued and
+        read in another pass, never dropped.
+        """
+        self._quick_poll_groups.add(group)
         if self._quick_poll_task is not None and not self._quick_poll_task.done():
             return
         self._quick_poll_task = self._spawn_background(
@@ -213,10 +223,12 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         )
 
     async def _quick_poll(self) -> None:
-        # Let the lights apply the command (and the remote's retransmission
-        # arrive) before asking for their state.
-        await asyncio.sleep(QUICK_POLL_DELAY)
-        await self._poll_all_nodes()
+        while self._quick_poll_groups:
+            # Let the lights apply the command (and the remote's
+            # retransmission arrive) before asking for their state.
+            await asyncio.sleep(QUICK_POLL_DELAY)
+            groups, self._quick_poll_groups = self._quick_poll_groups, set()
+            await self._poll_all_nodes(None if None in groups else groups)
 
     # ------------------------------------------------------------------
     # SEQ management
@@ -741,7 +753,12 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             except Exception:
                 _LOGGER.exception("State poll loop crashed, continuing")
 
-    async def _poll_all_nodes(self) -> None:
+    async def _poll_all_nodes(self, groups: set[int] | None = None) -> None:
+        """Poll every light, or only those subscribed to one of ``groups``."""
+        async with self._poll_lock:
+            await self._poll_nodes_locked(groups)
+
+    async def _poll_nodes_locked(self, groups: set[int] | None) -> None:
         """Send exactly one state Get per node.
 
         Every Get costs one SEQ, so we only ask for the status the light
@@ -756,6 +773,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         for node_cfg in self._nodes_cfg:
             unicast = node_cfg.get("unicast")
             if not unicast or self.proxy is None:
+                continue
+            if groups is not None and not groups & set(node_cfg.get("groups") or []):
                 continue
             try:
                 if _polls_ctl(node_cfg):

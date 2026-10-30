@@ -745,3 +745,64 @@ def test_unsubscribed_listener_gets_nothing():
 
     asyncio.run(run())
     assert events == []
+
+
+def _remote_with_group(group):
+    modules = [{"index": i, "enabled": True, "name": None, "scenes": [],
+                "group_address": group if i == 0 else None} for i in range(6)]
+    return {**_REMOTE, "modules": modules}
+
+
+def test_quick_poll_reads_only_the_lights_of_the_pressed_group(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_remote_with_group(0xC001)])
+    c.proxy = FakeProxy()
+
+    async def run():
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == [("ctl", 0x0017)]  # only the light in group C001
+
+
+def test_press_during_a_quick_poll_is_read_in_another_pass(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_remote_with_group(0xC001)])
+    c.proxy = FakeProxy()
+    original = c.proxy.get_ctl
+
+    async def get_ctl_and_press_again(dst):
+        await original(dst)
+        if len(c.proxy.calls) == 1:  # a second press while the first poll runs
+            c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0002"))
+
+    c.proxy.get_ctl = get_ctl_and_press_again
+
+    async def run():
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == [("ctl", 0x0017), ("ctl", 0x0017)]
+
+
+def test_quick_poll_waits_for_a_running_periodic_poll(monkeypatch):
+    monkeypatch.setattr(coord_mod, "QUICK_POLL_DELAY", 0)
+    monkeypatch.setattr(coord_mod, "STATE_POLL_PER_NODE_GAP", 0)
+    c = _coordinator(remotes=[_remote_with_group(0xC001)])
+    c.proxy = FakeProxy()
+
+    async def run():
+        await c._poll_lock.acquire()  # a periodic poll is in progress
+        c._dispatch_status(0x0100, 0x8203, bytes.fromhex("0101"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert c.proxy.calls == []
+        c._poll_lock.release()
+        await asyncio.gather(*c._background_tasks)
+
+    asyncio.run(run())
+    assert c.proxy.calls == [("ctl", 0x0017)]

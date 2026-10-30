@@ -65,12 +65,50 @@
       "position_6": "Position 6",
       "position_7": "Position 7",
       "position_8": "Position 8",
-      "position_9": "Position 9"
+      "position_9": "Position 9",
+      "position_10": "Position 10",
+      "position_11": "Position 11",
+      "position_12": "Position 12",
+      "position_13": "Position 13",
+      "position_14": "Position 14",
+      "position_15": "Position 15",
+      "position_16": "Position 16",
+      "position_17": "Position 17",
+      "position_18": "Position 18",
+      "position_19": "Position 19",
+      "position_20": "Position 20",
+      "position_21": "Position 21",
+      "position_22": "Position 22",
+      "position_23": "Position 23",
+      "position_24": "Position 24"
     }
   },
   "entity": {
     "event": {
       "remote_module": {
+        "name": "Position {position}",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "turn_on": "On",
+              "turn_off": "Off",
+              "brightness_max": "Brightness max (ring up)",
+              "brightness_min": "Brightness min (ring down)",
+              "color_temp_cold": "Colder (ring right)",
+              "color_temp_warm": "Warmer (ring left)",
+              "saturation_max": "Saturation max",
+              "saturation_min": "Saturation min",
+              "hue_max": "Hue max",
+              "hue_min": "Hue min",
+              "scene_a": "Button A",
+              "scene_b": "Button B",
+              "scene_c": "Button C"
+            }
+          }
+        }
+      },
+      "remote_module_group": {
+        "name": "Position {position} ({group})",
         "state_attributes": {
           "event_type": {
             "state": {

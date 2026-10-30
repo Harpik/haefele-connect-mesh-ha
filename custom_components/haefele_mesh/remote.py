@@ -27,7 +27,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .const import DOMAIN
+
 ELEMENTS_PER_MODULE = 4
+# Fired on the Home Assistant bus for every press; device triggers listen to it.
+REMOTE_BUS_EVENT = f"{DOMAIN}_remote_event"
 DEDUP_WINDOW = 6.0  # seconds; a TID is reused only after 256 presses
 
 OP_ONOFF_SET = 0x8202
@@ -85,14 +89,39 @@ class RemoteEvent:
     module: int
     event_type: str
     attributes: dict[str, Any] = field(default_factory=dict)
+    # Group the pressed position controls, when the export names it.
+    group_address: int | None = None
+
+
+def remote_device_identifier(remote_cfg: dict) -> tuple[str, str]:
+    """Stable device-registry identifier for a remote."""
+    key = remote_cfg.get("uuid") or f"{remote_cfg.get('unicast', 0):04x}"
+    return (DOMAIN, f"remote_{str(key).lower()}")
+
+
+def module_info(remote_cfg: dict, module: int) -> dict:
+    """The export's description of one position (defaults when absent)."""
+    modules = remote_cfg.get("modules") or []
+    if module < len(modules):
+        return modules[module]
+    return {"index": module, "enabled": True, "name": None, "scenes": []}
+
+
+def bus_event_data(device_id: str, event: RemoteEvent) -> dict[str, Any]:
+    """Payload of REMOTE_BUS_EVENT; device triggers match on these keys."""
+    return {
+        **event.attributes,
+        "device_id": device_id,
+        "module": event.module + 1,
+        "type": event.event_type,
+    }
 
 
 def module_count(remote_cfg: dict) -> int:
-    """Number of modules: from the export, else derived from the element count."""
+    """Number of modules: the larger of the export's list and the element count."""
     modules = remote_cfg.get("modules") or []
-    if modules:
-        return len(modules)
-    return max(int(remote_cfg.get("elements") or 0) // ELEMENTS_PER_MODULE, 1)
+    from_elements = int(remote_cfg.get("elements") or 0) // ELEMENTS_PER_MODULE
+    return max(len(modules), from_elements, 1)
 
 
 class RemoteDecoder:
@@ -134,7 +163,9 @@ class RemoteDecoder:
             return None
         self._seen[key] = now
 
-        return RemoteEvent(lo, module, event_type, attributes)
+        modules = remote.get("modules") or []
+        group = modules[module].get("group_address") if module < len(modules) else None
+        return RemoteEvent(lo, module, event_type, attributes, group)
 
 
 def _event_for(opcode: int, params: bytes, offset: int) -> tuple[str, int, dict] | None:

@@ -115,9 +115,11 @@ Each Häfele remote in the `.connect` export becomes a device with one **event e
 | Ring right / left | `color_temp_cold` / `color_temp_warm` |
 | Buttons A / B / C (only where the app assigned a scene) | `scene_a` / `scene_b` / `scene_c` (with the scene number) |
 
-The remote keeps doing what the Häfele app configured; Home Assistant only listens. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing: enable them in the app (assign a group), export again and run **Reconfigure**. Their entities are created disabled until then.
+The remote keeps doing what the Häfele app configured; Home Assistant only listens. Controls that do nothing on your lights (for example colour temperature on dimmable-only strips, or A/B/C without a scene) are free to use in automations. Positions disabled in the app send nothing and their entities are created disabled. Enable the position in the app (assign a group), export again and run **Reconfigure**: the entity is then enabled automatically, unless you disabled it yourself. Device triggers work even if you disable a position's entity.
 
-After pressing a button, the integration reads the lights' state right away instead of waiting for the 15 s poll.
+After a press, the integration reads the state of the lights in the pressed position's group right away (about a second, plus 0.2 s per light), instead of waiting for the 15 s poll. These reads never overlap the regular poll.
+
+Tests for this part run against the real Home Assistant package in `tests_ha/` (CI job `test-ha`).
 
 Sensors and wall switches are still skipped.
 

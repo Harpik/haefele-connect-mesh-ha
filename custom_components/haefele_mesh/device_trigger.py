@@ -14,7 +14,6 @@ from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
 from homeassistant.helpers.typing import ConfigType
 
 from .const import DOMAIN
-from .event import REMOTE_BUS_EVENT, module_info, remote_device_identifier
 from .remote import (
     EVENT_BRIGHTNESS_MAX,
     EVENT_BRIGHTNESS_MIN,
@@ -26,7 +25,10 @@ from .remote import (
     EVENT_TURN_OFF,
     EVENT_TURN_ON,
     EVENT_TYPES,
+    REMOTE_BUS_EVENT,
     module_count,
+    module_info,
+    remote_device_identifier,
 )
 
 CONF_SUBTYPE = "subtype"
@@ -47,7 +49,7 @@ _SCENE_TRIGGERS = [EVENT_SCENE_A, EVENT_SCENE_B, EVENT_SCENE_C]
 TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
     {
         vol.Required(CONF_TYPE): vol.In(EVENT_TYPES),
-        vol.Required(CONF_SUBTYPE): vol.Match(r"^position_[1-9]$"),
+        vol.Required(CONF_SUBTYPE): vol.Match(r"^position_[1-9][0-9]?$"),
     }
 )
 
