@@ -110,7 +110,7 @@ Each Häfele remote in the `.connect` export becomes a device with one **event e
 
 | Control (remote v2) | Event type |
 |---|---|
-| Centre button (on / off) | `turn_on` / `turn_off` |
+| Centre button, short / long press | `turn_on` / `turn_off` |
 | Ring up / down | `brightness_max` / `brightness_min` |
 | Ring right / left | `color_temp_cold` / `color_temp_warm` |
 | Buttons A / B / C (only where the app assigned a scene) | `scene_a` / `scene_b` / `scene_c` (with the scene number) |
@@ -127,9 +127,7 @@ Each position also gets a **mode** select (in the remote's device page, under *C
 | **Home Assistant only** | Every control publishes to an address no light listens to (`0xFEFF`). Nothing reacts by itself; the presses still reach Home Assistant, so you decide in automations what each button does. |
 | **Disabled** | The position sends nothing. |
 
-The remote runs on batteries and sleeps between presses, so a change is **pending** (attribute `pending: true`, hourglass icon) until you press a button on the remote, on any position that is not disabled (a disabled position sends nothing, so Home Assistant can't tell the remote is awake). The remote stays awake a few seconds after the last press; Home Assistant sends the change in that time and keeps it pending, control by control, until the remote confirms it. If it is still pending, press again. The last position that is not disabled can't be disabled from Home Assistant, or no press could ever reach the remote again. The remote's device key is needed for this: entries created before this feature need one **Reconfigure** with the export, after which the selects appear.
-
-In a *Home Assistant only* position the centre button may send *on* every time: the remote decides on/off from the state it believes the light has, and no light answers it there. Use both the *turn on* and *turn off* triggers as "centre button pressed".
+The remote runs on batteries and sleeps between presses, so a change is **pending** (attribute `pending: true`, hourglass icon) until you press a button on the remote, on any position that is not disabled (a disabled position sends nothing, so Home Assistant can't tell the remote is awake). The remote stays awake a few seconds after the last press; Home Assistant sends the change in that time and keeps it pending, control by control, until the remote confirms it. If it is still pending, press again: several presses in a row keep the remote awake, so a whole position usually takes 3 to 6 presses. The last position that is not disabled can't be disabled from Home Assistant, or no press could ever reach the remote again. The remote's device key is needed for this: entries created before this feature need one **Reconfigure** with the export, after which the selects appear.
 
 The Häfele app does not know about these changes: it keeps showing a position set to *Home Assistant only* as disabled, and editing the remote in the app may overwrite them. Set the mode again from Home Assistant if that happens.
 
