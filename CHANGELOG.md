@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-30
+
 ### Added
 
 - **Häfele remotes in Home Assistant.** Each remote in the `.connect` export
@@ -372,6 +374,7 @@ Initial tagged release after the single-proxy refactor
 (`MeshSession` + `MeshProxyConnection` + `HaefeleCoordinator`,
 with the legacy per-node `MeshGattNode` removed).
 
+[0.5.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.5.0
 [0.4.7]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.7
 [0.4.6]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.6
 [0.4.5]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.5
