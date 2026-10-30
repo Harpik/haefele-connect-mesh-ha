@@ -24,12 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forge a beacon and move our IV Index, making the lights drop every frame we
   send. Beacons are now checked against the BeaconKey, the IV Index never
   moves backwards, and once it is known it moves forward by at most 42
-  (Mesh Profile §3.10.5). A stale IV Index from the `.connect` export is
-  still corrected by the first authenticated beacon.
-- **A failed setup is retried.** Errors during setup now raise
-  `ConfigEntryNotReady`, so Home Assistant retries with backoff, and whatever
-  the coordinator had started (poll loop, proxy link) is stopped first so a
-  retry never leaves a second one running.
+  (Mesh Profile §3.10.5). An IV Index that only comes from the `.connect`
+  export (or from a store written by 0.4.6 or earlier) is not treated as
+  known, so the first authenticated beacon can still correct it by any
+  amount; the store now records whether a beacon confirmed it.
+- **A failed setup is retried.** Transient errors during setup now raise
+  `ConfigEntryNotReady`, so Home Assistant retries with backoff; invalid entry
+  data raises `ConfigEntryError` and is not retried. Whatever the coordinator
+  had started (poll loop, proxy link) is stopped first so a retry never leaves
+  a second one running.
 
 ### Added
 

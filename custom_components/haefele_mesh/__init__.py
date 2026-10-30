@@ -6,7 +6,7 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady
 
 from .const import DOMAIN, LEGACY_SRC_ADDRESSES, SRC_ADDRESS_BASE
 from .coordinator import HaefeleCoordinator
@@ -50,18 +50,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Häfele Connect Mesh from a config entry."""
     coordinator = HaefeleCoordinator(hass, dict(entry.data), entry_id=entry.entry_id)
 
-    # A failed setup raises ConfigEntryNotReady so Home Assistant retries it
-    # with backoff, instead of leaving the entry in a permanent error state.
-    # Whatever the coordinator already started (poll loop, proxy link) is
-    # torn down first; otherwise every retry would leave one running.
+    # A transient failure raises ConfigEntryNotReady so Home Assistant retries
+    # it with backoff. Bad entry data (malformed keys, missing fields) cannot
+    # fix itself, so it raises ConfigEntryError and is not retried. Either
+    # way, whatever the coordinator already started (poll loop, proxy link)
+    # is torn down first; otherwise every retry would leave one running.
     try:
         await coordinator.async_setup()
         await coordinator.async_config_entry_first_refresh()
     except Exception as err:
-        _LOGGER.debug("Häfele Mesh setup failed", exc_info=True)
         await coordinator.async_shutdown()
-        if isinstance(err, ConfigEntryNotReady):
+        if isinstance(err, (ConfigEntryNotReady, ConfigEntryError)):
             raise
+        if isinstance(err, (ValueError, KeyError, TypeError)):
+            _LOGGER.exception("Häfele Mesh entry data is invalid")
+            raise ConfigEntryError(
+                f"Invalid Häfele Mesh configuration: {err!r}"
+            ) from err
+        _LOGGER.debug("Häfele Mesh setup failed, will retry", exc_info=True)
         raise ConfigEntryNotReady(
             f"Failed to set up Häfele Mesh coordinator: {err}"
         ) from err

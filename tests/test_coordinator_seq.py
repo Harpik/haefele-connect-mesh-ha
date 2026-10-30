@@ -625,16 +625,41 @@ def test_pdu_uses_src_from_before_seq_provider_rotates():
 # IV Index provenance (beacon jump limit only applies to a known IV)
 # ---------------------------------------------------------------------------
 
-def test_persisted_iv_counts_as_confirmed():
-    FakeStore.data[STORE_KEY] = {"200": 1000, "_iv_index": 7}
-    c = _coordinator()
-    asyncio.run(_setup(c))
-    assert c.session.iv_index == 7
-    assert c.session.iv_confirmed is True
-
-
 def test_iv_from_connect_export_is_not_confirmed():
     c = _coordinator()
     asyncio.run(_setup(c))
     assert c.session.iv_index == 1
+    assert c.session.iv_confirmed is False
+
+
+def test_saved_export_iv_stays_unconfirmed_across_restarts():
+    # The export's IV is written to the store on the first start; a restart
+    # (or a ConfigEntryNotReady retry) must not promote it to "confirmed".
+    asyncio.run(_setup(_coordinator()))
+    assert FakeStore.data[STORE_KEY]["_iv_index"] == 1
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_confirmed is False
+
+
+def test_beacon_confirmed_iv_survives_a_restart():
+    async def first_run():
+        c = _coordinator()
+        await c.async_setup()
+        c.session.iv_index = 9
+        c.session.iv_confirmed = True  # as set by an authenticated beacon
+        await c.async_shutdown()
+
+    asyncio.run(first_run())
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 9
+    assert c.session.iv_confirmed is True
+
+
+def test_iv_stored_by_older_release_is_not_confirmed():
+    FakeStore.data[STORE_KEY] = {"200": 1000, "_iv_index": 7}
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert c.session.iv_index == 7
     assert c.session.iv_confirmed is False

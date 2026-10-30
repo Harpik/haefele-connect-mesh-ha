@@ -24,6 +24,10 @@ class _ConfigEntryNotReady(Exception):
     pass
 
 
+class _ConfigEntryError(Exception):
+    pass
+
+
 class _FakeCoordinator:
     instances: list[_FakeCoordinator] = []
     fail_setup: Exception | None = None
@@ -54,6 +58,7 @@ def integration(monkeypatch):
     """
     exc = types.ModuleType("homeassistant.exceptions")
     exc.ConfigEntryNotReady = _ConfigEntryNotReady
+    exc.ConfigEntryError = _ConfigEntryError
     monkeypatch.setitem(sys.modules, "homeassistant.exceptions", exc)
     if "homeassistant.config_entries" not in sys.modules:
         ce = types.ModuleType("homeassistant.config_entries")
@@ -118,3 +123,21 @@ def test_successful_setup_registers_and_forwards(integration):
     assert coordinator.shutdown_calls == 0
     assert hass.data[integration.DOMAIN]["abc"] is coordinator
     assert forwarded == [(entry, ("light",))]
+
+
+def test_invalid_entry_data_is_a_permanent_error(integration):
+    _FakeCoordinator.fail_setup = ValueError("non-hexadecimal number found")
+    hass, entry, forwarded = _hass_and_entry()
+    with pytest.raises(_ConfigEntryError, match="non-hexadecimal"):
+        asyncio.run(integration.async_setup_entry(hass, entry))
+    (coordinator,) = _FakeCoordinator.instances
+    assert coordinator.shutdown_calls == 1
+    assert forwarded == []
+
+
+def test_config_entry_error_from_coordinator_is_not_downgraded(integration):
+    _FakeCoordinator.fail_refresh = _ConfigEntryError("auth failed")
+    hass, entry, _forwarded = _hass_and_entry()
+    with pytest.raises(_ConfigEntryError, match="auth failed"):
+        asyncio.run(integration.async_setup_entry(hass, entry))
+    assert _FakeCoordinator.instances[0].shutdown_calls == 1
