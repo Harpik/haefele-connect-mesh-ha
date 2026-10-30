@@ -11,15 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Proxy filter messages were never accepted by the proxy.** Proxy
   Configuration messages were encrypted with the Network nonce instead of the
   Proxy nonce (Mesh Profile §3.8.5.4), so the proxy failed their NetMIC and
-  dropped them silently. This is the likely reason no Proxy Filter Status
-  was ever seen (not yet confirmed on real hardware).
+  dropped them silently, and no Proxy Filter Status was ever seen. Confirmed
+  on hardware: with the Proxy nonce a Häfele proxy answers every one.
   Only our own SRC reached the filter (the proxy adds it automatically), so
   publications from the remote and the Häfele app never reached Home
   Assistant and state changes showed up only through the 15 s poll. Incoming
   Proxy Configuration messages are now decrypted with the Proxy nonce too.
-- **Filter list split into messages of at most 5 addresses.** One "Add
-  Addresses to Filter" message is a single 29-byte Network PDU; a longer list
-  (13 addresses on a typical kitchen) would not fit.
+- **The proxy now forwards all mesh traffic.** Häfele proxies keep at most
+  4 addresses in their filter list (seen on hardware), too few for every
+  group the remote publishes to. The filter is now set to an empty reject
+  list, which forwards everything; if a proxy does not confirm that, an
+  accept list is used as before, with our SRC first, then groups, then
+  lamps. Address lists are sent in messages of at most 5 addresses: one "Add
+  Addresses to Filter" message is a single 29-byte Network PDU.
 - **Secure Network Beacons are authenticated before their IV Index is used.**
   The Network ID and IV Index travel in clear, so anyone in BLE range could
   forge a beacon and move our IV Index, making the lights drop every frame we

@@ -683,3 +683,10 @@ def test_shutdown_after_failed_store_load_keeps_the_store(monkeypatch):
 
     asyncio.run(run())
     assert FakeStore.data["haefele_mesh_seq_E1"] == stored
+
+
+def test_filter_addresses_put_src_then_groups_then_unicasts():
+    # A proxy that falls back to a small accept list keeps the first ones.
+    c = _coordinator()
+    asyncio.run(_setup(c))
+    assert FakeProxy.instances[0].filter_addresses == [0x00C8, 0xC001, 0x0017, 0x002F, 0x003A]

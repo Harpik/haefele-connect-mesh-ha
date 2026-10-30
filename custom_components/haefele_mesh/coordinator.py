@@ -642,18 +642,27 @@ class HaefeleCoordinator(DataUpdateCoordinator):
           * every lamp unicast (replies overheard via relay)
           * every group configured on the lamps (so publications from
             the physical remote or the Häfele app come through)
+
+        Ordered by priority, because a proxy may keep only the first few
+        when it falls back to an accept list: our SRC, then groups, then
+        lamp unicasts (replies to our SRC already reach us).
         """
-        addrs: set[int] = set()
-        if self.session is not None:
-            addrs.add(self.session.src & 0xFFFF)
+        groups: set[int] = set()
+        unicasts: set[int] = set()
         for n in self._nodes_cfg:
             unicast = n.get("unicast")
             if isinstance(unicast, int):
-                addrs.add(unicast & 0xFFFF)
+                unicasts.add(unicast & 0xFFFF)
             for g in n.get("groups", []) or []:
                 if isinstance(g, int):
-                    addrs.add(g & 0xFFFF)
-        return sorted(addrs)
+                    groups.add(g & 0xFFFF)
+        ordered: list[int] = []
+        if self.session is not None:
+            ordered.append(self.session.src & 0xFFFF)
+        for addr in [*sorted(groups), *sorted(unicasts)]:
+            if addr not in ordered:
+                ordered.append(addr)
+        return ordered
 
     def is_available(self, node_id: str) -> bool:
         return self.availability.get(node_id, False)

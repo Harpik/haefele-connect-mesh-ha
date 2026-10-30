@@ -42,6 +42,7 @@ from .const import (
     MESH_PROXY_DATA_IN_UUID,
     MESH_PROXY_DATA_OUT_UUID,
     MESH_PROXY_SERVICE_UUID,
+    FILTER_STATUS_TIMEOUT,
     PROXY_FILTER_MAX_ADDRESSES,
 )
 from .mesh_crypto import (
@@ -392,6 +393,8 @@ class MeshProxyConnection:
         # Last Proxy Filter Status seen: (filter_type, list_size), or None.
         # Exposed in diagnostics to confirm the proxy accepted our filter.
         self.last_filter_status: tuple[int, int] | None = None
+        # True while the proxy runs an empty reject list (forwards everything).
+        self._forward_all = False
         # Signalled on the first Secure Network Beacon (proxy PDU type=0x01).
         # Used as the real 'is this a functional proxy?' test — the Filter
         # Status ACK isn't reliable (Häfele firmware doesn't send it).
@@ -699,15 +702,9 @@ class MeshProxyConnection:
             await self._teardown_active()
             return False
 
-        # Got a beacon — real proxy. Now configure the filter. Häfele
-        # firmware is flaky about Set Filter Type, so we send Set Filter
-        # Type = accept-list AND explicitly add all addresses we care
-        # about. No reliance on Filter Status ACK (we've confirmed this
-        # firmware never sends it).
+        # Got a beacon — real proxy. Now configure the filter.
         try:
-            await self._configure_proxy_filter(reject_list=False)
-            if self._filter_addresses:
-                await self.add_filter_addresses(self._filter_addresses)
+            await self._setup_proxy_filter()
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Proxy filter setup failed on %s: %s", mac, err)
 
@@ -1080,6 +1077,39 @@ class MeshProxyConnection:
         pdu = await self._session.build_access_network_pdu(dst, opcode, params)
         await self._send_proxy_pdu(pdu, pdu_type=0x00)
 
+    async def _setup_proxy_filter(self) -> None:
+        """Make the proxy forward the traffic we care about.
+
+        Preferred: an empty reject list, i.e. forward everything, so group
+        publications from the remote and the app reach us whatever their
+        address. Häfele proxies keep at most 4 addresses in their filter
+        list (verified on hardware), too few for an accept list of every
+        group. If the proxy does not confirm the reject list, fall back to an
+        accept list with our addresses in priority order.
+        """
+        self._forward_all = False
+        self.last_filter_status = None
+        self._filter_status_event.clear()
+        await self._configure_proxy_filter(reject_list=True)
+        try:
+            await asyncio.wait_for(
+                self._filter_status_event.wait(), timeout=FILTER_STATUS_TIMEOUT,
+            )
+        except TimeoutError:
+            pass
+        status = self.last_filter_status
+        if status is not None and status[0] == 0x01:
+            self._forward_all = True
+            _LOGGER.debug("Proxy confirmed reject list: forwarding all traffic")
+            return
+        _LOGGER.debug(
+            "Proxy did not confirm a reject list (status=%s); using an accept list",
+            status,
+        )
+        await self._configure_proxy_filter(reject_list=False)
+        if self._filter_addresses:
+            await self.add_filter_addresses(self._filter_addresses)
+
     async def _configure_proxy_filter(self, reject_list: bool = True) -> None:
         filter_type = 0x01 if reject_list else 0x00
         message = bytes([0x00, filter_type])  # Opcode 0x00 = Set Filter Type
@@ -1101,6 +1131,9 @@ class MeshProxyConnection:
         publications from the physical remote / app).
         """
         if not addresses:
+            return
+        if self._forward_all:
+            # Adding to a reject list would block these addresses.
             return
         # Opcode 0x01 = Add Addresses To Filter, then N big-endian 16-bit
         # addresses. A Proxy Configuration message is a single unsegmented

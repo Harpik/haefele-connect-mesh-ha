@@ -316,3 +316,61 @@ def test_replayed_in_progress_beacon_for_current_iv_is_ignored():
     _proxy(s)._parse_secure_network_beacon(_beacon(s, IV_INDEX, flags=0x02))
     assert s.iv_update is False
     assert s.tx_iv_index == IV_INDEX
+
+
+# ---------------------------------------------------------------------------
+# Filter setup: prefer an empty reject list, fall back to an accept list
+# ---------------------------------------------------------------------------
+
+
+def _scripted_proxy(reply_filter_type: int | None, monkeypatch):
+    """A proxy whose Set Filter Type answers with the given type (None = silent)."""
+    import custom_components.haefele_mesh.gatt as gatt_mod
+
+    monkeypatch.setattr(gatt_mod, "FILTER_STATUS_TIMEOUT", 0.05)
+    s = _session()
+    proxy = _proxy(s)
+    proxy.set_filter_addresses([SRC, 0xC00F, 0xC00B, 0xC017, 0x002F, 0x003A])
+    sent: list[tuple[int, bytes]] = []
+
+    async def _send(pdu: bytes, pdu_type: int = 0x00) -> None:
+        opcode, params = s.decode_proxy_config(pdu)
+        sent.append((opcode, params))
+        if opcode == 0x00 and reply_filter_type is not None:
+            # Real firmware answers a Set Filter Type with a Filter Status.
+            ftype = params[0] if reply_filter_type == -1 else reply_filter_type
+            status = await s.build_proxy_config_pdu(bytes([0x03, ftype, 0x00, 0x00]))
+            proxy._handle_proxy_config(status)
+
+    proxy._send_proxy_pdu = _send
+    return s, proxy, sent
+
+
+def test_filter_setup_prefers_forward_all(monkeypatch):
+    _s, proxy, sent = _scripted_proxy(-1, monkeypatch)  # echoes the type asked
+    asyncio.run(proxy._setup_proxy_filter())
+    assert sent == [(0x00, b"\x01")]  # Set Filter Type = reject list, nothing else
+    assert proxy._forward_all is True
+    assert proxy.last_filter_status == (0x01, 0)
+    # A later SRC rotation must not add itself to the reject list (= block it).
+    asyncio.run(proxy.add_filter_addresses([0x7EFF]))
+    assert sent == [(0x00, b"\x01")]
+
+
+def test_filter_setup_falls_back_to_accept_list_when_reject_is_refused(monkeypatch):
+    _s, proxy, sent = _scripted_proxy(0x00, monkeypatch)  # stays accept list
+    asyncio.run(proxy._setup_proxy_filter())
+    assert proxy._forward_all is False
+    assert sent[0] == (0x00, b"\x01")
+    assert sent[1] == (0x00, b"\x00")
+    added = b"".join(p for op, p in sent[2:] if op == 0x01)
+    assert [int.from_bytes(added[i:i + 2], "big") for i in range(0, len(added), 2)] == [
+        SRC, 0xC00F, 0xC00B, 0xC017, 0x002F, 0x003A,
+    ]
+
+
+def test_filter_setup_falls_back_when_proxy_is_silent(monkeypatch):
+    _s, proxy, sent = _scripted_proxy(None, monkeypatch)
+    asyncio.run(proxy._setup_proxy_filter())
+    assert proxy._forward_all is False
+    assert [op for op, _p in sent] == [0x00, 0x00, 0x01, 0x01]
