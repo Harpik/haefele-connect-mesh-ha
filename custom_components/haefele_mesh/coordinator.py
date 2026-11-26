@@ -32,6 +32,7 @@ from .const import (
     LINK_PROBE_MAX_NODES,
     LINK_PROBE_TIMEOUT,
     LINK_RECONNECT_BACKOFF_MAX,
+    LINK_REPLY_WINDOW,
     LINK_STALE_AFTER,
     NODE_ADDRESS_MARGIN,
     ROTATED_SRC_SEQ_START,
@@ -194,6 +195,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # moment the current link came up.
         self._last_light_rx: float | None = None
         self._link_up_at: float | None = None
+        # link_generation of the link _link_up_at refers to.
+        self._link_seen_generation = 0
+        # Lights we sent a Get to (poll or probe) -> time.monotonic().
+        self._awaiting_reply: dict[int, float] = {}
         # Set when a probe went unanswered; the lights stay unavailable
         # until one of them talks again.
         self._link_suspect = False
@@ -238,7 +243,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     def _dispatch_status(self, src_address: int, opcode: int, params: bytes) -> None:
         if src_address in self._light_unicasts:
-            self._note_light_rx(src_address)
+            self._note_light_frame(src_address)
         for cb in self._status_handlers.get(src_address, ()):
             try:
                 cb(opcode, params)
@@ -747,8 +752,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.proxy.set_filter_addresses(self._filter_addresses())
 
         ok = await self.proxy.connect_any()
-        if ok:
-            self._note_link_up()
+        self._track_link()
         # Mark every node as available if *any* proxy is up — they're all
         # reachable through the mesh from there.
         self._set_availability(ok)
@@ -796,9 +800,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         """
         if self.proxy is None:
             return
-        ok = self.proxy.is_connected
-        if ok:
-            self._note_link_up()
+        # A link the watchdog found silent stays unavailable until a light
+        # answers, even if a real drop and auto-reconnect happened since.
+        self._track_link()
+        ok = self.proxy.is_connected and not self._link_suspect
         self._set_availability(ok)
         # Push the new state to every listener (light entities) and also
         # schedule a regular refresh so the next heartbeat stays aligned.
@@ -820,8 +825,10 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             ok = await self.proxy.connect_any()
             if self._closing:
                 return {nid: {"available": False} for nid in self.availability}
-            if ok:
-                self._note_link_up()
+            self._track_link()
+            # Still unproven if the lights were unavailable: the next
+            # heartbeat probes the new link.
+            ok = ok and not self._link_suspect
         elif self._link_suspect or self._link_idle_for() >= LINK_STALE_AFTER:
             # Open is not the same as working: on 26-11 a link stayed open
             # for hours while no frame went through it.
@@ -838,10 +845,22 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         for nid in self.availability:
             self.availability[nid] = ok
 
-    def _note_link_up(self) -> None:
-        self._link_up_at = time.monotonic()
+    def _expect_reply(self, dst: int) -> None:
+        """Remember that we just asked light ``dst`` for its state."""
+        self._awaiting_reply[dst & 0xFFFF] = time.monotonic()
 
-    def _note_light_rx(self, src_address: int) -> None:
+    def _note_light_frame(self, src_address: int) -> None:
+        """A light spoke. Only a reply to our own Get proves the link.
+
+        A light also publishes its state on its own (wall switch, Häfele
+        app): that proves we hear the mesh, not that the mesh hears us.
+        """
+        sent = self._awaiting_reply.pop(src_address, None)
+        if sent is None or time.monotonic() - sent > LINK_REPLY_WINDOW:
+            return
+        self._note_light_reply(src_address)
+
+    def _note_light_reply(self, src_address: int) -> None:
         self._last_light_rx = time.monotonic()
         # The link works: a later stuck link starts from a clean backoff.
         self._forced_backoff = 0.0
@@ -864,23 +883,41 @@ class HaefeleCoordinator(DataUpdateCoordinator):
                 )
 
     def _link_idle_for(self) -> float:
-        """Seconds since the link last proved it works (or came up)."""
-        ref = max(self._last_light_rx or 0.0, self._link_up_at or 0.0)
-        if ref == 0.0:
-            # Connected without us noticing the moment (should not happen):
-            # start counting now rather than probing straight away.
-            self._note_link_up()
+        """Seconds since the link last proved it works (or came up).
+
+        Every new link is noticed by its generation, whoever opened it
+        (setup, heartbeat, auto-reconnect, a light command), and gets the
+        full grace period instead of inheriting the old link's silence.
+        """
+        if self._track_link():
             return 0.0
+        ref = max(self._last_light_rx or 0.0, self._link_up_at or 0.0)
         return time.monotonic() - ref
+
+    def _track_link(self) -> bool:
+        """Note when a new link shows up; True if this one is new."""
+        if self.proxy is None:
+            return False
+        generation = self.proxy.link_generation
+        if generation == self._link_seen_generation:
+            return False
+        self._link_seen_generation = generation
+        self._link_up_at = time.monotonic()
+        return True
 
     async def _probe_link(self) -> bool:
         """Ask a few lights for their on/off state; True if one replies.
 
         Only a reply from the light we asked counts: it proves our frame
         went out through the proxy and the answer came back.
+
+        Only the current link is probed. If it goes away mid-probe the
+        probe stops instead of letting a Get reconnect: the probe timeout
+        would cancel that connect half-way.
         """
         if self.proxy is None or not self.proxy.is_connected:
             return False
+        generation = self.proxy.link_generation
         targets = [
             n["unicast"] & 0xFFFF for n in self._nodes_cfg
             if isinstance(n.get("unicast"), int)
@@ -889,8 +926,14 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             return True  # nothing to ask, nothing to judge the link by
         loop = asyncio.get_running_loop()
         for dst in targets:
+            if (
+                not self.proxy.is_connected
+                or self.proxy.link_generation != generation
+            ):
+                return False
             waiter = loop.create_future()
             self._probe_waiters[dst] = waiter
+            self._expect_reply(dst)
             try:
                 await asyncio.wait_for(
                     self.proxy.get_onoff(dst), LINK_PROBE_TIMEOUT,
@@ -921,11 +964,17 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         # (auto-reconnect after a real drop); that one must not be dropped.
         generation = self.proxy.link_generation
         if await self._probe_link():
-            # The reply went through _note_light_rx, which cleared the
+            # The reply went through _note_light_reply, which cleared the
             # suspect flag and the backoff.
             return True
         if self._closing:
             return False
+        if self.proxy.link_generation != generation:
+            # The link went away during the probe and another one is up
+            # (auto-reconnect): nothing to drop. The new link gets its
+            # grace period; if the lights were already unavailable, the
+            # next heartbeat probes it.
+            return self.proxy.is_connected and not self._link_suspect
 
         self._link_suspect = True
         # Entities go unavailable now, not after the reconnect below (which
@@ -960,8 +1009,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             # Unloaded while connecting: leave no link behind.
             await self.proxy.drop_link(timeout=LINK_DROP_TIMEOUT)
             return False
+        self._track_link()
         if ok:
-            self._note_link_up()
             ok = await self._probe_link()
         if ok:
             _LOGGER.warning(
@@ -1128,6 +1177,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             if groups is not None and not groups & set(node_cfg.get("groups") or []):
                 continue
             try:
+                self._expect_reply(unicast)
                 if _polls_ctl(node_cfg):
                     await self.proxy.get_ctl(unicast)
                 else:

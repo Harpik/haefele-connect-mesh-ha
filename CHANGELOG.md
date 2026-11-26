@@ -12,14 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxy could stay open while no frame went through it: Home Assistant kept
   the lights available and "on", commands went nowhere, and only a reload
   helped. The heartbeat now checks that the link works, not just that it is
-  open. If no light has answered for 90 s it asks up to three lights for
-  their state; if none replies, the link is dropped (even when the BLE stack
-  never confirms the disconnect) and the integration reconnects, trying the
-  other proxies first. The lights are unavailable from the moment the probe
-  fails until a light answers again. Forced reconnects that keep failing
-  back off up to 15 minutes, and three of them within 30 minutes raise a
-  persistent notification. Messages from remotes do not count as proof of a
-  working link (they show the mesh is heard, not that it hears us).
+  open. Only a light's reply to one of our own state requests (the 15 s poll
+  or a probe) counts as proof: frames from remotes, or a state a light
+  publishes by itself after a wall switch or the Häfele app, show that the
+  mesh is heard, not that it hears us. If no light has replied for 90 s, the
+  heartbeat asks up to three lights for their state; if none replies, the
+  link is dropped (even when the BLE stack never confirms the disconnect)
+  and the integration reconnects, trying the other proxies first. The lights
+  are unavailable from the moment the probe fails until a light replies
+  again. Forced reconnects that keep failing back off up to 15 minutes, and
+  three of them within 30 minutes raise a persistent notification.
+- Unloading the integration while it connects no longer leaves a Bluetooth
+  link (and its receive task) open, and a connect cancelled half-way never
+  leaves a link that looks connected without having been set up.
+- A late disconnect report from a link that was already replaced no longer
+  resets the new link's proxy filter or starts a needless reconnect.
 - Stored proxy candidates are now tried in their stored order (last working
   proxy first), as the reconnect logic already assumed.
 

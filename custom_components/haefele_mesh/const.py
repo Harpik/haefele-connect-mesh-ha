@@ -26,6 +26,9 @@ HEARTBEAT_INTERVAL = 60  # seconds
 LINK_STALE_AFTER = 90
 # Seconds to wait for each probe write and for the light's reply.
 LINK_PROBE_TIMEOUT = 4.0
+# Seconds after a Get (poll or probe) in which a light's status counts as
+# its reply, i.e. as proof that the link works both ways.
+LINK_REPLY_WINDOW = 10.0
 # Lights asked, one after another, before the link is declared stuck (a
 # single light can be off at the wall).
 LINK_PROBE_MAX_NODES = 3

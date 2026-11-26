@@ -714,8 +714,10 @@ class MeshProxyConnection:
                     device, name, timeout=timeout_per_candidate,
                 )
                 if ok and self._closed:
-                    # Unloaded while we were connecting.
+                    # Unloaded while we were connecting: close the link and
+                    # the rx pump the connect started.
                     await self._teardown_active()
+                    await self._stop_rx_pump()
                     return False
                 if ok:
                     # Move any matching stored candidate to the front so
@@ -889,6 +891,23 @@ class MeshProxyConnection:
             _LOGGER.debug("Connect to %s (%s) failed: %s", name, mac, err)
             return False
 
+        try:
+            return await self._validate_proxy(client, name, mac)
+        except asyncio.CancelledError:
+            # Cancelled half-way (e.g. a caller's timeout): never leave a
+            # link that skipped the beacon check and the filter setup
+            # looking connected.
+            if self._client is client:
+                await self._teardown_active()
+            else:
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+
+    async def _validate_proxy(self, client, name: str, mac: str) -> bool:
+        """Check a fresh GATT link is a working mesh proxy and set it up."""
         data_in = client.services.get_characteristic(MESH_PROXY_DATA_IN_UUID)
         data_out = client.services.get_characteristic(MESH_PROXY_DATA_OUT_UUID)
         if not data_in or not data_out:
@@ -1027,10 +1046,12 @@ class MeshProxyConnection:
             self._user_disconnecting = was_flagging
 
     def _on_disconnected(self, client) -> None:
-        if self._client is not None and client is not self._client:
-            # A link we already dropped (drop_link gave up waiting for it)
-            # finally reports its disconnect: it says nothing about the
-            # current link.
+        if client is not self._client:
+            # Not the current link: one we already dropped (drop_link gave
+            # up waiting for it) finally reporting its disconnect, or a
+            # candidate connect_any is discarding. Either way no reconnect
+            # is wanted. bleak (and Home Assistant's wrapper) pass the same
+            # client object establish_connection returned.
             _LOGGER.debug("Ignoring disconnect of a previous proxy link")
             return
         _LOGGER.debug("BLE disconnected from proxy %s", self._active_name)
@@ -1100,13 +1121,7 @@ class MeshProxyConnection:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._reconnect_task = None
-        if self._rx_task is not None and not self._rx_task.done():
-            self._rx_task.cancel()
-            try:
-                await self._rx_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        self._rx_task = None
+        await self._stop_rx_pump()
         for task in list(self._ack_tasks):
             task.cancel()
         if self._client is not None:
@@ -1119,6 +1134,15 @@ class MeshProxyConnection:
         self._active_mac = None
         self._active_name = ""
         self._user_disconnecting = False
+
+    async def _stop_rx_pump(self) -> None:
+        if self._rx_task is not None and not self._rx_task.done():
+            self._rx_task.cancel()
+            try:
+                await self._rx_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        self._rx_task = None
 
     async def drop_link(
         self, timeout: float = 10.0, expected_generation: int | None = None,
