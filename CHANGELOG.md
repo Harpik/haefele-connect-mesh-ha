@@ -20,8 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link is dropped (even when the BLE stack never confirms the disconnect)
   and the integration reconnects, trying the other proxies first. The lights
   are unavailable from the moment the probe fails until a light replies
-  again. Forced reconnects that keep failing back off up to 15 minutes, and
-  three of them within 30 minutes raise a persistent notification.
+  again. Until a new link is up, every reconnect (also one started by a
+  light command) tries the stuck proxy last. Forced reconnects that keep
+  failing back off up to 15 minutes, and three of them within 30 minutes
+  raise a persistent notification (the lights may simply be without power,
+  which looks the same from Home Assistant).
 - Unloading the integration while it connects no longer leaves a Bluetooth
   link (and its receive task) open, and a connect cancelled half-way never
   leaves a link that looks connected without having been set up.

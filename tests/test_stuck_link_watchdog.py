@@ -1270,3 +1270,94 @@ def test_reconnected_link_is_probed_90_s_after_it_came_up(clock):
     probes = asyncio.run(run())
 
     assert all(p > 0 for p in probes), probes
+
+
+# ---------------------------------------------------------------------------
+# Review round 3
+# ---------------------------------------------------------------------------
+
+def test_command_reconnecting_during_a_drop_avoids_the_stuck_proxy(monkeypatch):
+    """A light command can reconnect before the watchdog does."""
+    proxy = _real_proxy()
+    proxy.set_candidates([DESAYUNOS, FUEGOS])
+    nid = proxy._session.network_id
+    monkeypatch.setattr(
+        gatt_mod.bluetooth, "async_discovered_service_info",
+        lambda _h, connectable=True: [_advert(DESAYUNOS[0], nid), _advert(FUEGOS[0], nid)],
+        raising=False,
+    )
+    attempts: list[str] = []
+
+    class Client:
+        is_connected = True
+
+        async def disconnect(self):
+            self.is_connected = False  # BlueZ reports the drop first...
+            await asyncio.sleep(0.2)  # ...while bleak still cleans up
+
+    async def try_connect(device, name, timeout):
+        attempts.append(device.address)
+        proxy._client = Client()
+        proxy._active_mac = device.address
+        proxy.link_generation += 1
+        return True
+
+    monkeypatch.setattr(proxy, "_try_connect_device", try_connect)
+
+    async def run():
+        await proxy.connect_any()
+        attempts.clear()
+        stuck = proxy.active_mac
+
+        async def watchdog():
+            await proxy.drop_link(timeout=10)
+            await proxy.connect_any(avoid=stuck)
+
+        async def light_command():
+            await asyncio.sleep(0.05)
+            await proxy.ensure_connected()
+
+        await asyncio.gather(watchdog(), light_command())
+
+    asyncio.run(run())
+
+    assert attempts == [FUEGOS[0]]
+
+
+def test_avoidance_ends_once_a_link_is_up(monkeypatch):
+    proxy = _real_proxy()
+    proxy.set_candidates([DESAYUNOS, FUEGOS])
+    attempts = _attempts(
+        monkeypatch, proxy,
+        [_advert(DESAYUNOS[0], proxy._session.network_id),
+         _advert(FUEGOS[0], proxy._session.network_id)],
+    )
+
+    async def run():
+        proxy._client = SimpleNamespace(is_connected=True, disconnect=_async_noop)
+        proxy._active_mac = DESAYUNOS[0]
+        await proxy.drop_link()
+        await proxy.connect_any()  # avoids Luz desayunos
+        proxy._client = None
+        await proxy.connect_any()  # normal order again (winner first)
+
+    asyncio.run(run())
+
+    assert attempts == [FUEGOS[0], FUEGOS[0]]
+    assert proxy._dropped_mac is None
+
+
+def test_notification_does_not_blame_the_adapter_alone(clock, notifications):
+    async def run():
+        c, proxy = await _started()
+        for _ in range(3):
+            proxy.behaviour[proxy.active_mac] = "silent"
+            other = FUEGOS[0] if proxy.active_mac == DESAYUNOS[0] else DESAYUNOS[0]
+            proxy.behaviour[other] = "ok"
+            clock.now += 200
+            await c._async_update_data()
+        await c.async_shutdown()
+
+    asyncio.run(run())
+
+    assert "without power" in notifications[0]["message"]

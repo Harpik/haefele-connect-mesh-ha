@@ -606,6 +606,10 @@ class MeshProxyConnection:
         # Bumped on every successful connect, so a caller can tell whether
         # the link it looked at is still the current one.
         self.link_generation: int = 0
+        # Proxy whose link drop_link() just closed as stuck. Every connect
+        # tries it last until a link is up again, not only the watchdog's
+        # own: a light command can reconnect first.
+        self._dropped_mac: str | None = None
         # Tracks the in-flight auto-reconnect task (if any). Prevents a
         # storm of reconnect tasks if bleak fires _on_disconnected more
         # than once for the same drop.
@@ -669,10 +673,11 @@ class MeshProxyConnection:
 
         ``avoid`` (a MAC) is tried last: after dropping a stuck link, the
         other proxies get the first chance, and the old one is still used
-        if nothing else works.
+        if nothing else works. Without ``avoid``, the proxy drop_link()
+        last closed is avoided.
         """
-        avoid = avoid.upper() if avoid else None
         async with self._connect_lock:
+            avoid = (avoid or self._dropped_mac or "").upper() or None
             if self._closed:
                 return False
             if self.is_connected:
@@ -720,6 +725,7 @@ class MeshProxyConnection:
                     await self._stop_rx_pump()
                     return False
                 if ok:
+                    self._dropped_mac = None
                     # Move any matching stored candidate to the front so
                     # subsequent reconnects prefer the same proxy first.
                     if mac:
@@ -1183,6 +1189,7 @@ class MeshProxyConnection:
                 self._active_mac = None
                 self._active_name = ""
             self._reassembly_buf = bytearray()
+            self._dropped_mac = mac
             return mac
 
     async def ensure_connected(self) -> bool:

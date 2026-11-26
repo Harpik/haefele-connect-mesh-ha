@@ -1052,12 +1052,14 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             return
         self._flap_notified = True
         self._notify(
-            "Häfele Connect Mesh: unstable proxy link",
-            f"The Bluetooth link to the mesh got stuck {recent} times in the "
-            f"last {LINK_FLAP_WINDOW // 60} minutes and had to be "
-            f"reconnected (last via {name or '?'}). Check the Bluetooth "
-            "adapter or proxy placement; download the integration "
-            "diagnostics for details.",
+            "Häfele Connect Mesh: lights not answering",
+            f"No light answered through the mesh proxy {recent} times in "
+            f"the last {LINK_FLAP_WINDOW // 60} minutes, so the link was "
+            f"reconnected each time (last via {name or '?'}). The lights may "
+            "be without power (e.g. switched off at the wall), or the "
+            "Bluetooth link to the proxy keeps getting stuck. If the lights "
+            "have power, check the Bluetooth adapter and proxy placement; "
+            "the integration diagnostics have the details.",
         )
 
     def _notify(self, title: str, message: str) -> None:
