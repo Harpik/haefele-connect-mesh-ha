@@ -642,7 +642,9 @@ class MeshProxyConnection:
     def active_name(self) -> str:
         return self._active_name if self.is_connected else ""
 
-    async def connect_any(self, timeout_per_candidate: float = 15.0) -> bool:
+    async def connect_any(
+        self, timeout_per_candidate: float = 15.0, avoid: str | None = None,
+    ) -> bool:
         """Discover proxies advertising our Network ID; connect to the first usable one.
 
         Discovery is done by scanning HA's currently-known BLE devices for
@@ -658,7 +660,12 @@ class MeshProxyConnection:
         as an *ordering hint*: a discovered device whose address matches
         a stored candidate is tried first. Devices outside the candidate
         list still get tried — stale stored MACs no longer block recovery.
+
+        ``avoid`` (a MAC) is tried last: after dropping a stuck link, the
+        other proxies get the first chance, and the old one is still used
+        if nothing else works.
         """
+        avoid = avoid.upper() if avoid else None
         async with self._connect_lock:
             if self.is_connected:
                 return True
@@ -677,6 +684,12 @@ class MeshProxyConnection:
                 )
                 await asyncio.sleep(5.0)
                 discovered = self._discover_proxy_candidates()
+
+            if avoid is not None:
+                discovered = (
+                    [d for d in discovered if (d[0].address or "").upper() != avoid]
+                    + [d for d in discovered if (d[0].address or "").upper() == avoid]
+                )
 
             if not discovered:
                 _LOGGER.warning(
@@ -820,6 +833,12 @@ class MeshProxyConnection:
                 preferred.append(entry)
             else:
                 others.append(entry)
+
+        # Stored candidates in their stored order: connect_any moves the last
+        # proxy that worked to the front, and the stuck-link watchdog relies
+        # on that order to try the other proxies first.
+        order = {mac: i for i, (mac, _) in enumerate(self._candidates)}
+        preferred.sort(key=lambda e: order[(e[0].address or "").upper()])
 
         if preferred or others:
             _LOGGER.debug(
@@ -1078,6 +1097,35 @@ class MeshProxyConnection:
         self._active_mac = None
         self._active_name = ""
         self._user_disconnecting = False
+
+    async def drop_link(self, timeout: float = 10.0) -> str | None:
+        """Close the current link even if it still reports connected.
+
+        For a link that is open but carries nothing. No auto-reconnect is
+        triggered (the caller decides where to reconnect) and the rx pump
+        is kept for the next link. If the BLE stack does not confirm the
+        disconnect within ``timeout`` the client is forgotten anyway.
+
+        Returns the MAC of the dropped proxy, or None if there was none.
+        """
+        async with self._connect_lock:
+            mac = self._active_mac
+            if self._client is None:
+                return mac
+            try:
+                await asyncio.wait_for(self._teardown_active(), timeout)
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Proxy %s did not confirm the disconnect within %.0f s; "
+                    "dropping it anyway", self._active_name or mac, timeout,
+                )
+                self.filter_mode = None
+                self._client = None
+                self._data_in = None
+                self._active_mac = None
+                self._active_name = ""
+            self._reassembly_buf = bytearray()
+            return mac
 
     async def ensure_connected(self) -> bool:
         if self.is_connected:

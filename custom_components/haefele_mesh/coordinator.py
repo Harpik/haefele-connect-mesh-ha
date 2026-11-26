@@ -26,6 +26,13 @@ from .const import (
     DOMAIN,
     HEARTBEAT_INTERVAL,
     LEGACY_SRC_ADDRESSES,
+    LINK_DROP_TIMEOUT,
+    LINK_FLAP_THRESHOLD,
+    LINK_FLAP_WINDOW,
+    LINK_PROBE_MAX_NODES,
+    LINK_PROBE_TIMEOUT,
+    LINK_RECONNECT_BACKOFF_MAX,
+    LINK_STALE_AFTER,
     NODE_ADDRESS_MARGIN,
     ROTATED_SRC_SEQ_START,
     ROTATION_SEARCH_TOP,
@@ -174,6 +181,31 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             _node_id(n): False for n in self._nodes_cfg
         }
 
+        # Stuck-link watchdog (see _async_update_data). A link can stay
+        # open while carrying nothing; only replies from the lights prove
+        # it works both ways. A remote's frames are not counted: hearing
+        # the mesh does not mean the mesh hears us.
+        self._entry_id = entry_id
+        self._light_unicasts: set[int] = {
+            n["unicast"] & 0xFFFF for n in self._nodes_cfg
+            if isinstance(n.get("unicast"), int)
+        }
+        # time.monotonic() of the last message from a light, and of the
+        # moment the current link came up.
+        self._last_light_rx: float | None = None
+        self._link_up_at: float | None = None
+        # Set when a probe went unanswered; the lights stay unavailable
+        # until one of them talks again.
+        self._link_suspect = False
+        # Lights a probe is waiting to hear from.
+        self._probe_waiters: dict[int, asyncio.Future] = {}
+        self._forced_reconnects: list[float] = []
+        self._forced_reconnects_total = 0
+        self._forced_backoff = 0.0
+        self._next_forced_reconnect_at = 0.0
+        self._last_forced_reconnect: dict[str, Any] | None = None
+        self._flap_notified = False
+
     # ------------------------------------------------------------------
     # Status routing
     # ------------------------------------------------------------------
@@ -205,6 +237,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         return _unsub
 
     def _dispatch_status(self, src_address: int, opcode: int, params: bytes) -> None:
+        if src_address in self._light_unicasts:
+            self._note_light_rx(src_address)
         for cb in self._status_handlers.get(src_address, ()):
             try:
                 cb(opcode, params)
@@ -713,10 +747,11 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         self.proxy.set_filter_addresses(self._filter_addresses())
 
         ok = await self.proxy.connect_any()
+        if ok:
+            self._note_link_up()
         # Mark every node as available if *any* proxy is up — they're all
         # reachable through the mesh from there.
-        for nid in self.availability:
-            self.availability[nid] = ok
+        self._set_availability(ok)
 
         # Start the state-polling loop.
         if self._poll_task is None or self._poll_task.done():
@@ -762,8 +797,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         if self.proxy is None:
             return
         ok = self.proxy.is_connected
-        for nid in self.availability:
-            self.availability[nid] = ok
+        if ok:
+            self._note_link_up()
+        self._set_availability(ok)
         # Push the new state to every listener (light entities) and also
         # schedule a regular refresh so the next heartbeat stays aligned.
         self.async_set_updated_data(
@@ -771,7 +807,7 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         )
 
     # ------------------------------------------------------------------
-    # Heartbeat — just keep the single connection alive
+    # Heartbeat — keep the single connection alive *and working*
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -782,10 +818,216 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         if not ok:
             _LOGGER.debug("Proxy disconnected, trying to reconnect...")
             ok = await self.proxy.connect_any()
+            if ok:
+                self._note_link_up()
+        elif self._link_suspect or self._link_idle_for() >= LINK_STALE_AFTER:
+            # Open is not the same as working: on 26-11 a link stayed open
+            # for hours while no frame went through it.
+            ok = await self._check_link()
 
+        self._set_availability(ok)
+        return {nid: {"available": ok} for nid in self.availability}
+
+    # ------------------------------------------------------------------
+    # Stuck-link watchdog
+    # ------------------------------------------------------------------
+
+    def _set_availability(self, ok: bool) -> None:
         for nid in self.availability:
             self.availability[nid] = ok
-        return {nid: {"available": ok} for nid in self.availability}
+
+    def _note_link_up(self) -> None:
+        self._link_up_at = time.monotonic()
+
+    def _note_light_rx(self, src_address: int) -> None:
+        self._last_light_rx = time.monotonic()
+        waiter = self._probe_waiters.get(src_address)
+        if waiter is not None and not waiter.done():
+            waiter.set_result(True)
+        if self._link_suspect:
+            # A light answered: the link works again, no need to wait for
+            # the next heartbeat to bring the entities back.
+            self._link_suspect = False
+            _LOGGER.info(
+                "Mesh link answering again (light %04X); lights available",
+                src_address,
+            )
+            if self.proxy is not None and self.proxy.is_connected:
+                self._set_availability(True)
+                self.async_set_updated_data(
+                    {nid: {"available": True} for nid in self.availability},
+                )
+
+    def _link_idle_for(self) -> float:
+        """Seconds since the link last proved it works (or came up)."""
+        ref = max(self._last_light_rx or 0.0, self._link_up_at or 0.0)
+        if ref == 0.0:
+            # Connected without us noticing the moment (should not happen):
+            # start counting now rather than probing straight away.
+            self._note_link_up()
+            return 0.0
+        return time.monotonic() - ref
+
+    async def _probe_link(self) -> bool:
+        """Ask a few lights for their on/off state; True if one replies.
+
+        Only a reply from the light we asked counts: it proves our frame
+        went out through the proxy and the answer came back.
+        """
+        if self.proxy is None or not self.proxy.is_connected:
+            return False
+        targets = [
+            n["unicast"] & 0xFFFF for n in self._nodes_cfg
+            if isinstance(n.get("unicast"), int)
+        ][:LINK_PROBE_MAX_NODES]
+        if not targets:
+            return True  # nothing to ask, nothing to judge the link by
+        loop = asyncio.get_running_loop()
+        for dst in targets:
+            waiter = loop.create_future()
+            self._probe_waiters[dst] = waiter
+            try:
+                await asyncio.wait_for(
+                    self.proxy.get_onoff(dst), LINK_PROBE_TIMEOUT,
+                )
+                await asyncio.wait_for(waiter, LINK_PROBE_TIMEOUT)
+            except (TimeoutError, ConnectionError) as err:
+                _LOGGER.debug(
+                    "Link probe: no reply from %04X (%s)", dst,
+                    type(err).__name__,
+                )
+                continue
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Link probe to %04X failed: %s", dst, err)
+                continue
+            finally:
+                if self._probe_waiters.get(dst) is waiter:
+                    del self._probe_waiters[dst]
+            return True
+        return False
+
+    async def _check_link(self) -> bool:
+        """Probe an idle link; drop it and reconnect if nothing answers.
+
+        Returns whether the lights are reachable now.
+        """
+        idle = self._link_idle_for()
+        if await self._probe_link():
+            if self._link_suspect:
+                self._link_suspect = False
+                _LOGGER.info("Mesh link answering again; lights available")
+            self._forced_backoff = 0.0
+            return True
+
+        self._link_suspect = True
+        # Entities go unavailable now, not after the reconnect below (which
+        # can take a while with several candidates).
+        self._set_availability(False)
+        self.async_set_updated_data(
+            {nid: {"available": False} for nid in self.availability},
+        )
+        now = time.monotonic()
+        if now < self._next_forced_reconnect_at:
+            _LOGGER.debug(
+                "Mesh link still silent; next forced reconnect in %.0f s",
+                self._next_forced_reconnect_at - now,
+            )
+            return False
+
+        name = self.proxy.active_name
+        mac = self.proxy.active_mac
+        _LOGGER.warning(
+            "Mesh proxy link via %s (%s) is open but silent: no reply from "
+            "any light for %.0f s, nor to a state probe. Dropping it and "
+            "reconnecting", name or "?", mac or "?", idle,
+        )
+        self._record_forced_reconnect(now, name, mac)
+        await self.proxy.drop_link(timeout=LINK_DROP_TIMEOUT)
+        ok = await self.proxy.connect_any(avoid=mac)
+        if ok:
+            self._note_link_up()
+            ok = await self._probe_link()
+        if ok:
+            self._link_suspect = False
+            self._forced_backoff = 0.0
+            _LOGGER.warning(
+                "Mesh proxy link restored via %s (%s)",
+                self.proxy.active_name, self.proxy.active_mac,
+            )
+        else:
+            self._forced_backoff = min(
+                max(self._forced_backoff * 2, HEARTBEAT_INTERVAL),
+                LINK_RECONNECT_BACKOFF_MAX,
+            )
+            self._next_forced_reconnect_at = (
+                time.monotonic() + self._forced_backoff - 1
+            )
+            _LOGGER.warning(
+                "Mesh proxy reconnect %s, but no light answers yet; lights "
+                "stay unavailable (next forced reconnect in %.0f s)",
+                f"via {self.proxy.active_name}" if self.proxy.is_connected
+                else "failed",
+                self._forced_backoff,
+            )
+        return ok
+
+    def _record_forced_reconnect(
+        self, now: float, name: str, mac: str | None,
+    ) -> None:
+        self._forced_reconnects_total += 1
+        self._forced_reconnects = [
+            t for t in self._forced_reconnects if now - t < LINK_FLAP_WINDOW
+        ] + [now]
+        self._last_forced_reconnect = {
+            "at": time.time(), "from_name": name, "from_mac": mac,
+        }
+        recent = len(self._forced_reconnects)
+        if recent < LINK_FLAP_THRESHOLD:
+            self._flap_notified = False
+            return
+        if self._flap_notified:
+            return
+        self._flap_notified = True
+        self._notify(
+            "Häfele Connect Mesh: unstable proxy link",
+            f"The Bluetooth link to the mesh got stuck {recent} times in the "
+            f"last {LINK_FLAP_WINDOW // 60} minutes and had to be "
+            f"reconnected (last via {name or '?'}). Check the Bluetooth "
+            "adapter or proxy placement; download the integration "
+            "diagnostics for details.",
+        )
+
+    def _notify(self, title: str, message: str) -> None:
+        try:
+            from homeassistant.components import persistent_notification
+
+            persistent_notification.async_create(
+                self.hass, message, title=title,
+                notification_id=f"{DOMAIN}_{self._entry_id or 'entry'}_link",
+            )
+        except Exception:
+            _LOGGER.debug("Could not create the notification", exc_info=True)
+
+    def link_health(self) -> dict[str, Any]:
+        """Watchdog state, for diagnostics."""
+        now = time.monotonic()
+        return {
+            "seconds_since_light_reply": (
+                None if self._last_light_rx is None
+                else round(now - self._last_light_rx, 1)
+            ),
+            "seconds_since_link_up": (
+                None if self._link_up_at is None
+                else round(now - self._link_up_at, 1)
+            ),
+            "suspect": self._link_suspect,
+            "forced_reconnects_total": self._forced_reconnects_total,
+            "forced_reconnects_recent": len([
+                t for t in self._forced_reconnects if now - t < LINK_FLAP_WINDOW
+            ]),
+            "last_forced_reconnect": self._last_forced_reconnect,
+            "backoff_seconds": self._forced_backoff,
+        }
 
     def _filter_addresses(self) -> list[int]:
         """Compute the set of DST addresses the proxy should forward.

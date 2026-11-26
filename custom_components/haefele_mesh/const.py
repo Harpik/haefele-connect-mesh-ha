@@ -19,6 +19,25 @@ MESH_PROXY_DATA_OUT_UUID = "00002ade-0000-1000-8000-00805f9b34fb"
 # Heartbeat
 HEARTBEAT_INTERVAL = 60  # seconds
 
+# Stuck-link watchdog. A GATT link can stay open (is_connected True) while
+# nothing goes through it. The state poll asks every light for its state
+# every 15 s, so a healthy link hears a light at least that often.
+# Seconds without any message from a light before the heartbeat probes it.
+LINK_STALE_AFTER = 90
+# Seconds to wait for each probe write and for the light's reply.
+LINK_PROBE_TIMEOUT = 4.0
+# Lights asked, one after another, before the link is declared stuck (a
+# single light can be off at the wall).
+LINK_PROBE_MAX_NODES = 3
+# Seconds allowed to drop a stuck link; a hung BLE stack may never answer.
+LINK_DROP_TIMEOUT = 10.0
+# Forced reconnects that keep failing are spaced out, doubling up to this.
+LINK_RECONNECT_BACKOFF_MAX = 900  # seconds
+# This many forced reconnects within the window raise a persistent
+# notification in Home Assistant.
+LINK_FLAP_THRESHOLD = 3
+LINK_FLAP_WINDOW = 1800  # seconds
+
 # Mesh crypto
 IV_INDEX_DEFAULT = 1
 # Mesh Profile 1.0 §3.10.5: a known IV Index may move forward by at most 42.

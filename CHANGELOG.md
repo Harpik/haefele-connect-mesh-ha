@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stuck proxy link detected and replaced.** A Bluetooth link to the mesh
+  proxy could stay open while no frame went through it: Home Assistant kept
+  the lights available and "on", commands went nowhere, and only a reload
+  helped. The heartbeat now checks that the link works, not just that it is
+  open. If no light has answered for 90 s it asks up to three lights for
+  their state; if none replies, the link is dropped (even when the BLE stack
+  never confirms the disconnect) and the integration reconnects, trying the
+  other proxies first. The lights are unavailable from the moment the probe
+  fails until a light answers again. Forced reconnects that keep failing
+  back off up to 15 minutes, and three of them within 30 minutes raise a
+  persistent notification. Messages from remotes do not count as proof of a
+  working link (they show the mesh is heard, not that it hears us).
+- Stored proxy candidates are now tried in their stored order (last working
+  proxy first), as the reconnect logic already assumed.
+
+### Added
+
+- `link_health` in the diagnostics: seconds since a light last answered,
+  forced reconnects (total, last 30 min, last one) and the current backoff.
+
 ## [0.5.0] — 2026-10-30
 
 ### Added

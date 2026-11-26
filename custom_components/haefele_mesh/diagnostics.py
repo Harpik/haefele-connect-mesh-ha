@@ -189,6 +189,11 @@ def _coordinator_snapshot(coordinator: HaefeleCoordinator) -> dict[str, Any]:
         "availability": dict(coordinator.availability),
         "session": session_state,
         "proxy": proxy_state,
+        # Stuck-link watchdog: when a light last answered, forced reconnects.
+        "link_health": (
+            coordinator.link_health()
+            if hasattr(coordinator, "link_health") else None
+        ),
         "seq_state": seq_snapshot,
         "persisted_iv_index": coordinator._persisted_iv_index,  # noqa: SLF001
     }
