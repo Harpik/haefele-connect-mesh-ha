@@ -110,6 +110,7 @@ class FakeProxy:
         self.pushed_filters: list[list[int]] = []
         self.calls: list[tuple[str, int]] = []
         self.is_connected = False
+        self.link_generation = 0
         FakeProxy.instances.append(self)
 
     def set_candidates(self, candidates):

@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stuck proxy link detected and replaced.** A Bluetooth link to the mesh
+  proxy could stay open while no frame went through it: Home Assistant kept
+  the lights available and "on", commands went nowhere, and only a reload
+  helped. The heartbeat now checks that the link works, not just that it is
+  open. Only a light's reply to one of our own state requests (the 15 s poll
+  or a probe) counts as proof: frames from remotes, or a state a light
+  publishes by itself after a wall switch or the Häfele app, show that the
+  mesh is heard, not that it hears us. If no light has replied for 90 s, the
+  heartbeat asks up to three lights for their state; if none replies, the
+  link is dropped (even when the BLE stack never confirms the disconnect)
+  and the integration reconnects, trying the other proxies first. The lights
+  are unavailable from the moment the probe fails until a light replies
+  again. Until a new link is up, every reconnect (also one started by a
+  light command) tries the stuck proxy last. Forced reconnects that keep
+  failing back off up to 15 minutes, and three of them within 30 minutes
+  raise a persistent notification (the lights may simply be without power,
+  which looks the same from Home Assistant).
+- Unloading the integration while it connects no longer leaves a Bluetooth
+  link (and its receive task) open, and a connect cancelled half-way never
+  leaves a link that looks connected without having been set up.
+- A late disconnect report from a link that was already replaced no longer
+  resets the new link's proxy filter or starts a needless reconnect.
+- Stored proxy candidates are now tried in their stored order (last working
+  proxy first), as the reconnect logic already assumed.
+
+### Added
+
+- `link_health` in the diagnostics: seconds since a light last answered,
+  forced reconnects (total, last 30 min, last one) and the current backoff.
+
 ## [0.5.0] — 2026-10-30
 
 ### Added
