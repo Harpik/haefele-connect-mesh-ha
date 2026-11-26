@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-26
+
 ### Fixed
 
 - **Stuck proxy link detected and replaced.** A Bluetooth link to the mesh
@@ -406,6 +408,7 @@ Initial tagged release after the single-proxy refactor
 (`MeshSession` + `MeshProxyConnection` + `HaefeleCoordinator`,
 with the legacy per-node `MeshGattNode` removed).
 
+[0.5.1]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.5.1
 [0.5.0]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.5.0
 [0.4.7]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.7
 [0.4.6]: https://github.com/Harpik/haefele-connect-mesh-ha/releases/tag/v0.4.6
