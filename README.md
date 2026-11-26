@@ -14,7 +14,7 @@ Home Assistant itself plays the role of a BT Mesh **GATT Proxy client**. It conn
 - 🔵 Native BLE via Home Assistant's `bluetooth` integration
 - 📡 **ESPHome Bluetooth Proxy compatible** — extend range without extra software
 - 💡 On/Off, brightness, color temperature (Tunable White), hue/saturation (RGB, experimental)
-- 🔁 Automatic reconnection with `bleak-retry-connector` — immediate retry on disconnect plus a 60 s heartbeat as a safety net
+- 🔁 Automatic reconnection with `bleak-retry-connector` — immediate retry on disconnect, plus a 60 s heartbeat that also catches a link that stays open but no longer carries anything, and reconnects through another proxy
 - 🎛️ **Physical remote changes are reflected in HA** — the coordinator polls every light every 15 s so wall-switch / Häfele-app presses show up in HA within seconds
 - 💾 Persistent BT Mesh sequence numbers and IV Index (survives HA restarts — no replay risk)
 - 🧩 HACS compatible, setup 100% via UI
@@ -148,6 +148,7 @@ Sensors and wall switches are still skipped.
 - The 24-bit SEQ counter is never allowed to wrap. When the active source address gets close to the end of its SEQ space, the integration switches to a fresh, never-used source address (skipping every node, the provisioner and previously used addresses, and preferring addresses outside the provisioning app's allocated unicast range so a future light can never take it; new entries start outside that range too) and logs a warning. The switch is persisted and survives restarts.
 - Commands are built as BT Mesh Network PDUs (encrypted with AES-CCM, obfuscated with AES-ECB) and sent over the Mesh Proxy PDU bearer (spec § 6.6.2).
 - An immediate reconnect is attempted whenever the BLE link drops; a 60 s heartbeat also verifies connectivity as a safety net.
+- An open link is not taken as a working one. Only a light's reply to one of the integration's own state requests proves the link works both ways. A state a light publishes on its own (wall switch, Häfele app) or a remote press only proves the mesh is heard. If no light has replied for 90 s, the heartbeat asks up to three lights for their state. If none answers, the lights go unavailable, the link is dropped and the integration reconnects, trying the other proxies first. The lights come back as soon as one replies. Forced reconnects that keep failing are spaced out up to 15 minutes, and three within 30 minutes raise a persistent notification.
 - Every 15 s the coordinator polls each light with a single Get (CTL for tunable-white lights, On/Off for the rest) so manual changes from the physical remote or the Häfele app are reflected in HA.
 - Secure Network Beacons from the mesh are parsed live; the IV Index is auto-updated if the mesh advances it.
 
@@ -170,12 +171,19 @@ HA can't reach any mesh proxy over BLE. Check:
 
    The integration **does not depend on stored MAC addresses** to find the proxy: it discovers it live via BLE advertisements keyed on your Network ID, so a stale or non-MAC-shaped address in the `.connect` file is no longer a blocker.
 
+**Lights go "unavailable" for a few seconds, with `is open but silent` in the log**
+The link to the proxy stayed open but stopped carrying messages, so the integration dropped it and reconnected through another proxy. The log then shows `restored via ...`. That is the expected recovery. If it keeps happening, the *Lights not answering* notification appears and `link_health` in the diagnostics counts the forced reconnects. Lights without power (switched off at the wall) look the same from Home Assistant.
+
+**No node advertises the proxy at all, although the lights are powered**
+Häfele lights have been seen to stop advertising the Mesh Proxy service (for example after a Home Assistant restart) until their power is cycled. Cutting their power for about 10 s brings them back, and the integration then reconnects on its own.
+
 **Physical remote presses aren't reflected in HA**
 The coordinator polls every 15 s, so expect up to ~15 s of lag after a wall-switch press. If it never catches up, check HA logs for `State poll for ... failed` entries.
 
 **Need to see what's really going on**
 Download the integration's diagnostics from **Settings → Devices & Services → Häfele Connect Mesh → ⋮ → Download diagnostics**. The JSON includes:
 - Coordinator state (active proxy, candidate order, per-node availability, current IV Index, SEQ snapshot)
+- `link_health`: seconds since a light last replied, whether the link is under suspicion, forced reconnects (total, last 30 min, last one) and the current backoff
 - Latest BLE advertising data for every provisioned node (RSSI, advertised service UUIDs, `advertises_mesh_proxy` flag, seconds since last seen)
 - Full GATT service/characteristic tree of whichever node is currently acting as the mesh proxy (read from the cached bleak client — zero extra BLE traffic)
 
@@ -204,6 +212,7 @@ CI runs `pytest` on Python 3.11, 3.13 and 3.14 (with stubbed HA and the latest t
 - [x] **Reconfigure flow** — re-import an updated `.connect` without losing mesh state (SEQ, IV Index)
 - [x] **Downloadable diagnostics** with redacted keys (Settings → Devices & Services → ⋮ → Download diagnostics)
 - [x] **Immediate auto-reconnect** on unsolicited BLE disconnect (no more 60 s heartbeat wait)
+- [x] **Stuck-link watchdog** — a link that stays open but silent is detected and replaced through another proxy (0.5.1)
 - [x] **Issue / PR templates + `CONTRIBUTING.md`**
 - [x] **Secret-scanning infrastructure** (gitleaks pre-commit + CI, BT-Mesh-aware rules)
 
