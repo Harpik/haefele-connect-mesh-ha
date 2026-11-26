@@ -71,6 +71,9 @@ class MeshProxy:
         self.gets: list[int] = []
         self.drops: list[str | None] = []
         self.connects: list[str | None] = []
+        self.link_generation = 0
+        # Set by a test to make connect_any slow (a real BLE connect is).
+        self.connect_delay = 0.0
         MeshProxy.last = self
 
     def set_candidates(self, candidates):
@@ -81,6 +84,8 @@ class MeshProxy:
 
     async def connect_any(self, timeout_per_candidate=15.0, avoid=None):
         self.connects.append(avoid)
+        if self.connect_delay:
+            await asyncio.sleep(self.connect_delay)
         if self.is_connected:
             return True
         order = [c for c in self.order if c[0] != avoid] + [
@@ -90,9 +95,15 @@ class MeshProxy:
             return False
         self.active_mac, self.active_name = order[0]
         self.is_connected = True
+        self.link_generation += 1
         return True
 
-    async def drop_link(self, timeout=10.0):
+    async def drop_link(self, timeout=10.0, expected_generation=None):
+        if (
+            expected_generation is not None
+            and expected_generation != self.link_generation
+        ):
+            return None
         mac = self.active_mac
         self.drops.append(mac)
         self.is_connected = False
@@ -518,3 +529,327 @@ def test_drop_link_gives_up_on_a_hung_disconnect(caplog):
     assert proxy.is_connected is False
     assert proxy._user_disconnecting is False
     assert "did not confirm the disconnect" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Review round 1: unload, stale callbacks, replaced links, backoff
+# ---------------------------------------------------------------------------
+
+def test_unload_during_forced_reconnect_leaves_no_link(clock):
+    async def run():
+        c, proxy = await _started()
+        proxy.behaviour[DESAYUNOS[0]] = "silent"
+        proxy.connect_delay = 0.3  # a BLE connect takes time
+        clock.now += 200
+        heartbeat = asyncio.create_task(c._async_update_data())
+        await asyncio.sleep(0.25)  # probe done, now inside connect_any
+        assert proxy.drops == [DESAYUNOS[0]]
+        await c.async_shutdown()  # entry unloaded
+        await heartbeat
+        return proxy
+
+    proxy = asyncio.run(run())
+
+    assert proxy.is_connected is False
+
+
+def test_proxy_unloaded_while_connecting_closes_the_new_link(monkeypatch):
+    proxy = _real_proxy()
+    proxy.set_candidates([FUEGOS])
+    monkeypatch.setattr(
+        gatt_mod.bluetooth, "async_discovered_service_info",
+        lambda _h, connectable=True: [_advert(FUEGOS[0], proxy._session.network_id)],
+        raising=False,
+    )
+    closed: list[str] = []
+    connected = asyncio.Event()
+    release = asyncio.Event()
+
+    class Client:
+        is_connected = True
+
+        async def disconnect(self):
+            closed.append("new link")
+            self.is_connected = False
+
+    async def try_connect(device, name, timeout):
+        connected.set()
+        await release.wait()
+        proxy._client = Client()
+        proxy._active_mac = device.address
+        return True
+
+    monkeypatch.setattr(proxy, "_try_connect_device", try_connect)
+
+    async def run():
+        connecting = asyncio.create_task(proxy.connect_any())
+        await connected.wait()
+        await proxy.disconnect()  # integration unload
+        release.set()
+        first = await connecting
+        again = await proxy.connect_any()
+        return first, again
+
+    first, again = asyncio.run(run())
+
+    assert (first, again) == (False, False)
+    assert closed == ["new link"]
+    assert proxy.is_connected is False
+
+
+def test_late_disconnect_of_a_dropped_link_leaves_the_new_link_alone():
+    proxy = _real_proxy()
+    scheduled: list[str] = []
+    proxy._hass = SimpleNamespace(
+        async_create_task=lambda coro, name=None: (coro.close(), scheduled.append(name)),
+    )
+
+    class Hung:
+        is_connected = True
+
+        async def disconnect(self):
+            await asyncio.Event().wait()
+
+    old = Hung()
+    proxy._client = old
+    proxy._active_mac = DESAYUNOS[0]
+
+    async def run():
+        await proxy.drop_link(timeout=0.05)
+        proxy._client = SimpleNamespace(is_connected=True)  # new link
+        proxy._active_mac = FUEGOS[0]
+        proxy.filter_mode = "forward_all"
+        proxy._on_disconnected(old)  # BlueZ finally reports the old one
+
+    asyncio.run(run())
+
+    assert proxy.filter_mode == "forward_all"
+    assert scheduled == []
+
+
+def test_drop_link_leaves_a_link_that_replaced_the_stuck_one():
+    proxy = _real_proxy()
+    closed: list[str] = []
+
+    class Client:
+        is_connected = True
+
+        async def disconnect(self):
+            closed.append("dropped")
+
+    proxy._client = Client()
+    proxy._active_mac = FUEGOS[0]
+    proxy.link_generation = 2  # auto-reconnect replaced link 1
+
+    dropped = asyncio.run(proxy.drop_link(expected_generation=1))
+
+    assert dropped is None
+    assert closed == []
+    assert proxy.is_connected is True
+
+
+def test_watchdog_keeps_a_link_that_auto_reconnect_brought_up_meanwhile(clock):
+    async def run():
+        c, proxy = await _started()
+        sent: list[int] = []
+
+        async def get_onoff(dst):
+            sent.append(dst)
+            if len(sent) == 1:
+                # The stuck link really drops; auto-reconnect brings up a
+                # new one while the probe is still waiting for replies.
+                proxy.active_mac, proxy.active_name = FUEGOS
+                proxy.link_generation += 1
+            if len(sent) > len(LIGHTS):  # the new link works
+                asyncio.get_running_loop().call_soon(
+                    c._dispatch_status, dst, OP_ONOFF_STATUS, b"\x01",
+                )
+
+        proxy.get_onoff = get_onoff
+        clock.now += 200
+        result = await c._async_update_data()
+        await c.async_shutdown()
+        return proxy, result
+
+    proxy, result = asyncio.run(run())
+
+    assert proxy.drops == []
+    assert proxy.active_mac == FUEGOS[0]
+    assert _available(result) == {True}
+
+
+def test_backoff_and_gate_reset_when_a_light_answers(clock):
+    async def run():
+        c, proxy = await _started()
+        proxy.behaviour = {DESAYUNOS[0]: "silent", FUEGOS[0]: "silent"}
+        for _ in range(3):  # backoff 60, 120, 240
+            clock.now += 300
+            await c._async_update_data()
+        assert c.link_health()["backoff_seconds"] == 240
+        # The mesh comes back: a light answers the poll.
+        c._dispatch_status(LIGHTS[0], OP_ONOFF_STATUS, b"\x01")
+        health = c.link_health()
+        # 100 s later (inside the old 240 s gate) the link sticks again.
+        clock.now += 100
+        drops = len(proxy.drops)
+        await c._async_update_data()
+        await c.async_shutdown()
+        return health, len(proxy.drops) - drops
+
+    health, new_drops = asyncio.run(run())
+
+    assert health["backoff_seconds"] == 0
+    assert new_drops == 1
+
+
+def test_backoff_is_capped(clock):
+    async def run():
+        c, proxy = await _started()
+        proxy.behaviour = {DESAYUNOS[0]: "silent", FUEGOS[0]: "silent"}
+        for _ in range(8):
+            clock.now += 2000
+            await c._async_update_data()
+        health = c.link_health()
+        await c.async_shutdown()
+        return health
+
+    assert asyncio.run(run())["backoff_seconds"] == 900
+
+
+def test_idle_time_counts_from_the_last_link_up(clock):
+    """A link that just came up is not judged by the previous link's silence."""
+
+    async def run():
+        c, proxy = await _started()
+        c._last_light_rx = clock.now - 1000
+        c._link_up_at = clock.now - 30
+        await c._async_update_data()
+        await c.async_shutdown()
+        return proxy
+
+    assert asyncio.run(run()).gets == []
+
+
+def test_probe_needs_a_reply_from_the_light_it_asked(clock):
+    """A late reply from another light (e.g. to an old poll) proves nothing."""
+
+    async def run():
+        c, proxy = await _started()
+
+        async def other_light_answers(dst):
+            proxy.gets.append(dst)
+            if proxy.active_mac == DESAYUNOS[0]:
+                other = LIGHTS[(LIGHTS.index(dst) + 1) % len(LIGHTS)]
+                asyncio.get_running_loop().call_soon(
+                    c._dispatch_status, other, OP_ONOFF_STATUS, b"\x01",
+                )
+            else:
+                asyncio.get_running_loop().call_soon(
+                    c._dispatch_status, dst, OP_ONOFF_STATUS, b"\x01",
+                )
+
+        proxy.get_onoff = other_light_answers
+        clock.now += 200
+        await c._async_update_data()
+        await c.async_shutdown()
+        return proxy
+
+    assert asyncio.run(run()).drops == [DESAYUNOS[0]]
+
+
+def test_old_forced_reconnects_leave_the_flap_window(clock, notifications):
+    async def run():
+        c, proxy = await _started()
+        for _ in range(4):
+            proxy.behaviour[proxy.active_mac] = "silent"
+            other = FUEGOS[0] if proxy.active_mac == DESAYUNOS[0] else DESAYUNOS[0]
+            proxy.behaviour[other] = "ok"
+            clock.now += 1000  # one stuck link every ~17 min
+            await c._async_update_data()
+        health = c.link_health()
+        await c.async_shutdown()
+        return health
+
+    health = asyncio.run(run())
+
+    assert notifications == []
+    assert health["forced_reconnects_total"] == 4
+    assert health["forced_reconnects_recent"] == 2
+
+
+def test_drop_link_waits_for_a_connect_in_progress():
+    proxy = _real_proxy()
+    closed: list[str] = []
+
+    class Client:
+        is_connected = True
+
+        async def disconnect(self):
+            closed.append("dropped")
+
+    proxy._client = Client()
+    proxy._active_mac = DESAYUNOS[0]
+
+    async def run():
+        async with proxy._connect_lock:  # a connect_any is running
+            dropping = asyncio.create_task(proxy.drop_link())
+            await asyncio.sleep(0.05)
+            during = list(closed)
+        await dropping
+        return during
+
+    during = asyncio.run(run())
+
+    assert during == []
+    assert closed == ["dropped"]
+
+
+def test_drop_link_discards_a_half_received_frame():
+    proxy = _real_proxy()
+
+    class Client:
+        is_connected = True
+
+        async def disconnect(self):
+            pass
+
+    proxy._client = Client()
+    proxy._reassembly_buf = bytearray(b"\x01\x02\x03")
+
+    asyncio.run(proxy.drop_link())
+
+    assert proxy._reassembly_buf == bytearray()
+
+
+def test_diagnostics_include_link_health(clock, monkeypatch):
+    import importlib
+
+    diag_stub = types.ModuleType("homeassistant.components.diagnostics")
+    diag_stub.async_redact_data = lambda data, keys: data
+    monkeypatch.setitem(sys.modules, "homeassistant.components.diagnostics", diag_stub)
+    entries = sys.modules.get("homeassistant.config_entries")
+    if entries is None:
+        entries = types.ModuleType("homeassistant.config_entries")
+        monkeypatch.setitem(sys.modules, "homeassistant.config_entries", entries)
+    monkeypatch.setattr(entries, "ConfigEntry", object, raising=False)
+    monkeypatch.delitem(
+        sys.modules, "custom_components.haefele_mesh.diagnostics", raising=False,
+    )
+    diagnostics = importlib.import_module("custom_components.haefele_mesh.diagnostics")
+
+    async def run():
+        c, proxy = await _started()
+        proxy._candidates = []
+        proxy._filter_addresses = []
+        clock.now += 20
+        c._dispatch_status(LIGHTS[0], OP_ONOFF_STATUS, b"\x01")
+        clock.now += 5
+        snapshot = diagnostics._coordinator_snapshot(c)
+        await c.async_shutdown()
+        return snapshot
+
+    health = asyncio.run(run())["link_health"]
+
+    assert health["seconds_since_light_reply"] == 5.0
+    assert health["seconds_since_link_up"] == 25.0
+    assert health["suspect"] is False

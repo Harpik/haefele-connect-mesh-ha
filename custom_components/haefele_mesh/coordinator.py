@@ -818,6 +818,8 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         if not ok:
             _LOGGER.debug("Proxy disconnected, trying to reconnect...")
             ok = await self.proxy.connect_any()
+            if self._closing:
+                return {nid: {"available": False} for nid in self.availability}
             if ok:
                 self._note_link_up()
         elif self._link_suspect or self._link_idle_for() >= LINK_STALE_AFTER:
@@ -841,6 +843,9 @@ class HaefeleCoordinator(DataUpdateCoordinator):
 
     def _note_light_rx(self, src_address: int) -> None:
         self._last_light_rx = time.monotonic()
+        # The link works: a later stuck link starts from a clean backoff.
+        self._forced_backoff = 0.0
+        self._next_forced_reconnect_at = 0.0
         waiter = self._probe_waiters.get(src_address)
         if waiter is not None and not waiter.done():
             waiter.set_result(True)
@@ -912,12 +917,15 @@ class HaefeleCoordinator(DataUpdateCoordinator):
         Returns whether the lights are reachable now.
         """
         idle = self._link_idle_for()
+        # The link we are judging. Another one may replace it while we wait
+        # (auto-reconnect after a real drop); that one must not be dropped.
+        generation = self.proxy.link_generation
         if await self._probe_link():
-            if self._link_suspect:
-                self._link_suspect = False
-                _LOGGER.info("Mesh link answering again; lights available")
-            self._forced_backoff = 0.0
+            # The reply went through _note_light_rx, which cleared the
+            # suspect flag and the backoff.
             return True
+        if self._closing:
+            return False
 
         self._link_suspect = True
         # Entities go unavailable now, not after the reconnect below (which
@@ -942,14 +950,20 @@ class HaefeleCoordinator(DataUpdateCoordinator):
             "reconnecting", name or "?", mac or "?", idle,
         )
         self._record_forced_reconnect(now, name, mac)
-        await self.proxy.drop_link(timeout=LINK_DROP_TIMEOUT)
+        await self.proxy.drop_link(
+            timeout=LINK_DROP_TIMEOUT, expected_generation=generation,
+        )
+        if self._closing:
+            return False
         ok = await self.proxy.connect_any(avoid=mac)
+        if self._closing:
+            # Unloaded while connecting: leave no link behind.
+            await self.proxy.drop_link(timeout=LINK_DROP_TIMEOUT)
+            return False
         if ok:
             self._note_link_up()
             ok = await self._probe_link()
         if ok:
-            self._link_suspect = False
-            self._forced_backoff = 0.0
             _LOGGER.warning(
                 "Mesh proxy link restored via %s (%s)",
                 self.proxy.active_name, self.proxy.active_mac,

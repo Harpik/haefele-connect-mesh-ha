@@ -600,6 +600,12 @@ class MeshProxyConnection:
         # Set True while a user-initiated disconnect is in flight so the
         # bleak disconnected callback doesn't trigger an auto-reconnect.
         self._user_disconnecting: bool = False
+        # Set by disconnect() (integration unload). A connect still in
+        # flight must not leave a link open behind a closed integration.
+        self._closed: bool = False
+        # Bumped on every successful connect, so a caller can tell whether
+        # the link it looked at is still the current one.
+        self.link_generation: int = 0
         # Tracks the in-flight auto-reconnect task (if any). Prevents a
         # storm of reconnect tasks if bleak fires _on_disconnected more
         # than once for the same drop.
@@ -667,6 +673,8 @@ class MeshProxyConnection:
         """
         avoid = avoid.upper() if avoid else None
         async with self._connect_lock:
+            if self._closed:
+                return False
             if self.is_connected:
                 return True
 
@@ -705,6 +713,10 @@ class MeshProxyConnection:
                 ok = await self._try_connect_device(
                     device, name, timeout=timeout_per_candidate,
                 )
+                if ok and self._closed:
+                    # Unloaded while we were connecting.
+                    await self._teardown_active()
+                    return False
                 if ok:
                     # Move any matching stored candidate to the front so
                     # subsequent reconnects prefer the same proxy first.
@@ -930,6 +942,7 @@ class MeshProxyConnection:
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Proxy filter setup failed on %s: %s", mac, err)
 
+        self.link_generation += 1
         _LOGGER.info(
             "Mesh proxy connected via %s (%s) [nid=0x%02X aid=0x%02X src=0x%04X]",
             name, mac, self._session.nid, self._session.aid, self._session.src,
@@ -1013,10 +1026,18 @@ class MeshProxyConnection:
         finally:
             self._user_disconnecting = was_flagging
 
-    def _on_disconnected(self, _client) -> None:
+    def _on_disconnected(self, client) -> None:
+        if self._client is not None and client is not self._client:
+            # A link we already dropped (drop_link gave up waiting for it)
+            # finally reports its disconnect: it says nothing about the
+            # current link.
+            _LOGGER.debug("Ignoring disconnect of a previous proxy link")
+            return
         _LOGGER.debug("BLE disconnected from proxy %s", self._active_name)
         # A new link starts on an empty accept list (Mesh Profile §6.7).
         self.filter_mode = None
+        if self._closed:
+            return
         # Skip auto-reconnect when the disconnect was user-initiated
         # (explicit disconnect() call, teardown of a failed candidate,
         # or integration unload).
@@ -1069,6 +1090,7 @@ class MeshProxyConnection:
             _LOGGER.exception("Auto-reconnect task crashed")
 
     async def disconnect(self) -> None:
+        self._closed = True
         self._user_disconnecting = True
         self.filter_mode = None
         if self._reconnect_task is not None and not self._reconnect_task.done():
@@ -1098,7 +1120,9 @@ class MeshProxyConnection:
         self._active_name = ""
         self._user_disconnecting = False
 
-    async def drop_link(self, timeout: float = 10.0) -> str | None:
+    async def drop_link(
+        self, timeout: float = 10.0, expected_generation: int | None = None,
+    ) -> str | None:
         """Close the current link even if it still reports connected.
 
         For a link that is open but carries nothing. No auto-reconnect is
@@ -1106,9 +1130,19 @@ class MeshProxyConnection:
         is kept for the next link. If the BLE stack does not confirm the
         disconnect within ``timeout`` the client is forgotten anyway.
 
-        Returns the MAC of the dropped proxy, or None if there was none.
+        With ``expected_generation``, only that link is dropped: if another
+        one replaced it meanwhile (e.g. auto-reconnect after a real drop),
+        it is left alone.
+
+        Returns the MAC of the dropped proxy, or None if nothing was dropped.
         """
         async with self._connect_lock:
+            if (
+                expected_generation is not None
+                and expected_generation != self.link_generation
+            ):
+                _LOGGER.debug("Link already replaced; not dropping it")
+                return None
             mac = self._active_mac
             if self._client is None:
                 return mac
